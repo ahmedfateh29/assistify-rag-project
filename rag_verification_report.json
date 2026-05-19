@@ -1,0 +1,50 @@
+[
+  {
+    "id": "kb_return_policy",
+    "question": "How many days do I have to return a product?",
+    "num_chunks": 2,
+    "top_similarity": 0.7826732074418608,
+    "found_topics": [
+      "30 days",
+      "return",
+      "receipt"
+    ],
+    "missing_topics": [],
+    "duration_s": 8.218
+  },
+  {
+    "id": "kb_password_reset",
+    "question": "How do I reset my password?",
+    "num_chunks": 1,
+    "top_similarity": 0.7999567145933842,
+    "found_topics": [
+      "Forgot Password",
+      "email",
+      "reset link"
+    ],
+    "missing_topics": [],
+    "duration_s": 0.896
+  },
+  {
+    "id": "kb_shipping",
+    "question": "When is shipping free?",
+    "num_chunks": 1,
+    "top_similarity": 0.7275659573974704,
+    "found_topics": [
+      "$50",
+      "free",
+      "shipping"
+    ],
+    "missing_topics": [],
+    "duration_s": 0.81
+  },
+  {
+    "id": "kb_outofscope",
+    "question": "What is the capital of France?",
+    "num_chunks": 3,
+    "top_similarity": 0.3924258856076954,
+    "found_topics": [],
+    "missing_topics": [],
+    "duration_s": 0.903
+  }
+]
