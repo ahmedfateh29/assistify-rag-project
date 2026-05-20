@@ -226,6 +226,7 @@ Get-ChildItem tests\test_*.py | Where-Object { $_.Name -ne "test_arabic_tts.py" 
 | `passlib` / `bcrypt` version warning | Harmless if login works; optional: `pip install "bcrypt<4.1"`. |
 | TTS warnings on **5002** | Optional; Piper not running. Chat can still work without voice output. |
 | `graduation` venv broken | Delete `graduation\`; use Conda only. |
+| Moved project or large folders to another drive | See `docs/CANONICAL_PROJECT_PATH.md`; run `python scripts/preflight_check.py`. |
 
 ---
 

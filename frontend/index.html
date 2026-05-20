@@ -274,6 +274,22 @@
       cursor: pointer;
       transition: background 0.15s;
     }
+    .chat-voice-btn {
+      background: #3a3f44;
+      color: #fff;
+      border: 1px solid #4a5058;
+      flex-shrink: 0;
+      min-width: 2.75em;
+      padding: .7em .85em;
+    }
+    .chat-voice-btn:hover {
+      background: #4a5058;
+    }
+    .chat-voice-btn.active {
+      background: #6c63ff;
+      border-color: #6c63ff;
+      box-shadow: 0 0 0 2px rgba(108, 99, 255, 0.35);
+    }
     button:hover {
       background: #129c7d;
     }
@@ -606,6 +622,7 @@
       --voice-button-radius: 999px;
     }
     .voice-open-btn {
+      display: none; /* entry via #chatVoiceBtn in input row */
       width: 100%;
       margin-top: 10px;
       padding: 10px 14px;
@@ -924,6 +941,7 @@
       </div>
       <div class="chat-log" id="chatLog"></div>
       <form id="chatForm">
+        <button type="button" id="chatVoiceBtn" class="chat-voice-btn" title="Voice input" aria-label="Start voice input">🎤</button>
         <input type="text" id="chatInput" autocomplete="off" placeholder="Type your question..." />
         <button type="submit">Send</button>
       </form>
@@ -1775,6 +1793,77 @@
       }, remaining * 1000 + 300);
     }
 
+    function isForceVoiceRecoveryReason(reason) {
+      const r = String(reason || '');
+      return (
+        r === 'watchdog'
+        || r.startsWith('pending_tts')
+        || r.startsWith('voice_turn')
+        || r.startsWith('opener_')
+      );
+    }
+
+    function forceVoiceAudioRecovery(reason) {
+      console.warn('[VOICE RECOVERY] force_audio_reset reason=' + reason);
+      isTTSPlaying = false;
+      pauseAudioSending = false;
+      try {
+        if (typeof _ttsStreamAbort !== 'undefined' && _ttsStreamAbort) {
+          _ttsStreamAbort.abort();
+        }
+      } catch (_) {}
+      try {
+        if (typeof _stopStreamingAudio === 'function') _stopStreamingAudio();
+      } catch (_) {}
+      try {
+        if (_currentTTSAudio) {
+          _currentTTSAudio.pause();
+          _currentTTSAudio.currentTime = 0;
+          _currentTTSAudio = null;
+        }
+      } catch (_) {}
+      try { audioPlayer.pause(); audioPlayer.src = ''; } catch (_) {}
+      try {
+        if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      } catch (_) {}
+      ttsQueue = [];
+      hideAISpeaking();
+      hideThinking();
+    }
+
+    function completeVoiceTurn(reason) {
+      if (!window.voiceMode || typeof window.voiceMode.isOpen !== 'function' || !window.voiceMode.isOpen()) {
+        return;
+      }
+      if (window.voiceMode.isPaused && window.voiceMode.isPaused()) {
+        return;
+      }
+      const force = isForceVoiceRecoveryReason(reason);
+      if (force) {
+        forceVoiceAudioRecovery(reason);
+      } else {
+        hideThinking();
+        pauseAudioSending = false;
+        const wsAudioActive = (typeof _wsAudioState !== 'undefined' && _wsAudioState === 'playing');
+        if ((typeof isTTSPlaying !== 'undefined' && isTTSPlaying) || wsAudioActive) {
+          return;
+        }
+        hideAISpeaking();
+      }
+      if (window.voiceMode.clearVoiceTurnWatchdog) {
+        window.voiceMode.clearVoiceTurnWatchdog();
+      }
+      if (window.voiceMode.clearPendingTtsWatchdog) {
+        window.voiceMode.clearPendingTtsWatchdog();
+      }
+      if (window.voiceMode.clearOpenerWatchdog) {
+        window.voiceMode.clearOpenerWatchdog();
+      }
+      if (typeof window.voiceMode.resumeAfterAssistant === 'function') {
+        window.voiceMode.resumeAfterAssistant(reason);
+      }
+    }
+
     function resumeLiveCallListening(reason = 'assistant_audio_complete') {
       if (!_liveCallMode) return false;
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1863,9 +1952,21 @@
           _handleTtsAudioEnd();
 
         } else if(data.type === 'ttsFallback') {
-          // XTTS unavailable — use browser speech synthesis
+          // XTTS unavailable — use browser speech synthesis, then resume conversation mic
           responseAudioReceived = true;
-          _speakBrowser(data.text);
+          const fbText = String(data.text || '').trim();
+          if (fbText) {
+            showAISpeaking();
+            _speakBrowser(fbText, currentLanguage).then(() => {
+              hideAISpeaking();
+              completeVoiceTurn('tts_fallback_browser');
+            }).catch(() => {
+              hideAISpeaking();
+              completeVoiceTurn('tts_fallback_browser_error');
+            });
+          } else {
+            completeVoiceTurn('tts_fallback_empty');
+          }
 
         } else if(data.type === 'aiResponseChunk') {
           if (!wsResponseActive || wsResponseFinalized) {
@@ -1905,6 +2006,10 @@
           if(finalText) {
             lastAIResponse = finalText;
             try { window.voiceMode && window.voiceMode.updateVoiceAssistantText && window.voiceMode.updateVoiceAssistantText(finalText); } catch(e){}
+            try {
+              window.voiceMode && window.voiceMode.notify &&
+                window.voiceMode.notify('answer_ready', { serverTtsPending: serverTtsPending });
+            } catch(e){}
             if (!data.arabic_mode && !serverTtsPending) {
               finalTtsStarted = triggerFinalTTSParallel(finalText, {
                 source: 'aiResponseDone',
@@ -1931,6 +2036,10 @@
             if (!finalTtsStarted && responseAudioReceived) {
               _handleTtsComplete();
             }
+          }
+          const willPlayServerTts = serverTtsPending || responseAudioReceived;
+          if (_liveCallMode && !data.arabic_mode && !willPlayServerTts && !finalTtsStarted) {
+            completeVoiceTurn('aiResponseDone_no_tts');
           }
           setTextSubmitLock(false);
           refreshConversationsQuietly();
@@ -1969,18 +2078,25 @@
           if(data.final && data.text && data.text.trim() && data.text !== lastTranscript) {
             lastTranscript = data.text;
             resetWsResponseBuffer('voice_transcript', data.text);
-            lastUserMsgEl = appendMsg('user', data.text, detectArabicText(data.text));
-            try { window.voiceMode && window.voiceMode.onTranscript && window.voiceMode.onTranscript(data.text); } catch(e){}
-            showThinking();
+            if (isVoiceOverlayOpen()) {
+              try { window.voiceMode.onTranscript(data.text); } catch(e){}
+            } else {
+              lastUserMsgEl = appendMsg('user', data.text, detectArabicText(data.text));
+              showThinking();
+            }
           }
         } else if(data.type === 'transcriptCorrection') {
           // Backend corrected the garbled Arabic STT — update the 'أنت:' bubble silently
-          if(data.text && data.text.trim() && lastUserMsgEl) {
-            const arabic = detectArabicText(data.text);
-            const label = arabic ? '\u0623\u0646\u062a:' : 'You:';
-            lastUserMsgEl.textContent = `${label} ${data.text}`;
-            if(arabic && !lastUserMsgEl.classList.contains('arabic-msg')) {
-              lastUserMsgEl.classList.add('arabic-msg');
+          if(data.text && data.text.trim()) {
+            if (isVoiceOverlayOpen()) {
+              try { window.voiceMode.updateVoiceUserText(data.text); } catch (e) {}
+            } else if (lastUserMsgEl) {
+              const arabic = detectArabicText(data.text);
+              const label = arabic ? '\u0623\u0646\u062a:' : 'You:';
+              lastUserMsgEl.textContent = `${label} ${data.text}`;
+              if(arabic && !lastUserMsgEl.classList.contains('arabic-msg')) {
+                lastUserMsgEl.classList.add('arabic-msg');
+              }
             }
             lastTranscript = data.text;  // keep in sync
           }
@@ -2050,6 +2166,9 @@
       'what are your capabilities',
       'help',
       'what do you support',
+      'tell me are you getting my messages',
+      'can you listen to me',
+      'are you there',
     ]);
     const ASSISTANT_HELP_AR_QUERIES = new Set([
       'ماذا يمكنك أن تفعل',
@@ -2191,6 +2310,10 @@
       if (banner) banner.classList.remove('visible');
     }
 
+    function isVoiceOverlayOpen() {
+      return !!(window.voiceMode && typeof window.voiceMode.isOpen === 'function' && window.voiceMode.isOpen());
+    }
+
     // Voice control button handlers
     let _liveCallMode = false; // true while user is in a live voice session
 
@@ -2279,13 +2402,22 @@
       ttsLanguage = ttsLanguage || getTTSLanguageForText(sentence);
 
       const t_xtts_start = performance.now() / 1000;
-      const resp = await fetch('/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: sentence, language: ttsLanguage }),
-        credentials: 'include',
-        signal: _ttsStreamAbort.signal,
-      });
+      const fetchAbort = new AbortController();
+      const fetchTimeout = setTimeout(() => {
+        try { fetchAbort.abort(); } catch (_) {}
+      }, 15000);
+      let resp;
+      try {
+        resp = await fetch('/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: sentence, language: ttsLanguage }),
+          credentials: 'include',
+          signal: fetchAbort.signal,
+        });
+      } finally {
+        clearTimeout(fetchTimeout);
+      }
 
       if (!resp.ok) throw new Error('XTTS HTTP ' + resp.status + ': ' + (await resp.text().catch(() => '')));
 
@@ -2438,7 +2570,9 @@
 
     function showThinking() {
       isThinking = true;
-      setActivityIndicator('thinking');
+      if (!isVoiceOverlayOpen()) {
+        setActivityIndicator('thinking');
+      }
       try { window.voiceMode && window.voiceMode.notify && window.voiceMode.notify('thinking'); } catch(e){}
     }
     function showListening() {
@@ -2464,6 +2598,11 @@
       const el = document.getElementById('aiSpeakingGlow');
       if (el) el.classList.add('active');
       try { window.voiceMode && window.voiceMode.notify && window.voiceMode.notify('speaking'); } catch(e){}
+      try {
+        if (isVoiceOverlayOpen() && window.voiceMode.armPendingTtsWatchdog) {
+          window.voiceMode.armPendingTtsWatchdog();
+        }
+      } catch (e) {}
     }
     function hideAISpeaking() {
       const el = document.getElementById('aiSpeakingGlow');
@@ -2610,6 +2749,11 @@
     function queueAssistantTyping(fullText, finalized) {
       const nextText = fullText || '';
       if (!nextText) return;
+      // Voice overlay owns the live transcript; avoid duplicating into main chat log.
+      if (isVoiceOverlayOpen()) {
+        if (finalized) markAssistantFinalText(nextText);
+        return;
+      }
       _typingTargetText = nextText;
       if (finalized) {
         console.log(`[UX TYPEWRITER] finalize chars=${nextText.length}`);
@@ -3139,8 +3283,10 @@
        4) Styling        : driven by CSS variables + .voice-state-* classes
        ========================================================= */
     (function initVoiceMode() {
+      const MANUAL_MIC_ONLY = false; // conversation mode: auto-resume mic after assistant speaks
       const overlay      = document.getElementById('voiceOverlay');
       const openBtn      = document.getElementById('voiceModeOpenBtn');
+      const chatVoiceBtn = document.getElementById('chatVoiceBtn');
       const closeBtn     = document.getElementById('voiceCloseBtn');
       const micBtn       = document.getElementById('voiceMicBtn');
       const stopBtn      = document.getElementById('voiceStopBtn');
@@ -3153,7 +3299,19 @@
       const asstTextEl   = document.getElementById('voiceAssistantText');
       const asstLabelEl  = document.getElementById('voiceAssistantLabel');
 
-      if (!overlay || !openBtn) return; // markup missing
+      if (!overlay) return; // markup missing
+
+      function syncInlineVoiceBtn() {
+        if (!chatVoiceBtn) return;
+        const open = isOpen;
+        chatVoiceBtn.classList.toggle('active', open);
+        const ar = isArabic();
+        chatVoiceBtn.setAttribute(
+          'aria-label',
+          open ? (ar ? 'إغلاق الإدخال الصوتي' : 'Close voice input') : (ar ? 'بدء الإدخال الصوتي' : 'Start voice input')
+        );
+        chatVoiceBtn.title = open ? (ar ? 'إغلاق الصوت' : 'Close voice') : (ar ? 'إدخال صوتي' : 'Voice input');
+      }
 
       const STATES = ['idle', 'listening', 'transcribing', 'assistant_speaking', 'interrupted', 'error'];
       let currentState = 'idle';
@@ -3186,6 +3344,86 @@
       // ---- Phase 7C: idle-after-speaking timer (debounced) ----
       let idleAfterSpeakingTimer = null;
 
+      // Safety net when TTS completion signals are lost
+      let voiceTurnWatchdog = null;
+      const VOICE_TURN_WATCHDOG_MS = 9000;
+      let pendingTtsWatchdog = null;
+      const PENDING_TTS_WATCHDOG_MS = 6000;
+      let openerWatchdog = null;
+      const OPENER_WATCHDOG_MS = 10000;
+      let openerFinished = false;
+
+      function clearOpenerWatchdog() {
+        if (openerWatchdog) {
+          clearTimeout(openerWatchdog);
+          openerWatchdog = null;
+        }
+      }
+
+      function armOpenerWatchdog() {
+        clearOpenerWatchdog();
+        openerWatchdog = setTimeout(() => {
+          openerWatchdog = null;
+          if (!isOpen || voicePaused || openerFinished) return;
+          finishOpener('timeout');
+        }, OPENER_WATCHDOG_MS);
+      }
+
+      function clearPendingTtsWatchdog() {
+        if (pendingTtsWatchdog) {
+          clearTimeout(pendingTtsWatchdog);
+          pendingTtsWatchdog = null;
+        }
+      }
+
+      function armPendingTtsWatchdog() {
+        clearPendingTtsWatchdog();
+        pendingTtsWatchdog = setTimeout(() => {
+          pendingTtsWatchdog = null;
+          if (!isOpen || voicePaused) return;
+          if (currentState === 'listening') return;
+          console.warn('[VOICE WATCHDOG] pending_tts_timeout — forcing recovery');
+          if (typeof completeVoiceTurn === 'function') {
+            completeVoiceTurn('pending_tts_timeout');
+          } else {
+            forceVoiceAudioRecovery('pending_tts_timeout');
+            resumeAfterAssistant('pending_tts_timeout');
+          }
+        }, PENDING_TTS_WATCHDOG_MS);
+      }
+
+      function flushVoiceTurnToChat() {
+        const userT = String(userTextEl?.textContent || '').trim();
+        const asstT = String(asstTextEl?.textContent || '').trim();
+        if (userT) appendMsg('user', userT, detectArabicSafe(userT));
+        if (asstT) appendMsg('assistant', asstT, detectArabicSafe(asstT));
+      }
+
+      function armVoiceTurnWatchdog() {
+        clearVoiceTurnWatchdog();
+        voiceTurnWatchdog = setTimeout(() => {
+          voiceTurnWatchdog = null;
+          if (!isOpen || voicePaused) return;
+          const stuck = (currentState === 'transcribing' || currentState === 'assistant_speaking');
+          if (stuck) {
+            console.warn('[VOICE WATCHDOG] stuck state=' + currentState + ' — forcing recovery');
+            if (typeof completeVoiceTurn === 'function') {
+              completeVoiceTurn('voice_turn_watchdog');
+            } else {
+              forceVoiceAudioRecovery('voice_turn_watchdog');
+              resumeAfterAssistant('voice_turn_watchdog');
+            }
+          }
+        }, VOICE_TURN_WATCHDOG_MS);
+      }
+
+      function clearVoiceTurnWatchdog() {
+        if (voiceTurnWatchdog) {
+          clearTimeout(voiceTurnWatchdog);
+          voiceTurnWatchdog = null;
+        }
+      }
+
       function isArabic() {
         return ((typeof currentLanguage !== 'undefined') ? currentLanguage : 'en') === 'ar';
       }
@@ -3201,7 +3439,7 @@
         const ar = isArabic();
         if (voicePaused) return ar ? 'الميكروفون متوقف مؤقتًا' : 'Microphone paused';
         switch (state) {
-          case 'idle':         return ar ? 'جاهز للاستماع' : 'Ready to listen';
+          case 'idle':         return ar ? 'جاهز — تحدث عندما تريد' : 'Ready — speak when you want';
           case 'listening':    return ar ? 'الاستماع...' : 'Listening...';
           case 'transcribing': return ar ? 'جاري التفكير...' : 'Thinking...';
           case 'assistant_speaking': return ar ? 'يتحدث...' : 'Speaking...';
@@ -3215,7 +3453,7 @@
         return {
           user:      ar ? 'أنت' : 'You',
           assistant: ar ? 'المساعد' : 'Assistant',
-          tap:       ar ? '🎤 استئناف' : '🎤 Resume',
+          tap:       ar ? '🎤 جاهز للاستماع' : '🎤 Ready to listen',
           pauseMic:  ar ? '⏸ إيقاف الميكروفون' : '⏸ Pause mic',
           resumeMic: ar ? '🎤 استئناف الميكروفون' : '🎤 Resume mic',
           interrupt: ar ? '✋ مقاطعة' : '✋ Interrupt',
@@ -3418,7 +3656,9 @@
                 console.log('[VOICE UX] barge_in_detected=true');
                 stopInterruptAnalyser();
                 try { stopVoicePlayback('barge_in'); } catch (_) {}
-                try { startVoiceListening('barge_in'); } catch (_) {}
+                if (!MANUAL_MIC_ONLY) {
+                  try { startVoiceListening('barge_in'); } catch (_) {}
+                }
                 return;
               }
             } else {
@@ -3454,39 +3694,42 @@
           ? 'أهلاً، كيف يمكنني مساعدتك اليوم؟'
           : 'Hello, how can I help you today?';
       }
+      function finishOpener(reason) {
+        if (openerFinished) return;
+        openerFinished = true;
+        clearOpenerWatchdog();
+        console.log('[VOICE MODE] opener_done reason=' + reason);
+        if (!isOpen || voicePaused) return;
+        if (MANUAL_MIC_ONLY) {
+          setVoiceState('idle');
+          updateVoiceStatus(statusFor('idle'));
+          updateMicButtonLabel();
+          return;
+        }
+        if (typeof completeVoiceTurn === 'function') {
+          completeVoiceTurn('opener_' + reason);
+        } else {
+          forceVoiceAudioRecovery('opener_' + reason);
+          resumeAfterAssistant('opener_' + reason);
+        }
+      }
+
       function speakOpener() {
+        openerFinished = false;
         const text = openerText();
         const lang = isArabic() ? 'ar' : 'en';
         console.log('[VOICE MODE] opener_started language=' + lang);
         updateVoiceAssistantText(text);
-        // Show speaking visual immediately so the user gets feedback.
         setVoiceState('assistant_speaking');
-        let started = false;
-        try {
-          if (typeof triggerFinalTTSParallel === 'function') {
-            // Note: triggerFinalTTSParallel calls /tts (pure synthesis) — no RAG, no history.
-            started = triggerFinalTTSParallel(text, { source: 'voice_opener', language: lang });
-          }
-        } catch (e) { started = false; }
-        if (!started) {
-          // Fall back to the browser SpeechSynthesis API.
-          try {
-            if (typeof _speakBrowser === 'function') {
-              _speakBrowser(text, lang).then(() => {
-                console.log('[VOICE MODE] opener_done');
-                resumeAfterAssistant('opener_browser_complete');
-              });
-              return;
-            }
-          } catch (e) {}
-          // No TTS available — stay visible as text only and drop to idle.
-          console.log('[VOICE MODE] opener_done (no_tts)');
-          resumeAfterAssistant('opener_no_tts');
+        armOpenerWatchdog();
+        // Browser-first: reliable when Piper/XTTS /tts returns 503 or hangs.
+        if (typeof _speakBrowser === 'function') {
+          _speakBrowser(text, lang)
+            .then(() => finishOpener('browser'))
+            .catch(() => finishOpener('browser_error'));
           return;
         }
-        // Server TTS: when audio ends the existing pipeline emits speaking_end via hideAISpeaking.
-        // We log opener_done from there — but also schedule a fallback log so it always appears.
-        setTimeout(() => { console.log('[VOICE MODE] opener_done'); }, 50);
+        finishOpener('no_speech_api');
       }
 
       // ---- Open / Close ----
@@ -3509,26 +3752,42 @@
         // If the assistant is already speaking from a prior interaction reflect that.
         if (typeof isTTSPlaying !== 'undefined' && isTTSPlaying) {
           setVoiceState('assistant_speaking');
+          syncInlineVoiceBtn();
           return;
         }
-        if (typeof isRecording !== 'undefined' && isRecording) {
+        if (typeof isRecording !== 'undefined' && isRecording && !MANUAL_MIC_ONLY) {
           setVoiceState('listening');
           console.log('[VOICE UX] auto_listen_started=true language=' + lang + ' reason=already_recording');
+          syncInlineVoiceBtn();
           return;
         }
-        // Greet on first open in this session, otherwise just go idle/ready.
+        // Greet on first open; conversation mode auto-arms mic after opener / on reopen.
         if (!openerSpokenInSession) {
           openerSpokenInSession = true;
           speakOpener();
         } else {
-          setVoiceState('idle');
-          startVoiceListening('open');
+          startVoiceListening('reopen');
         }
+        syncInlineVoiceBtn();
+      }
+
+      // Ensure overlay is interactive: tap mic or circle area to start listening when idle.
+      if (circleWrap) {
+        circleWrap.addEventListener('click', () => {
+          if (!isOpen || voicePaused) return;
+          if (currentState === 'idle' || currentState === 'error' || currentState === 'interrupted') {
+            resumeVoiceListening();
+          }
+        });
       }
       function closeVoiceMode() {
+        try { flushVoiceTurnToChat(); } catch (e) { console.warn('[VOICE MODE] flush to chat failed', e); }
         isOpen = false;
         voicePaused = false;
         _liveCallMode = false;
+        clearVoiceTurnWatchdog();
+        clearPendingTtsWatchdog();
+        clearOpenerWatchdog();
         if (idleAfterSpeakingTimer) { clearTimeout(idleAfterSpeakingTimer); idleAfterSpeakingTimer = null; }
         try {
           if (typeof isRecording !== 'undefined' && isRecording &&
@@ -3545,6 +3804,7 @@
         setVoiceState('idle');
         updateVoiceStatus(statusFor(currentState));
         updateMicButtonLabel();
+        syncInlineVoiceBtn();
         console.log('[VOICE MODE] closed');
       }
 
@@ -3625,10 +3885,31 @@
       }
       function resumeAfterAssistant(reason = 'assistant_audio_complete') {
         if (!isOpen || voicePaused) return false;
+        clearVoiceTurnWatchdog();
+        clearPendingTtsWatchdog();
+        if (typeof pauseAudioSending !== 'undefined') pauseAudioSending = false;
         if (idleAfterSpeakingTimer) { clearTimeout(idleAfterSpeakingTimer); idleAfterSpeakingTimer = null; }
-        setVoiceState('listening');
-        startVoiceListening(reason);
-        return true;
+        if (MANUAL_MIC_ONLY) {
+          setVoiceState('idle');
+          updateVoiceStatus(statusFor('idle'));
+          updateMicButtonLabel();
+          console.log('[VOICE FLOW] manual_mic_idle_after=' + reason);
+          return false;
+        }
+        const started = startVoiceListening(reason);
+        if (started && typeof started.then === 'function') {
+          started.then((ok) => {
+            if (!isOpen || voicePaused) return;
+            if (!ok) {
+              setVoiceState('idle');
+              updateVoiceStatus(statusFor('idle'));
+              updateMicButtonLabel();
+              console.warn('[VOICE FLOW] listen_failed_after=' + reason);
+            }
+          });
+          return true;
+        }
+        return !!started;
       }
       function stopVoicePlayback(reason = 'manual_stop') {
         try {
@@ -3669,7 +3950,16 @@
         } catch (_) {}
         setVoiceState('interrupted');
         console.log('[VOICE MODE] tts_started=False (playback stopped by user)');
-        setTimeout(() => { if (isOpen && !voicePaused) startVoiceListening(reason); }, 120);
+        if (MANUAL_MIC_ONLY) {
+          setTimeout(() => {
+            if (!isOpen || voicePaused) return;
+            setVoiceState('idle');
+            updateVoiceStatus(statusFor('idle'));
+            updateMicButtonLabel();
+          }, 120);
+        } else {
+          setTimeout(() => { if (isOpen && !voicePaused) startVoiceListening(reason); }, 120);
+        }
       }
 
       // ---- Public hook: react to events from the existing pipeline ----
@@ -3689,20 +3979,52 @@
             console.log('[VOICE MODE] tts_started=True');
             setVoiceState('assistant_speaking');
             break;
+          case 'answer_ready':
+            clearVoiceTurnWatchdog();
+            if (voicePaused) break;
+            hideThinking();
+            if (typeof isTTSPlaying !== 'undefined' && isTTSPlaying) {
+              setVoiceState('assistant_speaking');
+              armPendingTtsWatchdog();
+            } else if (payload && payload.serverTtsPending) {
+              setVoiceState('assistant_speaking');
+              armPendingTtsWatchdog();
+            } else {
+              resumeAfterAssistant('answer_ready');
+            }
+            break;
           case 'speaking_end':
+            clearPendingTtsWatchdog();
+            hideThinking();
             if (idleAfterSpeakingTimer) { clearTimeout(idleAfterSpeakingTimer); idleAfterSpeakingTimer = null; }
             idleAfterSpeakingTimer = setTimeout(() => {
               idleAfterSpeakingTimer = null;
               if (!isOpen) return;
-              resumeAfterAssistant('speaking_end');
-              console.log('[VOICE FLOW] returned_to_listening_after_speaking');
+              if (MANUAL_MIC_ONLY) {
+                setVoiceState('idle');
+                updateVoiceStatus(statusFor('idle'));
+                updateMicButtonLabel();
+                console.log('[VOICE FLOW] tap_to_speak_after_speaking');
+              } else {
+                resumeAfterAssistant('speaking_end');
+                console.log('[VOICE FLOW] returned_to_listening_after_speaking');
+              }
             }, 300);
             break;
           case 'barge_in':
             voicePaused = false;
             overlay.classList.remove('voice-paused');
             setVoiceState('interrupted');
-            setTimeout(() => { if (isOpen && !voicePaused) startVoiceListening('barge_in'); }, 120);
+            if (MANUAL_MIC_ONLY) {
+              setTimeout(() => {
+                if (!isOpen || voicePaused) return;
+                setVoiceState('idle');
+                updateVoiceStatus(statusFor('idle'));
+                updateMicButtonLabel();
+              }, 120);
+            } else {
+              setTimeout(() => { if (isOpen && !voicePaused) startVoiceListening('barge_in'); }, 120);
+            }
             break;
           case 'error':
             setVoiceState('error');
@@ -3721,10 +4043,17 @@
         updateVoiceAssistantText('');
         setVoiceState('transcribing');
         updateVoiceStatus(isArabic() ? 'جاري التفكير...' : 'Thinking...');
+        armVoiceTurnWatchdog();
       }
 
       // ---- Wire up DOM events ----
-      openBtn.addEventListener('click', openVoiceMode);
+      if (openBtn) openBtn.addEventListener('click', openVoiceMode);
+      if (chatVoiceBtn) {
+        chatVoiceBtn.addEventListener('click', () => {
+          if (isOpen) closeVoiceMode();
+          else openVoiceMode();
+        });
+      }
       closeBtn.addEventListener('click', closeVoiceMode);
       micBtn.addEventListener('click', () => {
         if (voicePaused) {
@@ -3767,7 +4096,14 @@
         clearVoiceConversationPreview,
         notify,
         onTranscript,
+        armVoiceTurnWatchdog,
+        clearVoiceTurnWatchdog,
+        armPendingTtsWatchdog,
+        clearPendingTtsWatchdog,
+        armOpenerWatchdog,
+        clearOpenerWatchdog,
         isOpen: () => isOpen,
+        isPaused: () => voicePaused,
         currentState: () => currentState,
       };
     })();

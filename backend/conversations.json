@@ -1,6 +1,242 @@
 {
   "conversations": [
     {
+      "id": "1bd0370a-8576-4bec-8bab-173c90ac6a88",
+      "title": "how to mange endo treated teeth",
+      "messages": [
+        {
+          "role": "user",
+          "text": "how to mange endo treated teeth"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "do you here"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "do you here me ?"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "hi"
+        },
+        {
+          "role": "assistant",
+          "text": "Hello! How can I assist you today?"
+        },
+        {
+          "role": "user",
+          "text": "I'll be proud to try. Get a listen. I'm any of them. Hi, how are you?"
+        }
+      ],
+      "created_at": "2026-05-20T16:25:49.092022+00:00",
+      "updated_at": "2026-05-20T16:35:09.035635+00:00"
+    },
+    {
+      "id": "c2ca3c41-7920-4027-891d-5542a02eed63",
+      "title": "tell me are you getting my messages",
+      "messages": [
+        {
+          "role": "user",
+          "text": "tell me are you getting my messages"
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, I received your message. I'm here to help with questions about your support knowledge base and uploaded documents-for example, password reset, returns, or shipping. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "Can you listen to me?"
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, I received your message. I'm here to help with questions about your support knowledge base and uploaded documents-for example, password reset, returns, or shipping. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "How do I reset my password?"
+        },
+        {
+          "role": "assistant",
+          "text": "To reset your password, follow these steps: 1) Go to the log in page and click 'Forgot Password' 2) Enter your registered email address 3) Check your email inbox for a password reset link 4) Click the link (valid for 24 hours) 5) Enter and confirm your new password 6) Log in with your new credentials."
+        },
+        {
+          "role": "user",
+          "text": "What is quantum physics?"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        }
+      ],
+      "created_at": "2026-05-20T02:59:45.638671+00:00",
+      "updated_at": "2026-05-20T02:59:47.203660+00:00"
+    },
+    {
+      "id": "197d34df-ad09-42e6-b370-b54704e7015d",
+      "title": "How do I reset my password?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "How do I reset my password?"
+        },
+        {
+          "role": "assistant",
+          "text": "To reset your password, follow these steps: 1) Go to the log in page and click 'Forgot Password' 2) Enter your registered email address 3) Check your email inbox for a password reset link 4) Click the link (valid for 24 hours) 5) Enter and confirm your new password 6) Log in with your new credentials."
+        },
+        {
+          "role": "user",
+          "text": "tell me what you can do"
+        },
+        {
+          "role": "assistant",
+          "text": "I can help you with the uploaded documents. You can ask me to explain concepts, summarize relevant parts, list items mentioned in the documents, compare grounded topics, and answer in English or Arabic when supported."
+        },
+        {
+          "role": "user",
+          "text": "tell me what you can dotell me what you can do"
+        },
+        {
+          "role": "assistant",
+          "text": "I can help you with the uploaded documents. You can ask me to explain concepts, summarize relevant parts, list items mentioned in the documents, compare grounded topics, and answer in English or Arabic when supported."
+        },
+        {
+          "role": "user",
+          "text": "tell me are getting my messages"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "How do I reset my password?"
+        },
+        {
+          "role": "assistant",
+          "text": "To reset your password, follow these steps: 1) Go to the log in page and click 'Forgot Password' 2) Enter your registered email address 3) Check your email inbox for a password reset link 4) Click the link (valid for 24 hours) 5) Enter and confirm your new password 6) Log in with your new credentials."
+        },
+        {
+          "role": "user",
+          "text": "Can you listen to me? Can you give me?"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "tell me are you getting my messages"
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, I received your message. I'm here to help with questions about your support knowledge base and uploaded documents-for example, password reset, returns, or shipping. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "Can you hear me?"
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, I received your message. I'm here to help with questions about your support knowledge base and uploaded documents-for example, password reset, returns, or shipping. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "So now we'll kind of speak together."
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "Yep."
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "Are you hearing me?"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "up."
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "So why am I?"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "Why are you only having to find the document?"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "So can you hear me?"
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, I received your message. I'm here to help with questions about your support knowledge base and uploaded documents-for example, password reset, returns, or shipping. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "So tell me how to reset the password."
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "Bye bye."
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "hi"
+        },
+        {
+          "role": "assistant",
+          "text": "Hello! How can I assist you today?"
+        }
+      ],
+      "created_at": "2026-05-20T02:36:48.720826+00:00",
+      "updated_at": "2026-05-20T04:21:18.637077+00:00"
+    },
+    {
       "id": "245f150c-e923-4f77-84ee-b92f3b5b972f",
       "title": "tell me what you can dotell me what...",
       "messages": [

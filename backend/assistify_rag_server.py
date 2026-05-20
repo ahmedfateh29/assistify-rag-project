@@ -11928,20 +11928,71 @@ def _explanation_content_tokens(value: str, keep_short: bool = False) -> list[st
     return tokens
 
 
+def _normalize_support_query_surface(query: str) -> str:
+    """Strip conversational/STT prefixes so support procedural detection still matches."""
+    q = re.sub(r"\s+", " ", str(query or "").strip())
+    q = re.sub(r"^(?:so|okay|ok|well|um|uh)[,.\s]+", "", q, flags=re.IGNORECASE)
+    q = re.sub(
+        r"^(?:please\s+)?(?:(?:can|could)\s+you\s+)?(?:tell\s+me|explain\s+to\s+me)\s+",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    )
+    return q.strip(" ?.!,;:")
+
+
 def _is_support_procedural_query(query: str) -> bool:
     """Support-KB style questions (returns, password, shipping) — not relationship essays."""
-    q = re.sub(r"\s+", " ", str(query or "").strip().lower())
+    q = _normalize_support_query_surface(query).lower()
     if not q:
         return False
     patterns = (
         r"^\s*how\s+(?:do|can|to)\s+i\s+",
+        r"^\s*(?:how\s+to|how\s+do\s+i|how\s+can\s+i)\s+",
+        r"^\s*(?:tell\s+me\s+)?how\s+to\s+",
         r"^\s*how\s+many\b",
         r"^\s*when\s+is\b",
         r"^\s*what\s+payment\b",
         r"^\s*what\s+are\s+(?:your|the)\b",
         r"support\s+hours\b",
+        r".\breset\b.*\bpassword\b",
+        r".\bpassword\b.*\breset\b",
     )
     return any(re.search(p, q) for p in patterns)
+
+
+def _rescue_support_procedural_from_docs(query: str, retrieved_docs: list[dict]) -> str:
+    """When retrieval clearly has a support how-to chunk, return it instead of not-found."""
+    if not _is_support_procedural_query(query):
+        return ""
+    if not retrieved_docs:
+        return ""
+    procedural_markers = (
+        "follow these steps",
+        "forgot password",
+        "reset link",
+        "log in with your new",
+    )
+    for doc in retrieved_docs[:4]:
+        meta = dict((doc or {}).get("metadata") or {})
+        doc_id = str(meta.get("id") or meta.get("doc_id") or "").lower()
+        text = str((doc or {}).get("page_content") or (doc or {}).get("text") or "").strip()
+        if not text:
+            continue
+        low = text.lower()
+        password_reset = ("password" in low and "reset" in low) or doc_id == "password_reset"
+        if not password_reset and not any(m in low for m in procedural_markers):
+            continue
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        if len(cleaned) >= 40:
+            logger.info(
+                "[SUPPORT PROCEDURAL RESCUE] query=%s source=%s chars=%s",
+                str(query or "")[:240],
+                doc_id or "support_chunk",
+                len(cleaned),
+            )
+            return cleaned
+    return ""
 
 
 def _is_explanation_intent_query(query: str) -> bool:
@@ -27770,6 +27821,82 @@ def _is_pure_smalltalk_query(query: str) -> bool:
     return _classify_smalltalk_intent(query) != "unknown"
 
 
+_ROUTER_DIRECT_ROUTES = frozenset(
+    {"smalltalk", "assistant_meta", "unsupported_unclear", "conversational_ack"}
+)
+
+
+def _conversational_redirect(query: str, language: str | None = None) -> str:
+    lang = _route_response_language(query, language)
+    return CONVERSATIONAL_REDIRECT_AR if lang == "ar" else CONVERSATIONAL_REDIRECT_EN
+
+
+def _classify_conversational_ack_intent(query: str) -> str:
+    q = _normalize_query_for_router(query)
+    if not q:
+        return "unknown"
+    if _detect_language(query) == "ar":
+        if re.search(r"\bهل\s+(?:تسمع|تستمع)\s*(?:لي)?\b", q):
+            return "listening"
+        if re.search(r"\bهل\s+(?:تستقبل|وصلت|وصلتك)\s+(?:رسالتي|رسائلي|رسالتي)\b", q):
+            return "presence"
+        if re.search(r"\bهل\s+انت\s+هنا\b", q):
+            return "presence"
+        if re.search(r"\bهل\s+تفهم(?:ني)?\b", q):
+            return "understanding"
+        if re.search(r"\bهل\s+انت\s+(?:متصل|متاح|شغال|تعمل)\b", q):
+            return "online"
+        return "unknown"
+    patterns: list[tuple[str, str]] = [
+        ("listening", r"\bcan\s+you\s+(?:hear|listen(?:\s+to)?)\s+me\b"),
+        ("listening", r"\b(?:do|are)\s+you\s+(?:hear|listening)\s+me\b"),
+        ("presence", r"\bare\s+you\s+there\b"),
+        ("presence", r"\b(?:tell\s+me\s+)?are\s+you\s+(?:there|getting|receiving)\s+(?:my\s+)?(?:message|messages|text|input)\b"),
+        ("presence", r"\b(?:did\s+you\s+get|are\s+you\s+getting)\s+(?:my\s+)?(?:message|messages)\b"),
+        ("understanding", r"\bdo\s+you\s+understand\s+me\b"),
+        ("online", r"\bare\s+you\s+(?:online|available|working|awake)\b"),
+        ("presence", r"\bhello\s*\?\s*$"),
+    ]
+    for intent, pattern in patterns:
+        if re.search(pattern, q):
+            return intent
+    return "unknown"
+
+
+def _is_conversational_ack_query(query: str) -> bool:
+    return _classify_conversational_ack_intent(query) != "unknown"
+
+
+def _is_assistant_behavior_complaint_query(query: str) -> bool:
+    """Meta questions about document-only / not-found behavior (not document content)."""
+    return _classify_assistant_meta_intent(query) in {
+        "document_only_behavior",
+        "not_found_behavior",
+    }
+
+
+def _finalize_user_visible_answer(
+    query: str,
+    answer: str,
+    language: str | None = None,
+    retrieved_docs: list[dict] | None = None,
+) -> str:
+    raw = str(answer or "").strip()
+    if raw.lower() != RAG_NO_MATCH_RESPONSE.lower():
+        return answer
+    if (
+        _is_conversational_ack_query(query)
+        or _is_unsupported_unclear_query(query)
+        or _is_assistant_behavior_complaint_query(query)
+    ):
+        return _conversational_redirect(query, language)
+    if retrieved_docs:
+        rescued = _rescue_support_procedural_from_docs(query, retrieved_docs)
+        if rescued:
+            return rescued
+    return answer
+
+
 def _classify_assistant_meta_intent(query: str) -> str:
     q = _normalize_query_for_router(query)
     if not q:
@@ -27810,6 +27937,22 @@ def _classify_assistant_meta_intent(query: str) -> str:
         ("capabilities", r"\btell\s+me\s+what\s+you\s+can\s+do\b"),
         ("capabilities", r"\bwhat\s+can\s+you\s+do\b"),
         ("capabilities", r"\b(?:tell\s+me\s+)?(?:if\s+you\s+)?can\s+(?:you\s+)?do\s+anything\b"),
+        (
+            "document_only_behavior",
+            r"\bwhy\s+(?:are\s+you|do\s+you)\s+only\b.*\b(?:find|search|look|use)\b.*\b(?:document|documents)\b",
+        ),
+        (
+            "document_only_behavior",
+            r"\bwhy\s+(?:can(?:not|'t)|won(?:not|'t))\s+you\s+answer\s+(?:without|outside)\s+(?:the\s+)?(?:document|documents)\b",
+        ),
+        (
+            "not_found_behavior",
+            r"\bwhy\s+(?:do\s+you|are\s+you)\s+(?:keep\s+)?(?:saying|tell(?:ing)?)\s+(?:not\s+found|that\s+it\s+is\s+not\s+found)\b",
+        ),
+        (
+            "not_found_behavior",
+            r"\bwhy\s+(?:do\s+you|are\s+you)\s+only\s+(?:saying|give|return(?:ing)?)\s+not\s+found\b",
+        ),
     ]
     for intent, pattern in patterns:
         if re.search(pattern, q):
@@ -27871,6 +28014,8 @@ def _looks_like_document_question(query: str) -> bool:
 
 
 def classify_query_route(query: str) -> str:
+    if _is_conversational_ack_query(query):
+        return "conversational_ack"
     if _is_assistant_capability_or_meta_query(query):
         return "assistant_meta"
     if _is_pure_smalltalk_query(query):
@@ -27890,12 +28035,18 @@ def _direct_route_answer(query: str, route: str, language: str | None = None) ->
         return ASSISTANT_META_RESPONSE_AR if lang == "ar" else ASSISTANT_META_RESPONSE_EN
     if route == "smalltalk":
         return _smalltalk_response(query)
+    if route in {"conversational_ack", "unsupported_unclear"}:
+        return _conversational_redirect(query, lang)
     return RAG_NO_MATCH_RESPONSE
 
 
 def _log_direct_route_handled(route: str, query: str, language: str | None = None) -> None:
     lang = _route_response_language(query, language)
-    if route == "assistant_meta":
+    if route == "conversational_ack":
+        intent = _classify_conversational_ack_intent(query)
+        logger.info("[ROUTER CONVERSATIONAL] handled=True language=%s intent=%s query=%s", lang, intent, str(query or "")[:240])
+        logger.info("[CONVERSATION INTENT] intent=conversational:%s language=%s handled=True", intent, lang)
+    elif route == "assistant_meta":
         intent = _classify_assistant_meta_intent(query)
         logger.info("[ROUTER META] handled=True language=%s intent=%s query=%s", lang, intent, str(query or "")[:240])
         logger.info("[CONVERSATION INTENT] intent=meta:%s language=%s handled=True", intent, lang)
@@ -28029,7 +28180,7 @@ def _apply_not_found_ux(query: str, answer: str, doc_dicts: List[Dict[str, Any]]
     def _finalize(a: str) -> str:
         raw = str(a or "").strip()
         if raw.lower() == RAG_NO_MATCH_RESPONSE.lower():
-            return RAG_NO_MATCH_RESPONSE
+            return _finalize_user_visible_answer(query, RAG_NO_MATCH_RESPONSE)
         if _is_arabic_text(raw):
             cleaned = _polish_final_response_text(query, raw)
         else:
@@ -28047,8 +28198,9 @@ def _apply_not_found_ux(query: str, answer: str, doc_dicts: List[Dict[str, Any]]
         logger.info("[POSTPROCESS FINAL ANSWER] %s", ans[:280])
         return ans
 
-    logger.info("[POSTPROCESS FINAL ANSWER] %s", RAG_NO_MATCH_RESPONSE)
-    return RAG_NO_MATCH_RESPONSE
+    final = _finalize_user_visible_answer(query, RAG_NO_MATCH_RESPONSE)
+    logger.info("[POSTPROCESS FINAL ANSWER] %s", final[:280])
+    return final
 
 
 def _is_explicit_oos_query(query: str) -> bool:
@@ -30757,6 +30909,15 @@ def _shared_rag_final_answer_decision( # type: ignore
             answer_source_mode = "not_found_guard"
         if ans is not None and cleaned_ans != ans:
             logger.info("[OCR CLEANUP APPLIED] before=%s | after=%s", str(ans)[:180], str(cleaned_ans)[:180])
+        if cleaned_ans == RAG_NO_MATCH_RESPONSE:
+            _support_rescue = _rescue_support_procedural_from_docs(
+                query, routed_docs or doc_dicts or []
+            )
+            if _support_rescue:
+                cleaned_ans = _support_rescue
+                used_llm = False
+                answer_type = "support_procedural_rescue"
+                answer_source_mode = "support_kb"
         rejected = bool(cleaned_ans == RAG_NO_MATCH_RESPONSE)
         rejection_reason = ""
         if rejected:
@@ -33334,7 +33495,7 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
         text = _maybe_rewrite_about_entity_question(text)
 
     route = classify_query_route(text)
-    if route in {"smalltalk", "assistant_meta", "unsupported_unclear"}:
+    if route in _ROUTER_DIRECT_ROUTES:
         route_lang = _route_response_language(text)
         direct_answer = _direct_route_answer(text, route, route_lang)
         _log_direct_route_handled(route, text, route_lang)
@@ -36042,9 +36203,12 @@ async def send_final_response(
     send_chunk: bool = True,
     replace: bool = False,
     extra_payload: Optional[dict] = None,
+    user_query: Optional[str] = None,
 ) -> None:
     """Send the final WS response and consistently attach TTS when enabled."""
     response_text = str(text or "")
+    if user_query:
+        response_text = _finalize_user_visible_answer(user_query, response_text, language)
     timing = t_meta if isinstance(t_meta, dict) else {}
     ws = websocket or _active_ws_connections.get(connection_id)
     if ws is None:
@@ -36903,7 +37067,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
     try:
         if text and len(str(text).strip()) >= 2:
             direct_route = classify_query_route(text)
-            if direct_route in {"smalltalk", "assistant_meta", "unsupported_unclear"}:
+            if direct_route in _ROUTER_DIRECT_ROUTES:
                 route_t0 = time.perf_counter()
                 route_lang = _route_response_language(text, language)
                 direct_answer = _direct_route_answer(text, direct_route, route_lang)
@@ -40809,6 +40973,7 @@ async def query_rag(data: QueryRequest, request: Request, user=Depends(require_l
         normalized_query_for_output, _ = _normalize_definition_query_before_retrieval(_post_text)
         ai_response = _force_clean_definition_sentence(normalized_query_for_output or _post_text, ai_response, retrieved_docs)
     ai_response = _cleanup_final_answer_text(ai_response)
+    ai_response = _finalize_user_visible_answer(_post_text, ai_response)
     logger.info("[HTTP FINAL ANSWER BEFORE RETURN] %s", str(ai_response or "")[:320])
     return {"answer": ai_response}
 
@@ -43223,7 +43388,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                                     continue
 
                                 route = classify_query_route(text)
-                                if route in {"smalltalk", "assistant_meta", "unsupported_unclear"}:
+                                if route in _ROUTER_DIRECT_ROUTES:
                                     route_lang = _route_response_language(text, msg_lang)
                                     direct_answer = _direct_route_answer(text, route, route_lang)
                                     _log_direct_route_handled(route, text, route_lang)
@@ -43272,7 +43437,9 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                                     continue
 
                                 if _is_weak_generic_request(text):
-                                    direct_answer = RAG_NO_MATCH_RESPONSE
+                                    direct_answer = _finalize_user_visible_answer(
+                                        text, RAG_NO_MATCH_RESPONSE, msg_lang
+                                    )
                                     logger.info("[ANSWER PERMISSION] allowed=False reason=weak_generic_entrypoint query=%s", text[:180])
                                     try:
                                         _save_last_answer_state(connection_id, text, direct_answer, [])
