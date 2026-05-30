@@ -129,6 +129,14 @@ def ensure_cwd_and_path() -> None:
     os.chdir(REPO_ROOT)
     # prepend repo root to PYTHONPATH for reliable imports
     os.environ["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(REPO_ROOT / ".env")
+    except Exception:
+        pass
+    # Avoid OpenMP crashes when torch + faster-whisper run together (cmd or PowerShell).
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     _purge_pycache()
 
 
