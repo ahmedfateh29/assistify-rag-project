@@ -2899,6 +2899,24 @@
       });
     }
 
+    // Speak via the SAME server Piper voice used for answers, so the greeting
+    // and the answers sound like one person. Falls back to the browser voice
+    // ONLY if Piper is unavailable/fails (keeps voice mode usable offline).
+    async function _speakPiper(text, ttsLanguage) {
+      const lang = ttsLanguage || getTTSLanguageForText(text);
+      if (_xttsAvailable) {
+        try {
+          const ok = await _playStreamingTTS(text, lang);
+          if (ok) return;
+        } catch (e) {
+          if (e && e.name === 'AbortError') return; // barge-in — do not fall back
+          console.warn('[TTS] Opener Piper failed — falling back to browser voice:', e && (e.message || e));
+          _disableXttsMomentarily();
+        }
+      }
+      await _speakBrowser(text, lang);
+    }
+
     function addToTTSQueue(text, selectedLanguage = currentLanguage) {
       if (!text || text.trim() === '') return;
       const cleaned = text.replace(/[\u{1F000}-\u{1F9FF}\u{2600}-\u{27BF}]/gu, '').trim();
@@ -3722,7 +3740,14 @@
         updateVoiceAssistantText(text);
         setVoiceState('assistant_speaking');
         armOpenerWatchdog();
-        // Browser-first: reliable when Piper/XTTS /tts returns 503 or hangs.
+        // Piper-first so the greeting matches the answer voice; the browser
+        // voice is used only if Piper is unreachable (handled inside _speakPiper).
+        if (typeof _speakPiper === 'function') {
+          _speakPiper(text, lang)
+            .then(() => finishOpener('piper'))
+            .catch(() => finishOpener('piper_error'));
+          return;
+        }
         if (typeof _speakBrowser === 'function') {
           _speakBrowser(text, lang)
             .then(() => finishOpener('browser'))

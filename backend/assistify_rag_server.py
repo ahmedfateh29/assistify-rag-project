@@ -11950,13 +11950,32 @@ def _is_support_procedural_query(query: str) -> bool:
         r"^\s*how\s+(?:do|can|to)\s+i\s+",
         r"^\s*(?:how\s+to|how\s+do\s+i|how\s+can\s+i)\s+",
         r"^\s*(?:tell\s+me\s+)?how\s+to\s+",
-        r"^\s*how\s+many\b",
-        r"^\s*when\s+is\b",
+        r"^\s*how\s+(?:many|long|much)\b",
+        r"^\s*when\s+(?:is|are)\b",
         r"^\s*what\s+payment\b",
         r"^\s*what\s+are\s+(?:your|the)\b",
         r"support\s+hours\b",
         r".\breset\b.*\bpassword\b",
         r".\bpassword\b.*\breset\b",
+        # ---- Common support-FAQ intents (e-commerce style) ----
+        # These are support questions that were previously blocked by the
+        # generic/low-confidence guard even though the matching support
+        # chunk was retrieved. The answer-permission gate still requires a
+        # retrieved doc, so off-topic queries remain gated downstream.
+        r"\breturn\b.*\bpolic",
+        r"\brefund\b",
+        r"\bexchange\b",
+        r"\bwarrant(?:y|ies)\b",
+        r"\bguarantee\b",
+        r"\bcancel(?:lation|led|ling)?\b",
+        r"\b(?:forgot|lost|recover|change|update)\b.*\bpassword\b",
+        r"\bpassword\b.*\b(?:forgot|lost|recover|change|update)\b",
+        r"\btrack(?:ing)?\b",
+        r"\bwhere\s+is\s+my\b",
+        r"\b(?:ship|shipping|shipped|deliver|delivery)\b",
+        r"\bpayment\b",
+        r"\b(?:create|delete|update|make)\b.*\baccount\b",
+        r"\bcontact\b.*\b(?:hours|support|us)\b",
     )
     return any(re.search(p, q) for p in patterns)
 
