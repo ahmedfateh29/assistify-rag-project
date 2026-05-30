@@ -61,6 +61,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PORT_LLM = 8000
 PORT_RAG = 7000
 PORT_LOGIN = 7001
+PORT_PIPER = 5002    # Piper TTS microservice (tts_service.piper_server:app)
+PORT_OLLAMA = 11434  # Ollama inference server (started via the ollama CLI)
 
 SERVICES = [
     {
@@ -140,6 +142,9 @@ def parse_args():
     p.add_argument("--no-llm", action="store_true", help="Skip starting LLM server (use existing one)")
     p.add_argument("--no-rag", action="store_true", help="Skip starting RAG server (use existing one)")
     p.add_argument("--no-login", action="store_true", help="Skip starting Login server (use existing one)")
+    p.add_argument("--no-ollama", action="store_true", help="Skip auto-starting Ollama (assume it is already running on 11434)")
+    p.add_argument("--no-piper", action="store_true", help="Skip starting the Piper TTS microservice on 5002")
+    p.add_argument("--skip-model-pull", action="store_true", help="Do not auto 'ollama pull' the model if it is missing")
     p.add_argument("--llm-host", default=None, help="Override LLM bind host (default 0.0.0.0)")
     p.add_argument("--rag-host", default=None, help="Override RAG bind host (default 127.0.0.1)")
     p.add_argument("--login-host", default=None, help="Override Login bind host (default 127.0.0.1)")
@@ -257,6 +262,91 @@ async def pipe_output(prefix: str, stream: asyncio.StreamReader):
 def _host_for_check(bind_host: str) -> str:
     # If a service binds to 0.0.0.0, we still check via localhost
     return "127.0.0.1" if bind_host in ("0.0.0.0", "::") else bind_host
+
+
+def _piper_voice_env() -> dict:
+    """Resolve env overrides pointing Piper at the bundled voice models.
+    Only sets a var if the model file actually exists so the service can
+    report a clear 'voice_missing' instead of a bogus path."""
+    en = REPO_ROOT / "models" / "piper" / "en" / "voice.onnx"
+    ar = REPO_ROOT / "models" / "piper" / "ar" / "voice.onnx"
+    env: dict = {}
+    if en.exists():
+        env["PIPER_EN_VOICE_PATH"] = str(en)
+    if ar.exists():
+        env["PIPER_AR_VOICE_PATH"] = str(ar)
+    return env
+
+
+async def _ollama_model_usable(model: str) -> bool:
+    """Return True if `model` is pulled AND loadable.
+
+    We probe POST /api/show rather than /api/tags: a corrupt model store
+    (missing blobs, scrambled manifests) still shows up in /api/tags but
+    /api/show returns 404 'not found'. Treating that as 'not usable' lets
+    the launcher self-heal by re-pulling. On genuine uncertainty (no
+    aiohttp, transport error) we assume usable so we never block startup on
+    a needless multi-GB download."""
+    if aiohttp is None:
+        return True
+    try:
+        to = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=to) as session:
+            async with session.post(
+                f"http://127.0.0.1:{PORT_OLLAMA}/api/show", json={"model": model}
+            ) as resp:
+                return resp.status == 200
+    except Exception:
+        return True
+
+
+async def ensure_ollama(skip: bool, skip_pull: bool):
+    """Make sure Ollama is up on 11434 (start it if needed) and the configured
+    model is available. Returns the spawned process ONLY if we started it (so
+    the caller can shut it down); returns None if it was already running or
+    skipped."""
+    if skip:
+        print("[SKIPPED] Ollama startup (--no-ollama)")
+        return None
+
+    started_proc = None
+    if port_is_open("127.0.0.1", PORT_OLLAMA):
+        print(f"[OLLAMA] Already running on 127.0.0.1:{PORT_OLLAMA}")
+    else:
+        ollama_cli = os.environ.get("OLLAMA_CLI", "ollama")
+        print(f"Starting Ollama via '{ollama_cli} serve' ...")
+        try:
+            started_proc = subprocess.Popen(
+                [ollama_cli, "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_popen_flags(),
+            )
+        except FileNotFoundError:
+            print(f"[OLLAMA] '{ollama_cli}' not found on PATH. Start Ollama manually, then re-run.")
+            return None
+        if not await wait_for_port("127.0.0.1", PORT_OLLAMA, timeout=60.0):
+            print("[OLLAMA] Port 11434 did not open in time. Continuing; LLM calls may fail.")
+            return started_proc
+        print(f"[OLLAMA] Ready on 127.0.0.1:{PORT_OLLAMA}")
+
+    # Ensure the model is available AND loadable (a corrupt store still lists
+    # the model in /api/tags but cannot serve it).
+    model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+    if not skip_pull:
+        if not await _ollama_model_usable(model):
+            ollama_cli = os.environ.get("OLLAMA_CLI", "ollama")
+            print(f"[OLLAMA] Model '{model}' missing or unusable — pulling (first run may take a while)...")
+            try:
+                # 'rm' clears a corrupt/orphaned manifest first (ignored if absent).
+                subprocess.run([ollama_cli, "rm", model],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run([ollama_cli, "pull", model], check=False)
+            except Exception as e:
+                print(f"[OLLAMA] pull failed: {e}")
+        else:
+            print(f"[OLLAMA] Model '{model}' present and loadable.")
+    return started_proc
 
 
 async def start_service(name: str, module: str, host: str, port: int, ready_path: str, reload_flag: bool, log_level: str, keep_alive: int = 75, env_overrides: Optional[dict] = None) -> Tuple[asyncio.subprocess.Process, bool]:
@@ -377,15 +467,20 @@ async def main():
     if args.login_port is not None:
         SERVICES[2]["port"] = args.login_port
 
-    # Optionally free ports (Windows only)
+    # Optionally free ports (Windows only). Ollama (11434) is intentionally
+    # NOT killed since it may be a shared tray app / external daemon.
     if args.kill_ports and IS_WINDOWS:
-        for p in (SERVICES[0]["port"], SERVICES[1]["port"], SERVICES[2]["port"]):
+        ports_to_free = [SERVICES[0]["port"], SERVICES[1]["port"], SERVICES[2]["port"]]
+        if not args.no_piper:
+            ports_to_free.append(PORT_PIPER)
+        for p in ports_to_free:
             pids = find_pids_on_port_windows(p)
             if pids:
                 print(f"Killing PIDs on port {p}: {pids}")
                 for pid in pids:
                     kill_pid_windows(pid)
 
+    ollama_proc = None  # set if WE started Ollama (so we can stop it on exit)
     running = []  # list of (name, proc)
     # Prepare log directory & file handles
     global SERVICE_LOG_FILES
@@ -399,7 +494,34 @@ async def main():
                 asyncio.current_task()._quick_mode = True
             except Exception:
                 pass
-        
+
+        # OLLAMA (must precede RAG: RAG preloads the model at startup)
+        ollama_proc = await ensure_ollama(args.no_ollama, args.skip_model_pull)
+
+        # PIPER TTS (must precede RAG: RAG probes Piper /health at startup)
+        if not args.no_piper:
+            voice_env = _piper_voice_env()
+            if not voice_env:
+                print("[PIPER] No voice models found at models/piper/{en,ar}/voice.onnx — "
+                      "starting service anyway; it will report not_ready until models exist.")
+            SERVICE_LOG_FILES['PIPER'] = open(log_dir / 'piper.log', 'a', encoding='utf-8')
+            proc, ok = await start_service(
+                "PIPER",
+                "tts_service.piper_server:app",
+                "127.0.0.1",
+                PORT_PIPER,
+                "/health",
+                args.reload,
+                "info",
+                keep_alive=300,
+                env_overrides=voice_env or None,
+            )
+            running.append(("PIPER", proc))
+            if not ok:
+                print("[WARNING] Piper failed to become ready; TTS audio will be unavailable.")
+        else:
+            print("[SKIPPED] Piper startup (--no-piper)")
+
         # LLM
         if not args.no_llm:
             # GPU note: Ollama handles GPU layer offloading via ggml-cuda.
@@ -427,7 +549,11 @@ async def main():
 
         # RAG
         if not args.no_rag:
-            rag_env = {}
+            rag_env = {
+                "WHISPER_DEVICE": "cpu",
+                "WHISPER_COMPUTE_TYPE": "int8",
+                "RAG_USE_GPU": "1",
+            }
             if args.use_whisper:
                 rag_env["USE_WHISPER"] = "1"
             if args.whisper_model:
@@ -498,8 +624,14 @@ async def main():
                 'keep_alive': SERVICES[2]['keep_alive'],
                 'env': None if not args.no_login else None
             },
+            'PIPER': {
+                'module': 'tts_service.piper_server:app', 'host': '127.0.0.1', 'port': PORT_PIPER,
+                'ready_path': '/health', 'reload': args.reload, 'log_level': 'info',
+                'keep_alive': 300,
+                'env': (_piper_voice_env() or None) if not args.no_piper else None
+            },
         }
-        restart_counts = {'LLM':0,'RAG':0,'LOGIN':0}
+        restart_counts = {'LLM':0,'RAG':0,'LOGIN':0,'PIPER':0}
         
         print("\n" + "="*70)
         print("[SUCCESS] ALL SERVERS RUNNING")
@@ -571,6 +703,15 @@ async def main():
                     except Exception as e:
                         print(f" [ERROR] ({e})")
         
+        # Stop Ollama only if this launcher started it
+        if ollama_proc is not None and ollama_proc.poll() is None:
+            try:
+                print("   Stopping Ollama (launcher-started)...", end="", flush=True)
+                ollama_proc.terminate()
+                print(" [OK]")
+            except Exception as e:
+                print(f" [ERROR] ({e})")
+
         # Close log files
         for log_file in SERVICE_LOG_FILES.values():
             try:

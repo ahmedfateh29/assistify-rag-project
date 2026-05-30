@@ -1,17 +1,23 @@
 # Assistify RAG — Local setup and run guide (Windows)
 
-Assistify is a help-desk stack with three FastAPI services:
+Assistify is a help-desk stack with several services started by one launcher:
 
 | Service | Port (default) | Role |
 |---------|----------------|------|
 | **Login** | `7001` | Auth, sessions, Web UI entry |
 | **RAG** | `7000` | Retrieval, speech, chat WebSocket |
 | **LLM API** | `8000` or `8010` | Thin API in front of **Ollama** (optional shim) |
+| **Piper TTS** | `5002` | Voice output (CPU; optional if models missing) |
+| **Ollama** | `11434` | LLM inference (**GPU**) |
 
-**Inference** is handled by **[Ollama](https://ollama.com)** on `http://127.0.0.1:11434`, not by local GGUF files in `backend/Models/`.
+**Inference** is handled by **[Ollama](https://ollama.com)** on `http://127.0.0.1:11434`, not by local GGUF files in `backend/Models`.
+
+**GPU policy:** GPU is reserved for **Ollama (LLM)** and **RAG embeddings**. Voice STT (Whisper) and Piper TTS run on **CPU** so VRAM stays free for chat and retrieval.
 
 ```
-Browser → Login (7001) → RAG (7000) → Ollama (11434)
+Browser → Login (7001) → RAG (7000) → Ollama (11434, GPU)
+                              ↓
+                        Piper TTS (5002, CPU)
               ↑ optional LLM shim (8000/8010)
 ```
 
@@ -136,11 +142,25 @@ Passwords are stored as bcrypt hashes (see `Login_system/init_users_db.py`).
 
 ## 2. Run the project (every session)
 
-### 2.1 Start Ollama
+Use **one PowerShell window** for the launcher. Always run from the **project root** (see `docs/CANONICAL_PROJECT_PATH.md` if you moved the folder).
 
-Ensure Ollama is running before starting Assistify.
+### 2.1 Before you start (checklist)
 
-### 2.2 Start all servers
+1. **Conda env** — `conda activate assistify_main`
+2. **Ollama** — tray app running, or let the launcher start it (default)
+3. **Model pulled** — `ollama pull qwen2.5:3b` (must match `OLLAMA_MODEL` in `.env` / `config.py`)
+4. **Knowledge base** — run section 1.6 once if you have not loaded sample docs
+5. **Users DB** — run section 1.7 once if `Login_system\users.db` does not exist
+
+Optional sanity check:
+
+```powershell
+python scripts\preflight_check.py
+```
+
+### 2.2 Start all servers (recommended)
+
+The launcher starts services **in order**: Ollama → Piper TTS → LLM shim → RAG → Login. It also sets voice STT to CPU and RAG embeddings to GPU.
 
 ```powershell
 cd "c:\Users\a7med\Downloads\assistify-rag-project-final-rag-system\assistify-rag-project-final-rag-system"
@@ -149,24 +169,54 @@ $env:KMP_DUPLICATE_LIB_OK = "TRUE"
 python scripts\project_start_server.py --kill-ports --llm-port 8010
 ```
 
-- **`--kill-ports`** — frees ports if a previous run left listeners behind.
-- **`--llm-port 8010`** — use when **8000** fails with “permission denied” on Windows; match `LLM_SERVER_URL` in `.env` if you set it.
+| Flag | When to use |
+|------|-------------|
+| **`--kill-ports`** | Frees `5002`, `7000`, `7001`, `8010` if a previous run left listeners behind |
+| **`--llm-port 8010`** | Use when port **8000** fails with “permission denied” on Windows; set `LLM_SERVER_URL=http://127.0.0.1:8010` in `.env` to match |
 
-**Ollama-only** (skip the FastAPI LLM process):
+**Wait until you see** `[OLLAMA]`, `[PIPER]`, `[LLM]`, `[RAG]`, and `[LOGIN]` each report **Ready** (first RAG start can take several minutes while faster-whisper downloads). Leave this window open; press **Ctrl+C** to stop all services.
 
-```powershell
-python scripts\project_start_server.py --kill-ports --no-llm
-```
-
-Leave this window open while you use the app. Press **Ctrl+C** to stop all services.
+Per-service logs are written under `logs\` (`piper.log`, `llm.log`, `rag.log`, `login.log`).
 
 ### 2.3 Open the app
 
 | URL | Purpose |
 |-----|---------|
 | http://127.0.0.1:7001/login | **Main UI — start here** |
+| http://127.0.0.1:7001/frontend/index.html | Chat UI (after login) |
 | http://127.0.0.1:7000/health | RAG health check |
+| http://127.0.0.1:5002/health | Piper TTS health (optional) |
 | http://127.0.0.1:8010/internal/gpu-status | LLM shim status (if using port 8010) |
+
+Log in with **`admin` / `admin`** (dev). After code or frontend changes, hard refresh the browser (**Ctrl+F5**). For a clean chat history, use **+ New Chat** in the sidebar.
+
+### 2.4 Alternative launcher options
+
+**Ollama + RAG only** (skip the FastAPI LLM shim; RAG talks to Ollama directly):
+
+```powershell
+python scripts\project_start_server.py --kill-ports --no-llm
+```
+
+**No voice output** (skip Piper on 5002; chat still works, browser TTS may be used):
+
+```powershell
+python scripts\project_start_server.py --kill-ports --llm-port 8010 --no-piper
+```
+
+**Ollama already running** (do not start a second Ollama process):
+
+```powershell
+python scripts\project_start_server.py --kill-ports --llm-port 8010 --no-ollama
+```
+
+**Development** (auto-reload on code changes):
+
+```powershell
+python scripts\project_start_server.py --kill-ports --llm-port 8010 --reload
+```
+
+Do **not** run `start_xtts_service.bat.disabled` unless you explicitly want the legacy XTTS GPU service instead of Piper.
 
 ---
 
@@ -217,14 +267,19 @@ Get-ChildItem tests\test_*.py | Where-Object { $_.Name -ne "test_arabic_tts.py" 
 
 | Symptom | What to try |
 |---------|-------------|
-| `can't open file ... scripts\project_start_server.py` | `cd` into the **project root** first. |
+| `can't open file ... scripts\project_start_server.py` | `cd` into the **project root** (two nested `assistify-rag-project-final-rag-system` folders). |
+| Launcher exits immediately / “All servers stopped” | Check `logs\rag.log` and `logs\piper.log`; ensure Ollama is running and the model is pulled. |
+| RAG stuck starting / long first boot | Normal on first run while faster-whisper downloads; wait up to ~10 minutes or check `logs\rag.log`. |
 | `$env:KMP_DUPLICATE_LIB_OK` error in **cmd** | Use PowerShell, or `set KMP_DUPLICATE_LIB_OK=TRUE` in cmd. |
-| `No module named 'backend'` in tests | Run tests from repo root; use updated test files that set `sys.path` to parent of `tests/`. |
-| LLM empty / connection errors | Start **Ollama**; run `ollama pull` for your model; check `OLLAMA_MODEL`. |
-| Port **8000** permission denied | Use `--llm-port 8010` and set `LLM_SERVER_URL` accordingly. |
+| No module named 'backend' in tests | Run tests from repo root; use updated test files that set `sys.path` to parent of `tests/`. |
+| LLM empty / connection errors | Start **Ollama**; run `ollama pull qwen2.5:3b`; check `OLLAMA_MODEL` matches. |
+| Ollama warmup 404 for model | Run `ollama pull` for the exact tag in `config.py` / `.env`. |
+| Port **8000** permission denied | Use `--llm-port 8010` and set `LLM_SERVER_URL=http://127.0.0.1:8010` in `.env`. |
 | OpenMP / crash with whisper + torch | `$env:KMP_DUPLICATE_LIB_OK = "TRUE"` (also in `.env`). |
 | `passlib` / `bcrypt` version warning | Harmless if login works; optional: `pip install "bcrypt<4.1"`. |
-| TTS warnings on **5002** | Optional; Piper not running. Chat can still work without voice output. |
+| Piper / TTS warnings on **5002** | Optional; chat works without server TTS (browser fallback). Use `--no-piper` to skip. |
+| Voice stuck on “Thinking…” / “Speaking…” | Hard refresh (**Ctrl+F5**); restart launcher; check browser mic/speech permissions. |
+| Old blunt replies in chat | Start **+ New Chat**; older threads may have cached answers from before router fixes. |
 | `graduation` venv broken | Delete `graduation\`; use Conda only. |
 | Moved project or large folders to another drive | See `docs/CANONICAL_PROJECT_PATH.md`; run `python scripts/preflight_check.py`. |
 
@@ -236,11 +291,14 @@ Get-ChildItem tests\test_*.py | Where-Object { $_.Name -ne "test_arabic_tts.py" 
 assistify-rag-project-final-rag-system/
 ├── backend/                 # RAG server, knowledge base, Ollama LLM shim
 ├── Login_system/            # Login server, users.db
-├── frontend/                # Static HTML/JS
+├── frontend/                # Static HTML/JS (chat UI)
+├── tts_service/             # Piper TTS microservice (port 5002)
 ├── scripts/
-│   └── project_start_server.py   # Recommended launcher
+│   ├── project_start_server.py   # Recommended launcher (starts all services)
+│   └── preflight_check.py        # Pre-start sanity check
+├── logs/                    # Per-service logs (created at runtime)
 ├── environment_main.yml     # Conda env definition
-├── config.py                # Shared configuration
+├── config.py                # Shared configuration (GPU policy, Ollama, Whisper)
 ├── .env.example             # Copy to .env
 └── docs/                    # Additional documentation
 ```
@@ -250,13 +308,12 @@ assistify-rag-project-final-rag-system/
 ## 7. Quick reference (daily use)
 
 ```powershell
-ollama pull qwen2.5:3b          # once per model
-cd <project-root>
+cd "c:\Users\a7med\Downloads\assistify-rag-project-final-rag-system\assistify-rag-project-final-rag-system"
 conda activate assistify_main
 $env:KMP_DUPLICATE_LIB_OK = "TRUE"
 python scripts\project_start_server.py --kill-ports --llm-port 8010
 ```
 
-Then open **http://127.0.0.1:7001/login**.
+Wait for all services **Ready**, then open **http://127.0.0.1:7001/login** (`admin` / `admin`).
 
-For more detail, see `docs/PROJECT_BRIEFING.md`, `docs/ENV_SETUP_COMPLETE.md`, and `archived_pdfs/SETUP_REQUIREMENTS.md` (some GGUF steps there are outdated; this project uses **Ollama**).
+For more detail, see `docs/PROJECT_BRIEFING.md`, `docs/ENV_SETUP_COMPLETE.md`, and `docs/CANONICAL_PROJECT_PATH.md` (some older docs mention local GGUF files; this project uses **Ollama** for the LLM).

@@ -49,10 +49,14 @@ def _list_collection_names(client) -> List[str]:
 
 # ================= STEP 15: PERFORMANCE CONFIG =================
 BATCH_SIZE = 16
-# Use GPU for embedding when available — the embedding model (~500MB) fits
-# alongside Ollama. Falls back to CPU if CUDA is unavailable.
+# Use GPU for RAG embedding/reranker when RAG_USE_GPU and CUDA available.
 try:
-    if torch.cuda.is_available():
+    from config import RAG_USE_GPU
+except Exception:
+    RAG_USE_GPU = True
+
+try:
+    if RAG_USE_GPU and torch.cuda.is_available():
         DEVICE = "cuda"
     else:
         DEVICE = "cpu"

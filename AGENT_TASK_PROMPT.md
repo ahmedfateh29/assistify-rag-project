@@ -1,4 +1,4 @@
-You are editing a strict generic RAG system.
+You are editing a grounded RAG chat system with conversational routing (not a blanket “always not found” bot).
 
 
 
@@ -12,21 +12,35 @@ Your job:
 
 2\. Find and remove all cheating or hardcoded behavior
 
-3\. Preserve only generic retrieval-grounded logic
+3\. Preserve generic retrieval-grounded logic **and** the existing conversational router
 
-4\. Keep the system strict: unsupported questions must return exactly `Not found in the document.`
+4\. Preserve normal answer behavior (see “Answer policy” below)
 
 5\. Make only minimal, surgical changes
 
 
 
+Answer policy (current product behavior — do not regress):
+
+\- **Document questions** with weak or missing evidence in the active KB → return exactly `Not found in the document.`
+
+\- **Conversational / presence** (e.g. “are you there”, “can you hear me”) → friendly redirect via `conversational_ack` / `_finalize_user_visible_answer`, not not-found.
+
+\- **Assistant meta** (e.g. “what can you do”, “why do you only search the document”) → `assistant_meta` or redirect, not not-found.
+
+\- **Support-style how-to** (e.g. “how do I reset my password”, including voice phrasing like “so tell me how to…”) → use KB/support retrieval and `_rescue_support_procedural_from_docs` when appropriate; do not treat as generic unsupported.
+
+\- **Truly unclear** small talk → `unsupported_unclear` redirect where routed, not a hallucinated document answer.
+
+
+
 Important bans:
 
-\- no hardcoded answers
+\- no hardcoded answers (no fixed text per question ID or test phrase)
 
-\- no psychology words
+\- no injecting domain terms **not present in retrieved chunks** (e.g. do not add “psychology” vocabulary to an answer when the retrieved text does not support it — this is anti-cheating, not a ban on answering psychology PDFs when evidence exists)
 
-\- no document-specific term lists
+\- no document-specific term lists used only to pass tests
 
 \- no fake fallback definitions
 
@@ -160,13 +174,13 @@ Every final report must include:
 
 When writing future task prompts, prefer reusable generic instructions. Every new task prompt should include or reference the following checklist:
 
-\- **Strict no-hardcoding rule** — no fixed answers, no domain term lists, no question→answer maps
+\- **No-hardcoding rule** — no fixed answers, no question→answer maps; domain terms only when grounded in retrieval
 
 \- **Read AGENT\_TASK\_PROMPT.md first** before starting any work
 
 \- **Read AI\_AGENT\_RULES.md second** and obey it fully
 
-\- **Preserve RAG grounding** — all answers must come from retrieved evidence
+\- **Preserve RAG grounding** for document questions; preserve conversational/meta/support routes from `classify_query_route` and `_finalize_user_visible_answer`
 
 \- **Run real WebSocket validation** when the behavior change affects `/ws` routes
 

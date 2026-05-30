@@ -27,7 +27,7 @@ dependencies:
     # Authentication / security
     - passlib[bcrypt]==1.7.4
     - python-jose[cryptography]==3.3.0
-    - bcrypt==4.2.1
+    - bcrypt==4.0.1
 
     # Pydantic
     - pydantic==2.10.6
@@ -64,3 +64,8 @@ dependencies:
     # Misc
     - python-dotenv==1.0.1
     - onnxruntime==1.21.0
+
+    # TTS (Piper microservice on port 5002)
+    # Use a version with prebuilt Windows wheels (bundles the compiled
+    # espeakbridge extension); 1.4.0 ships sdist-only and breaks synthesis.
+    - piper-tts==1.4.2

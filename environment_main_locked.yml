@@ -46,7 +46,7 @@ dependencies:
       - attrs==25.4.0
       - av==16.1.0
       - backoff==2.2.1
-      - bcrypt==4.2.1
+      - bcrypt==4.0.1
       - build==1.4.0
       - certifi==2026.2.25
       - cffi==2.0.0
@@ -104,7 +104,9 @@ dependencies:
       - orjson==3.11.7
       - overrides==7.7.0
       - passlib==1.7.4
+      - pathvalidate==3.3.1
       - pillow==12.1.1
+      - piper-tts==1.4.2
       - posthog==7.9.4
       - propcache==0.4.1
       - protobuf==6.33.5

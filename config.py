@@ -142,16 +142,29 @@ LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:11434/api/chat")
 
 # Ollama configuration — GPU inference via local Ollama service
 # Model name must match exactly what `ollama list` shows
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "127.0.0.1")
 OLLAMA_PORT = int(os.getenv("OLLAMA_PORT", "11434"))
 OLLAMA_CLI = os.getenv("OLLAMA_CLI", "ollama")
 
+# ========== GPU ALLOCATION POLICY ==========
+# GPU is reserved for LLM (Ollama) and RAG (embeddings / reranker) only.
+# Voice STT (faster-whisper) and TTS (Piper) always run on CPU.
+RAG_USE_GPU = os.getenv("RAG_USE_GPU", "1").lower() not in {"0", "false", "no"}
+
 # Speech Recognition - faster-whisper (replaces Vosk)
-# STABILIZATION: tiny.en on CPU with int8 to free GPU entirely for LLM + XTTS
+# Voice STT is CPU-only so VRAM stays available for Ollama + RAG embeddings.
 WHISPER_MODEL_PATH = Path(os.getenv("WHISPER_MODEL_PATH", str(ROOT / "backend" / "Models" / "faster-whisper-tiny.en")))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny.en")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")  # CPU — GPU VRAM reserved for Ollama + XTTS
+_requested_whisper_device = os.getenv("WHISPER_DEVICE", "cpu").strip().lower()
+if _requested_whisper_device != "cpu":
+    import warnings
+    warnings.warn(
+        f"WHISPER_DEVICE={_requested_whisper_device!r} ignored; "
+        "voice STT is CPU-only (GPU reserved for LLM + RAG).",
+        stacklevel=1,
+    )
+WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 for CPU efficiency
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))  # beam=1 for speed
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"  # Voice Activity Detection
@@ -204,6 +217,7 @@ __all__ = [
     "WHISPER_COMPUTE_TYPE",
     "WHISPER_BEAM_SIZE",
     "WHISPER_VAD_FILTER",
+    "RAG_USE_GPU",
     "VOSK_MODEL_PATH",  # deprecated
     "CHROMA_DB_PATH",
     "DB_PATH",

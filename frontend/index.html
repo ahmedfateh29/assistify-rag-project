@@ -1686,6 +1686,7 @@
     }
 
     function _handleTtsAudioStart(data) {
+      if (!isVoiceOutputEnabled()) return;
       const responseId = (data && data.response_id) || _wsPendingServerTtsResponseId || null;
       if (responseId && _wsCancelledAudioResponseIds.has(responseId)) return;
       const ctx = _getTTSAudioContext();
@@ -1923,6 +1924,7 @@
       ws.onmessage = event => {
       // Handle binary audio data from server-side TTS pipeline
       if (event.data instanceof ArrayBuffer) {
+        if (!isVoiceOutputEnabled()) return;
         _handleWsAudioChunk(event.data);
         return;
       }
@@ -1944,14 +1946,17 @@
           showThinking();
 
         } else if(data.type === 'ttsAudioStart') {
+          if (!isVoiceOutputEnabled()) return;
           // Server-side TTS audio stream starting for a sentence
           _handleTtsAudioStart(data);
 
         } else if(data.type === 'ttsAudioEnd') {
+          if (!isVoiceOutputEnabled()) return;
           // Server-side TTS audio stream ended for a sentence
           _handleTtsAudioEnd();
 
         } else if(data.type === 'ttsFallback') {
+          if (!isVoiceOutputEnabled()) return;
           // XTTS unavailable — use browser speech synthesis, then resume conversation mic
           responseAudioReceived = true;
           const fbText = String(data.text || '').trim();
@@ -1976,7 +1981,9 @@
           const chunkText = data.text || '';
           currentResponseHasTextChunk = true;
           full_response += chunkText;
-          showAISpeaking();
+          if (isVoiceOutputEnabled()) {
+            showAISpeaking();
+          }
           handleResponseChunk(chunkText, data.index);
           try { window.voiceMode && window.voiceMode.updateVoiceAssistantText && window.voiceMode.updateVoiceAssistantText(full_response); } catch(e){}
 
@@ -2007,10 +2014,12 @@
             lastAIResponse = finalText;
             try { window.voiceMode && window.voiceMode.updateVoiceAssistantText && window.voiceMode.updateVoiceAssistantText(finalText); } catch(e){}
             try {
-              window.voiceMode && window.voiceMode.notify &&
-                window.voiceMode.notify('answer_ready', { serverTtsPending: serverTtsPending });
+              if (isVoiceOverlayOpen()) {
+                window.voiceMode && window.voiceMode.notify &&
+                  window.voiceMode.notify('answer_ready', { serverTtsPending: serverTtsPending });
+              }
             } catch(e){}
-            if (!data.arabic_mode && !serverTtsPending) {
+            if (!data.arabic_mode && !serverTtsPending && isVoiceOutputEnabled()) {
               finalTtsStarted = triggerFinalTTSParallel(finalText, {
                 source: 'aiResponseDone',
                 language: currentLanguage,
@@ -2032,7 +2041,7 @@
           }
           // In Arabic mode, TTS is handled async by arabic_tts_complete event
           // Don't call _handleTtsComplete() now, as Arabic TTS hasn't started yet
-          if (!data.arabic_mode && !serverTtsPending) {
+          if (isVoiceOutputEnabled() && !data.arabic_mode && !serverTtsPending) {
             if (!finalTtsStarted && responseAudioReceived) {
               _handleTtsComplete();
             }
@@ -2040,6 +2049,9 @@
           const willPlayServerTts = serverTtsPending || responseAudioReceived;
           if (_liveCallMode && !data.arabic_mode && !willPlayServerTts && !finalTtsStarted) {
             completeVoiceTurn('aiResponseDone_no_tts');
+          }
+          if (!isVoiceOutputEnabled()) {
+            clearTextChatAudioState();
           }
           setTextSubmitLock(false);
           refreshConversationsQuietly();
@@ -2063,13 +2075,18 @@
             } else if(isRecording) {
               stopRecording(true);
             }
-            triggerFinalTTSParallel(finalText, {
-              source: 'aiResponse',
-              language: currentLanguage,
-            });
+            if (isVoiceOutputEnabled()) {
+              triggerFinalTTSParallel(finalText, {
+                source: 'aiResponse',
+                language: currentLanguage,
+              });
+            }
             finalizeStreamingDisplay(finalText);
           } else {
             hideThinking();
+          }
+          if (!isVoiceOutputEnabled()) {
+            clearTextChatAudioState();
           }
           setTextSubmitLock(false);
           refreshConversationsQuietly();
@@ -2138,6 +2155,7 @@
             resumeLiveCallListening('arabic_tts_complete');
           }, _rem * 1000 + 300);
         } else if(data.type === 'ttsComplete') {
+          if (!isVoiceOutputEnabled()) return;
           if (!data.response_id || !_wsCancelledAudioResponseIds.has(data.response_id)) {
             _handleTtsComplete();
           }
@@ -2154,8 +2172,16 @@
     initializeConversationUi().finally(connectWebSocket);
 
     const ASSISTANT_HELP_RESPONSES = {
-      en: 'I can help you with the uploaded documents. You can ask me to explain concepts, list items mentioned in the documents, summarize relevant parts, compare grounded topics, and answer in English or Arabic when supported.',
-      ar: 'أقدر أساعدك في المستندات المرفوعة. يمكنك أن تسألني عن شرح المفاهيم، استخراج القوائم المذكورة في المستندات، تلخيص الأجزاء المهمة، مقارنة الموضوعات المدعومة بالمستندات، والإجابة بالعربية أو الإنجليزية عند توفر الدعم.',
+      en: "Hello! I'm your Assistify support assistant. I answer questions using your uploaded support documents and knowledge base—for example, account help, returns, or shipping. What would you like help with?",
+      ar: 'مرحباً! أنا مساعد دعم Assistify. أجيب على الأسئلة باستخدام مستندات الدعم وقاعدة المعرفة المرفوعة—مثل مساعدة الحساب، الإرجاع، أو الشحن. بماذا تود المساعدة؟',
+    };
+    const ASSISTANT_PRESENCE_RESPONSES = {
+      en: "Yes, I'm here with you and I received your message. How can I help you today?",
+      ar: 'نعم، أنا معك واستلمت رسالتك. كيف يمكنني مساعدتك اليوم؟',
+    };
+    const ASSISTANT_LISTENING_RESPONSES = {
+      en: "Yes, I can hear you loud and clear. I'm your support assistant and I'm here to help. What would you like to ask about today?",
+      ar: 'نعم، أسمعك بوضوح. أنا مساعد الدعم الخاص بك وأنا هنا للمساعدة. ماذا تود أن تسأل عنه اليوم؟',
     };
     const ASSISTANT_HELP_EN_QUERIES = new Set([
       'what can you do',
@@ -2167,8 +2193,27 @@
       'help',
       'what do you support',
       'tell me are you getting my messages',
+      'are you getting my messages',
+      'are you getting me',
       'can you listen to me',
+      'can you hear me',
+      'do you hear me',
       'are you there',
+    ]);
+    const ASSISTANT_PRESENCE_EN_QUERIES = new Set([
+      'are you getting me',
+      'are you getting my messages',
+      'tell me are you getting my messages',
+      'are you there',
+      'did you get my message',
+      'are you receiving me',
+    ]);
+    const ASSISTANT_LISTENING_EN_QUERIES = new Set([
+      'can you hear me',
+      'do you hear me',
+      'can you listen to me',
+      'are you listening to me',
+      'do you listen to me',
     ]);
     const ASSISTANT_HELP_AR_QUERIES = new Set([
       'ماذا يمكنك أن تفعل',
@@ -2198,6 +2243,12 @@
       if (ASSISTANT_HELP_AR_QUERIES.has(normalized)) {
         return { language: 'ar', response: ASSISTANT_HELP_RESPONSES.ar };
       }
+      if (ASSISTANT_LISTENING_EN_QUERIES.has(normalized)) {
+        return { language: 'en', response: ASSISTANT_LISTENING_RESPONSES.en };
+      }
+      if (ASSISTANT_PRESENCE_EN_QUERIES.has(normalized)) {
+        return { language: 'en', response: ASSISTANT_PRESENCE_RESPONSES.en };
+      }
       if (ASSISTANT_HELP_EN_QUERIES.has(normalized)) {
         return { language: 'en', response: ASSISTANT_HELP_RESPONSES.en };
       }
@@ -2225,6 +2276,9 @@
       // Interrupt any ongoing AI response or TTS
       if (isTTSPlaying || isThinking) {
         bargeIn(true); // silent barge-in for text input
+      }
+      if (!isVoiceOutputEnabled()) {
+        clearTextChatAudioState();
       }
 
       const effectiveLang = currentLanguage;
@@ -2258,7 +2312,12 @@
       setTextSubmitLock(true);
       showThinking();
       try {
-        ws.send(JSON.stringify({ text, language: effectiveLang, conversation_id: activeConversationId }));
+        ws.send(JSON.stringify({
+          text,
+          language: effectiveLang,
+          conversation_id: activeConversationId,
+          tts_enabled: isVoiceOutputEnabled(),
+        }));
       } catch (err) {
         setTextSubmitLock(false);
         hideThinking();
@@ -2316,6 +2375,31 @@
 
     // Voice control button handlers
     let _liveCallMode = false; // true while user is in a live voice session
+
+    function isVoiceOutputEnabled() {
+      if (isVoiceOverlayOpen()) return true;
+      if (_liveCallMode && isRecording) return true;
+      return false;
+    }
+
+    function clearTextChatAudioState() {
+      hideAISpeaking();
+      isTTSPlaying = false;
+      pauseAudioSending = false;
+      _cancelCurrentWsAudioResponse();
+      ttsQueue = [];
+      if (_currentTTSAudio) {
+        try { _currentTTSAudio.pause(); } catch (e) {}
+        _currentTTSAudio = null;
+      }
+      try {
+        audioPlayer.pause();
+        audioPlayer.src = '';
+      } catch (e) {}
+      if (window.speechSynthesis) {
+        try { window.speechSynthesis.cancel(); } catch (e) {}
+      }
+    }
 
     btnStart.onclick = async () => {
       console.log("[DEBUG] btnStart clicked");
@@ -2595,6 +2679,7 @@
       if (el) el.classList.remove('active');
     }
     function showAISpeaking() {
+      if (!isVoiceOutputEnabled()) return;
       const el = document.getElementById('aiSpeakingGlow');
       if (el) el.classList.add('active');
       try { window.voiceMode && window.voiceMode.notify && window.voiceMode.notify('speaking'); } catch(e){}
@@ -2855,6 +2940,7 @@
     }
 
     function triggerFinalTTSParallel(text, options = {}) {
+      if (!isVoiceOutputEnabled()) return false;
       const cleanText = (text || '').trim();
       if (!cleanText) return false;
       const selectedLanguage = options.language || currentLanguage;
@@ -2918,6 +3004,7 @@
     }
 
     function addToTTSQueue(text, selectedLanguage = currentLanguage) {
+      if (!isVoiceOutputEnabled()) return;
       if (!text || text.trim() === '') return;
       const cleaned = text.replace(/[\u{1F000}-\u{1F9FF}\u{2600}-\u{27BF}]/gu, '').trim();
       if (!cleaned) return;

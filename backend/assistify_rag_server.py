@@ -6552,8 +6552,8 @@ def _load_multilingual_whisper_model_if_available() -> bool:
         return False
 
     try:
-        ml_device = "cuda" if torch.cuda.is_available() else "cpu"
-        ml_compute = "float16" if ml_device == "cuda" else "int8"
+        ml_device = WHISPER_DEVICE
+        ml_compute = WHISPER_COMPUTE_TYPE
         ml_kwargs: dict[str, Any] = {"device": ml_device, "compute_type": ml_compute, "download_root": None}
         if ml_device == "cpu":
             cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", str(min(os.cpu_count() or 4, 8))))
@@ -6937,6 +6937,7 @@ async def startup_event():
         WHISPER_COMPUTE_TYPE = "int8"
     
     logger.info(f"Loading faster-whisper model '{WHISPER_MODEL_SIZE}' on {WHISPER_DEVICE}...")
+    logger.info("[GPU POLICY] LLM+Ollama=GPU | RAG embeddings=GPU (when CUDA available) | Voice STT/TTS=CPU")
     logger.info(f"Model path: {WHISPER_MODEL_PATH}")
     
     try:
@@ -27755,18 +27756,6 @@ def _is_low_confidence_grounding(
     return False
 
 
-ASSISTANT_META_RESPONSE_EN = (
-    "I can help you with the uploaded documents. You can ask me to explain concepts, "
-    "summarize relevant parts, list items mentioned in the documents, compare grounded topics, "
-    "and answer in English or Arabic when supported."
-)
-ASSISTANT_META_RESPONSE_AR = (
-    "أقدر أساعدك في المستندات المرفوعة. يمكنك أن تسألني عن شرح المفاهيم، "
-    "تلخيص الأجزاء المهمة، استخراج القوائم المذكورة في المستندات، مقارنة الموضوعات "
-    "المدعومة بالمستندات، والإجابة بالعربية أو الإنجليزية عند توفر الدعم."
-)
-
-
 def _normalize_query_for_router(query: str) -> str:
     q = str(query or "").strip().lower()
     # Double-submit / missing space often glues "do" + "tell" (e.g. "dotell").
@@ -27795,16 +27784,16 @@ def _route_response_language(query: str, language: str | None = None) -> str:
 
 _SMALLTALK_RESPONSES = {
     "en": {
-        "thanks": "You're welcome!",
-        "greeting": "Hello! How can I assist you today?",
-        "wellbeing": "I'm doing well, thank you. How can I assist you today?",
-        "ack": "Okay. How can I assist you today?",
+        "thanks": "You're very welcome! Is there anything else I can help you with today?",
+        "greeting": "Hello! Thank you for contacting support. How can I help you today?",
+        "wellbeing": "I'm doing well, thank you for asking. How can I help you with your support question today?",
+        "ack": "Of course. What would you like help with?",
     },
     "ar": {
-        "thanks": "العفو!",
-        "greeting": "أهلاً! كيف يمكنني مساعدتك اليوم؟",
-        "wellbeing": "أنا بخير، شكرًا. كيف يمكنني مساعدتك اليوم؟",
-        "ack": "تمام، كيف يمكنني مساعدتك اليوم؟",
+        "thanks": "العفو! هل هناك أي شيء آخر يمكنني مساعدتك به اليوم؟",
+        "greeting": "أهلاً! شكراً لتواصلك مع الدعم. كيف يمكنني مساعدتك اليوم؟",
+        "wellbeing": "أنا بخير، شكراً لسؤالك. كيف يمكنني مساعدتك في سؤال الدعم اليوم؟",
+        "ack": "بالتأكيد. بماذا تود المساعدة؟",
     },
 }
 
@@ -27845,9 +27834,33 @@ _ROUTER_DIRECT_ROUTES = frozenset(
 )
 
 
+_CONVERSATIONAL_INTENT_REDIRECTS: dict[str, dict[str, str]] = {
+    "listening": {"en": CONVERSATIONAL_LISTENING_EN, "ar": CONVERSATIONAL_LISTENING_AR},
+    "presence": {"en": CONVERSATIONAL_PRESENCE_EN, "ar": CONVERSATIONAL_PRESENCE_AR},
+    "understanding": {"en": CONVERSATIONAL_UNDERSTANDING_EN, "ar": CONVERSATIONAL_UNDERSTANDING_AR},
+    "online": {"en": CONVERSATIONAL_ONLINE_EN, "ar": CONVERSATIONAL_ONLINE_AR},
+}
+
+
 def _conversational_redirect(query: str, language: str | None = None) -> str:
     lang = _route_response_language(query, language)
+    intent = _classify_conversational_ack_intent(query)
+    if intent != "unknown":
+        group = _CONVERSATIONAL_INTENT_REDIRECTS.get(intent) or {}
+        text = group.get(lang)
+        if text:
+            return text
     return CONVERSATIONAL_REDIRECT_AR if lang == "ar" else CONVERSATIONAL_REDIRECT_EN
+
+
+def _assistant_meta_direct_answer(query: str, language: str | None = None) -> str:
+    lang = _route_response_language(query, language)
+    intent = _classify_assistant_meta_intent(query)
+    if intent == "document_only_behavior":
+        return ASSISTANT_META_DOCUMENT_ONLY_AR if lang == "ar" else ASSISTANT_META_DOCUMENT_ONLY_EN
+    if intent == "not_found_behavior":
+        return ASSISTANT_META_NOT_FOUND_BEHAVIOR_AR if lang == "ar" else ASSISTANT_META_NOT_FOUND_BEHAVIOR_EN
+    return ASSISTANT_META_RESPONSE_AR if lang == "ar" else ASSISTANT_META_RESPONSE_EN
 
 
 def _classify_conversational_ack_intent(query: str) -> str:
@@ -27855,24 +27868,30 @@ def _classify_conversational_ack_intent(query: str) -> str:
     if not q:
         return "unknown"
     if _detect_language(query) == "ar":
-        if re.search(r"\bهل\s+(?:تسمع|تستمع)\s*(?:لي)?\b", q):
+        if re.search(r"\bهل\s+(?:تسمع|تستمع)\s*(?:لي|ني)?\b", q):
             return "listening"
-        if re.search(r"\bهل\s+(?:تستقبل|وصلت|وصلتك)\s+(?:رسالتي|رسائلي|رسالتي)\b", q):
+        if re.search(r"\bهل\s+(?:تستقبل|وصلت|وصلتك)\s+(?:لي|ني|رسالتي|رسائلي)\b", q):
             return "presence"
         if re.search(r"\bهل\s+انت\s+هنا\b", q):
             return "presence"
-        if re.search(r"\bهل\s+تفهم(?:ني)?\b", q):
+        if re.search(r"\bهل\s+(?:تفهم|فهمت)(?:ني)?\b", q):
             return "understanding"
         if re.search(r"\bهل\s+انت\s+(?:متصل|متاح|شغال|تعمل)\b", q):
             return "online"
+        if re.search(r"\b(?:هل\s+)?(?:وصلك|وصلت)\s+(?:رسالتي|رسائلي)\b", q):
+            return "presence"
         return "unknown"
     patterns: list[tuple[str, str]] = [
         ("listening", r"\bcan\s+you\s+(?:hear|listen(?:\s+to)?)\s+me\b"),
+        ("listening", r"\b(?:do|can)\s+you\s+hear\s+me\b"),
         ("listening", r"\b(?:do|are)\s+you\s+(?:hear|listening)\s+me\b"),
         ("presence", r"\bare\s+you\s+there\b"),
         ("presence", r"\b(?:tell\s+me\s+)?are\s+you\s+(?:there|getting|receiving)\s+(?:my\s+)?(?:message|messages|text|input)\b"),
         ("presence", r"\b(?:did\s+you\s+get|are\s+you\s+getting)\s+(?:my\s+)?(?:message|messages)\b"),
+        ("presence", r"\b(?:are\s+you\s+getting|did\s+you\s+get|you\s+getting)\s+me\b"),
+        ("presence", r"\bare\s+you\s+receiving\s+me\b"),
         ("understanding", r"\bdo\s+you\s+understand\s+me\b"),
+        ("understanding", r"\b(?:do\s+you\s+get|you\s+get)\s+me\b"),
         ("online", r"\bare\s+you\s+(?:online|available|working|awake)\b"),
         ("presence", r"\bhello\s*\?\s*$"),
     ]
@@ -27903,11 +27922,9 @@ def _finalize_user_visible_answer(
     raw = str(answer or "").strip()
     if raw.lower() != RAG_NO_MATCH_RESPONSE.lower():
         return answer
-    if (
-        _is_conversational_ack_query(query)
-        or _is_unsupported_unclear_query(query)
-        or _is_assistant_behavior_complaint_query(query)
-    ):
+    if _is_assistant_behavior_complaint_query(query):
+        return _assistant_meta_direct_answer(query, language)
+    if _is_conversational_ack_query(query) or _is_unsupported_unclear_query(query):
         return _conversational_redirect(query, language)
     if retrieved_docs:
         rescued = _rescue_support_procedural_from_docs(query, retrieved_docs)
@@ -28051,7 +28068,7 @@ def classify_query_route(query: str) -> str:
 def _direct_route_answer(query: str, route: str, language: str | None = None) -> str:
     lang = _route_response_language(query, language)
     if route == "assistant_meta":
-        return ASSISTANT_META_RESPONSE_AR if lang == "ar" else ASSISTANT_META_RESPONSE_EN
+        return _assistant_meta_direct_answer(query, lang)
     if route == "smalltalk":
         return _smalltalk_response(query)
     if route in {"conversational_ack", "unsupported_unclear"}:
@@ -36208,6 +36225,11 @@ async def _tts_single_response(
             await _local_tts_session.close()
 
 
+def _client_tts_allowed(client_tts_enabled: bool) -> bool:
+    """Honor client voice-mode flag only when server TTS is globally enabled."""
+    return bool(not EFFECTIVE_DISABLE_TTS and client_tts_enabled)
+
+
 async def send_final_response(
     connection_id: str,
     text: str,
@@ -37006,7 +37028,7 @@ def _emit_perf_report(t_meta: dict, perf_start: float, query_text: str, answer_t
         logger.exception("[PERF REPORT] _emit_perf_report failed")
 
 
-async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str, user, cancel_event: Optional[asyncio.Event] = None, t_meta=None, language: str = "en"): # type: ignore
+async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str, user, cancel_event: Optional[asyncio.Event] = None, t_meta=None, language: str = "en", client_tts_enabled: bool = True): # type: ignore
     """Stream LLM response with overlapping TTS via producer-consumer pipeline.
 
     Architecture:
@@ -37020,6 +37042,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
     the first sentence is ready, while LLM continues generating more text.
     """
     import time
+    effective_query_tts = _client_tts_allowed(client_tts_enabled)
     # ---- ABOUT-ENTITY STANDALONE REWRITE (run BEFORE the direct router) --
     # The direct router can mis-classify shapes like "وماذا عن X" or
     # "What about X?" as `unsupported_unclear` and short-circuit them. We
@@ -37071,7 +37094,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 connection_id,
                 mem_text,
                 "ar" if mem_lang == "ar" else XTTS_LANGUAGE,
-                not EFFECTIVE_DISABLE_TTS,
+                effective_query_tts,
                 websocket=websocket,
                 sources=0,
                 arabic_mode=(mem_lang == "ar"),
@@ -37107,7 +37130,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     direct_answer,
                     response_tts_lang,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=0,
                     arabic_mode=(route_lang == "ar" and direct_route != "unsupported_unclear"),
@@ -37157,7 +37180,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     fu_text,
                     "ar" if language == "ar" else XTTS_LANGUAGE,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=0,
                     arabic_mode=(language == "ar"),
@@ -37193,7 +37216,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 connection_id,
                 "I didn't catch that. Could you repeat?",
                 XTTS_LANGUAGE,
-                not EFFECTIVE_DISABLE_TTS,
+                effective_query_tts,
                 websocket=websocket,
                 sources=0,
                 arabic_mode=False,
@@ -37211,7 +37234,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 connection_id,
                 short_answer,
                 XTTS_LANGUAGE,
-                not EFFECTIVE_DISABLE_TTS,
+                effective_query_tts,
                 websocket=websocket,
                 sources=0,
                 arabic_mode=False,
@@ -37422,7 +37445,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                             connection_id,
                             fallback_text,
                             XTTS_LANGUAGE,
-                            not EFFECTIVE_DISABLE_TTS,
+                            effective_query_tts,
                             websocket=websocket,
                             sources=0,
                             arabic_mode=False,
@@ -37519,7 +37542,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                                     connection_id,
                                     fallback_text,
                                     XTTS_LANGUAGE,
-                                    not EFFECTIVE_DISABLE_TTS,
+                                    effective_query_tts,
                                     websocket=websocket,
                                     sources=0,
                                     arabic_mode=False,
@@ -37564,7 +37587,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                                     connection_id,
                                     fallback_text,
                                     XTTS_LANGUAGE,
-                                    not EFFECTIVE_DISABLE_TTS,
+                                    effective_query_tts,
                                     websocket=websocket,
                                     sources=0,
                                     arabic_mode=False,
@@ -37629,7 +37652,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                             connection_id,
                             fallback_text,
                             XTTS_LANGUAGE,
-                            not EFFECTIVE_DISABLE_TTS,
+                            effective_query_tts,
                             websocket=websocket,
                             sources=0,
                             arabic_mode=False,
@@ -37766,7 +37789,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                             connection_id,
                             fallback_text,
                             XTTS_LANGUAGE if protected_terms else "ar",
-                            not EFFECTIVE_DISABLE_TTS,
+                            effective_query_tts,
                             websocket=websocket,
                             sources=0,
                             arabic_mode=False if protected_terms else True,
@@ -37935,7 +37958,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 connection_id,
                 fallback_text,
                 "ar" if arabic_mode else xtts_lang,
-                not EFFECTIVE_DISABLE_TTS,
+                effective_query_tts,
                 websocket=websocket,
                 sources=0,
                 arabic_mode=arabic_mode,
@@ -37984,7 +38007,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     early_identity,
                     "ar" if arabic_mode else xtts_lang,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=len(relevant_docs),
                     arabic_mode=arabic_mode,
@@ -38315,7 +38338,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     clarification_text,
                     "ar" if arabic_mode else xtts_lang,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=len(doc_dicts),
                     arabic_mode=arabic_mode,
@@ -38409,7 +38432,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     short_answer,
                     "ar" if arabic_mode else xtts_lang,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=len(doc_dicts) if isinstance(doc_dicts, list) else 0,
                     arabic_mode=arabic_mode,
@@ -38587,7 +38610,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     explanation_answer,
                     "ar" if arabic_mode else xtts_lang,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=len(explanation_source_docs),
                     arabic_mode=arabic_mode,
@@ -38642,7 +38665,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     short_answer,
                     "ar" if arabic_mode else xtts_lang,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=len(doc_dicts),
                     arabic_mode=arabic_mode,
@@ -38701,7 +38724,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                         connection_id,
                         short_answer,
                         "ar" if arabic_mode else xtts_lang,
-                        not EFFECTIVE_DISABLE_TTS,
+                        effective_query_tts,
                         websocket=websocket,
                         sources=len(doc_dicts),
                         arabic_mode=arabic_mode,
@@ -38774,7 +38797,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     short_answer,
                     "ar" if arabic_mode else xtts_lang,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=len(doc_dicts),
                     arabic_mode=arabic_mode,
@@ -38877,7 +38900,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     connection_id,
                     short_answer,
                     "ar" if arabic_mode else xtts_lang,
-                    not EFFECTIVE_DISABLE_TTS,
+                    effective_query_tts,
                     websocket=websocket,
                     sources=len(doc_dicts),
                     arabic_mode=arabic_mode,
@@ -39647,7 +39670,7 @@ STRICT BEHAVIOR:
                 connection_id,
                 _mpc11_answer,
                 "ar" if arabic_mode else xtts_lang,
-                not EFFECTIVE_DISABLE_TTS,
+                effective_query_tts,
                 websocket=websocket,
                 sources=len(doc_dicts),
                 arabic_mode=arabic_mode,
@@ -39707,7 +39730,7 @@ STRICT BEHAVIOR:
                 connection_id,
                 short_answer,
                 "ar" if arabic_mode else xtts_lang,
-                not EFFECTIVE_DISABLE_TTS,
+                effective_query_tts,
                 websocket=websocket,
                 sources=len(doc_dicts),
                 arabic_mode=arabic_mode,
@@ -39853,7 +39876,7 @@ STRICT BEHAVIOR:
                 connection_id,
                 deterministic_answer,
                 "ar" if arabic_mode else xtts_lang,
-                not EFFECTIVE_DISABLE_TTS,
+                effective_query_tts,
                 websocket=websocket,
                 sources=len(relevant_docs),
                 arabic_mode=arabic_mode,
@@ -39947,7 +39970,7 @@ STRICT BEHAVIOR:
     final_replace_chunk = False
 
     # ---- Producer-Consumer Pipeline: LLM → Queue → TTS ----
-    tts_enabled_for_query = not EFFECTIVE_DISABLE_TTS
+    tts_enabled_for_query = effective_query_tts
     streaming_tts_enabled_for_query = bool(tts_enabled_for_query and prefinal_tts_enabled_for_query)
     sentence_queue = asyncio.Queue()
     # Reuse the per-connection lock so _tts_arabic_response background tasks
@@ -40861,7 +40884,7 @@ STRICT BEHAVIOR:
                 connection_id,
                 "Sorry, I encountered an issue. Let's continue.",
                 XTTS_LANGUAGE,
-                not EFFECTIVE_DISABLE_TTS,
+                effective_query_tts,
                 websocket=websocket,
                 sources=0,
                 arabic_mode=False,
@@ -41448,9 +41471,9 @@ async def arabic_download_models(user=Depends(require_login())):
         dest.mkdir(parents=True, exist_ok=True)
         try:
             from faster_whisper import WhisperModel as _WM
-            # Load on GPU if available — cuts Arabic STT from ~6s to ~0.3s
-            _dl_device  = "cuda" if torch.cuda.is_available() else "cpu"
-            _dl_compute = "float16" if _dl_device == "cuda" else "int8"
+            # Voice STT stays on CPU (GPU reserved for LLM + RAG embeddings).
+            _dl_device = WHISPER_DEVICE
+            _dl_compute = WHISPER_COMPUTE_TYPE
             _dl_kwargs: dict = {"device": _dl_device, "compute_type": _dl_compute, "download_root": str(dest.parent)}
             if _dl_device == "cpu":
                 import os as _os
@@ -42832,7 +42855,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                     if _model is None:
                         raise RuntimeError("STT Model could not be loaded or is unavailable.")
 
-                    # Arabic on GPU: beam_size=5 for accuracy; English: greedy (beam=1)
+                    # Arabic uses beam_size=5 for accuracy; English: greedy (beam=1)
                     _beam = 5 if attempt_lang == "ar" else WHISPER_BEAM_SIZE
                     _initial_prompt = _ARABIC_STT_INITIAL_PROMPT if attempt_lang == "ar" else None
                     segs_gen, info = _model.transcribe(
@@ -43293,6 +43316,8 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                             # Handle typed text queries with streaming
                             text = payload["text"].strip()
                             stored_user_text = text
+                            client_tts_enabled = bool(payload.get("tts_enabled", False))
+                            query_tts = _client_tts_allowed(client_tts_enabled)
                             # Allow per-message language override; fall back to session setting
                             msg_lang = str(payload.get("language", session_language) or session_language).strip().lower()
                             if msg_lang in ("en", "ar"):
@@ -43379,7 +43404,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                                             connection_id,
                                             mem_text,
                                             "ar" if msg_lang == "ar" else XTTS_LANGUAGE,
-                                            not EFFECTIVE_DISABLE_TTS,
+                                            query_tts,
                                             websocket=conversation_ws,
                                             sources=0,
                                             arabic_mode=(msg_lang == "ar"),
@@ -43428,7 +43453,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                                             connection_id,
                                             direct_answer,
                                             response_tts_lang,
-                                            not EFFECTIVE_DISABLE_TTS,
+                                            query_tts,
                                             websocket=conversation_ws,
                                             sources=0,
                                             arabic_mode=(route_lang == "ar" and route != "unsupported_unclear"),
@@ -43475,7 +43500,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                                             connection_id,
                                             direct_answer,
                                             XTTS_LANGUAGE,
-                                            not EFFECTIVE_DISABLE_TTS,
+                                            query_tts,
                                             websocket=conversation_ws,
                                             sources=0,
                                             arabic_mode=False,
@@ -43536,7 +43561,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                                             connection_id,
                                             _loading_msg,
                                             XTTS_LANGUAGE,
-                                            not EFFECTIVE_DISABLE_TTS,
+                                            query_tts,
                                             websocket=conversation_ws,
                                             sources=0,
                                             arabic_mode=False,
@@ -43612,7 +43637,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                                             connection_id,
                                             fu_text,
                                             "ar" if msg_lang == "ar" else XTTS_LANGUAGE,
-                                            not EFFECTIVE_DISABLE_TTS,
+                                            query_tts,
                                             websocket=conversation_ws,
                                             sources=0,
                                             arabic_mode=(msg_lang == "ar"),
@@ -43634,6 +43659,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                                     cancel_evt,
                                     t_meta=_ws_perf_t_meta,
                                     language=msg_lang,
+                                    client_tts_enabled=client_tts_enabled,
                                 )
                                 persist_runtime_memory(connection_id, conversation_id_for_text)
             

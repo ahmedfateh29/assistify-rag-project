@@ -48,16 +48,23 @@ logger = logging.getLogger("KnowledgeBase")
 # Initialize ChromaDB (persistent storage)
 client = chromadb.PersistentClient(path=str(CHROMA_DB_PATH))
 
-# Embedding device: Use GPU for fast embedding during upload/indexing.
-# Falls back to CPU if CUDA is unavailable.
+# Embedding device: GPU when RAG_USE_GPU and CUDA available (LLM+RAG GPU policy).
 try:
-    if torch.cuda.is_available():
+    from config import RAG_USE_GPU
+except Exception:
+    RAG_USE_GPU = True
+
+try:
+    if RAG_USE_GPU and torch.cuda.is_available():
         device = "cuda"
         gpu_name = torch.cuda.get_device_name(0)
         logger.info(f"✓ Embedding device: CUDA ({gpu_name})")
     else:
         device = "cpu"
-        logger.info("✓ Embedding device: CPU (CUDA not available)")
+        if not RAG_USE_GPU:
+            logger.info("✓ Embedding device: CPU (RAG_USE_GPU=0)")
+        else:
+            logger.info("✓ Embedding device: CPU (CUDA not available)")
 except Exception as e:
     logger.error(f"Fallback to CPU due to exception: {e}", exc_info=True)
     device = 'cpu'

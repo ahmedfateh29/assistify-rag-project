@@ -60,11 +60,11 @@ The agent must never inject words, phrases, entities, concepts, chapter names, o
 
 
 
-This includes:
+This includes (when **not** supported by retrieved text):
 
-\- psychology-specific words
+\- injecting psychology-specific vocabulary
 
-\- management-specific words
+\- injecting management-specific vocabulary
 
 \- philosophy-specific words
 
@@ -84,11 +84,15 @@ The system must stay domain-agnostic and document-agnostic.
 
 \### 3) No fake “smart” fallback
 
-If the answer is not grounded in retrieved context, the system must return exactly:
+If the user asked a **document question** and the answer is not grounded in retrieved context, return exactly:
 
 
 
 `Not found in the document.`
+
+
+
+If the query was routed as **conversational_ack**, **assistant_meta**, or **unsupported_unclear** (see `classify_query_route` / `_finalize_user_visible_answer` in `assistify_rag_server.py`), use the friendly redirect or meta response — do not force not-found for those intents.
 
 
 
@@ -232,11 +236,9 @@ If no, do not implement it.
 
 
 
-\### 8) Preserve strict out-of-scope behavior
+\### 8) Out-of-scope and conversational behavior
 
-If retrieval evidence is weak, mixed, irrelevant, or absent:
-
-return exactly:
+For **document questions**, if retrieval evidence is weak, mixed, irrelevant, or absent, return exactly:
 
 
 
@@ -244,7 +246,7 @@ return exactly:
 
 
 
-Do not weaken this rule for nicer-looking answers.
+For **non-document intents** (presence checks, capabilities, unclear chit-chat, support how-to with matching KB chunks), use the existing router and finalize helpers — do not replace those with blanket not-found.
 
 
 

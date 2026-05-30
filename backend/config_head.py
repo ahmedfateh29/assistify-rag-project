@@ -107,8 +107,8 @@ except Exception:
     from pathlib import Path as _P
     WHISPER_MODEL_PATH = _P(__file__).resolve().parent / "Models" / "faster-whisper-medium.en"
     WHISPER_MODEL_SIZE = "medium.en"
-    WHISPER_DEVICE = "cuda"
-    WHISPER_COMPUTE_TYPE = "float16"
+    WHISPER_DEVICE = "cpu"
+    WHISPER_COMPUTE_TYPE = "int8"
     WHISPER_BEAM_SIZE = 5
     WHISPER_VAD_FILTER = True
     LLM_URL = "http://127.0.0.1:11434/api/chat"
@@ -129,13 +129,69 @@ from backend.response_validator import validate_response
 RAG_STRICT_DISTANCE_THRESHOLD = float(os.getenv("RAG_STRICT_DISTANCE_THRESHOLD", "0.70"))
 RAG_NO_MATCH_RESPONSE = "Not found in the document."
 CONVERSATIONAL_REDIRECT_EN = (
-    "Yes, I received your message. I'm here to help with questions about your support "
-    "knowledge base and uploaded documents—for example, password reset, returns, or shipping. "
-    "What would you like to know?"
+    "Thank you for reaching out. I'm here and ready to help with your support questions "
+    "based on our knowledge base—for example, password reset, returns, or shipping. "
+    "What can I help you with today?"
 )
 CONVERSATIONAL_REDIRECT_AR = (
-    "نعم، استلمت رسالتك. أنا هنا للمساعدة في أسئلة قاعدة المعرفة والمستندات المرفوعة—"
-    "مثل إعادة تعيين كلمة المرور، الإرجاع، أو الشحن. ماذا تريد أن تعرف؟"
+    "شكراً لتواصلك معنا. أنا هنا وجاهز للمساعدة في أسئلة الدعم وفق قاعدة المعرفة—"
+    "مثل إعادة تعيين كلمة المرور، الإرجاع، أو الشحن. بماذا يمكنني مساعدتك اليوم؟"
+)
+CONVERSATIONAL_LISTENING_EN = (
+    "Yes, I can hear you loud and clear. I'm your support assistant and I'm here to help. "
+    "What would you like to ask about today?"
+)
+CONVERSATIONAL_LISTENING_AR = (
+    "نعم، أسمعك بوضوح. أنا مساعد الدعم الخاص بك وأنا هنا للمساعدة. "
+    "ماذا تود أن تسأل عنه اليوم؟"
+)
+CONVERSATIONAL_PRESENCE_EN = (
+    "Yes, I'm here with you and I received your message. How can I help you today?"
+)
+CONVERSATIONAL_PRESENCE_AR = (
+    "نعم، أنا معك واستلمت رسالتك. كيف يمكنني مساعدتك اليوم؟"
+)
+CONVERSATIONAL_UNDERSTANDING_EN = (
+    "Yes, I understand you. Please tell me what you need help with, and I'll do my best "
+    "to assist using our support knowledge base."
+)
+CONVERSATIONAL_UNDERSTANDING_AR = (
+    "نعم، أفهمك. من فضلك أخبرني بما تحتاج المساعدة فيه، وسأبذل قصارى جهدي "
+    "للمساعدة باستخدام قاعدة معرفة الدعم."
+)
+CONVERSATIONAL_ONLINE_EN = (
+    "Yes, I'm online and available to help. What support question can I answer for you?"
+)
+CONVERSATIONAL_ONLINE_AR = (
+    "نعم، أنا متصل ومتاح للمساعدة. ما سؤال الدعم الذي يمكنني الإجابة عنه؟"
+)
+ASSISTANT_META_RESPONSE_EN = (
+    "Hello! I'm your Assistify support assistant. I answer questions using your uploaded "
+    "support documents and knowledge base—for example, account help, returns, or shipping. "
+    "What would you like help with?"
+)
+ASSISTANT_META_RESPONSE_AR = (
+    "مرحباً! أنا مساعد دعم Assistify. أجيب على الأسئلة باستخدام مستندات الدعم وقاعدة "
+    "المعرفة المرفوعة—مثل مساعدة الحساب، الإرجاع، أو الشحن. بماذا تود المساعدة؟"
+)
+ASSISTANT_META_DOCUMENT_ONLY_EN = (
+    "I'm happy to explain. I answer from your uploaded support documents and knowledge base "
+    "so information stays accurate. Ask me about a topic in those materials—for example, "
+    "password reset or returns—and I'll help right away."
+)
+ASSISTANT_META_DOCUMENT_ONLY_AR = (
+    "يسعدني أن أوضح. أجيب من مستندات الدعم وقاعدة المعرفة المرفوعة لضمان دقة المعلومات. "
+    "اسألني عن موضوع موجود فيها—مثل إعادة تعيين كلمة المرور أو الإرجاع—وسأساعدك فوراً."
+)
+ASSISTANT_META_NOT_FOUND_BEHAVIOR_EN = (
+    "I understand that response can feel unhelpful. When something isn't in our knowledge base "
+    "documents, I have to say so rather than guess. Try rephrasing your question or ask about "
+    "a topic in your support materials—I'm here to help."
+)
+ASSISTANT_META_NOT_FOUND_BEHAVIOR_AR = (
+    "أتفهم أن هذا الرد قد يبدو غير مفيد. عندما لا يكون الموضوع في مستندات قاعدة المعرفة، "
+    "يجب أن أخبرك بذلك بدلاً من التخمين. جرّب إعادة صياغة سؤالك أو اسأل عن موضوع في "
+    "مواد الدعم—أنا هنا للمساعدة."
 )
 RAG_GUARD_MODE_VERSION = "two-stage-mild-v3"
 RAG_OLD_STRICT_07_ACTIVE = False
