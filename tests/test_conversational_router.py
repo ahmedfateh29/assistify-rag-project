@@ -11,14 +11,27 @@ if str(ROOT) not in sys.path:
 from backend.config_head import (
     CONVERSATIONAL_PRESENCE_EN,
     CONVERSATIONAL_REDIRECT_EN,
+    CS_NO_MATCH_RESPONSE_EN,
     RAG_NO_MATCH_RESPONSE,
 )
 from backend.assistify_rag_server import (
+    _assistant_meta_direct_answer,
+    _classify_assistant_meta_intent,
     _finalize_user_visible_answer,
     _is_support_procedural_query,
     _rescue_support_procedural_from_docs,
     classify_query_route,
 )
+
+_PASSWORD_DOCS = [
+    {
+        "page_content": (
+            "To reset your password, follow these steps: 1) Go to the login page "
+            "and click 'Forgot Password' 2) Enter your registered email address."
+        ),
+        "metadata": {"id": "password_reset"},
+    }
+]
 
 
 def test_classify_query_route_conversational() -> None:
@@ -35,6 +48,7 @@ def test_classify_query_route_conversational() -> None:
         ("So tell me how to reset the password", "document_question"),
         ("tell me how to reset my password", "document_question"),
         ("How do I reset my password?", "document_question"),
+        ("Tell me how can I change my password?", "document_question"),
     ]
     for query, expected_route in cases:
         assert classify_query_route(query) == expected_route, f"{query!r} -> {classify_query_route(query)!r}"
@@ -52,12 +66,14 @@ def test_finalize_maps_sentinel_for_getting_me() -> None:
     assert out == CONVERSATIONAL_PRESENCE_EN
 
 
-def test_finalize_keeps_sentinel_for_document_miss() -> None:
+def test_finalize_cs_tone_for_document_miss() -> None:
     out = _finalize_user_visible_answer(
         "What is quantum physics?",
         RAG_NO_MATCH_RESPONSE,
     )
-    assert out == RAG_NO_MATCH_RESPONSE
+    assert out != RAG_NO_MATCH_RESPONSE
+    assert out == CS_NO_MATCH_RESPONSE_EN
+    assert "Not found in the document." not in out
 
 
 def test_finalize_maps_sentinel_for_behavior_complaint() -> None:
@@ -77,35 +93,64 @@ def test_conversational_redirect_constant() -> None:
 def test_support_procedural_voice_phrasing() -> None:
     assert _is_support_procedural_query("So tell me how to reset the password")
     assert _is_support_procedural_query("tell me how to reset my password")
+    assert _is_support_procedural_query("Tell me how can I change my password?")
 
 
 def test_support_procedural_rescue_from_docs() -> None:
-    docs = [
-        {
-            "page_content": (
-                "To reset your password, follow these steps: 1) Go to the login page "
-                "and click 'Forgot Password' 2) Enter your registered email address."
-            ),
-            "metadata": {"id": "password_reset"},
-        }
-    ]
     out = _finalize_user_visible_answer(
         "So tell me how to reset the password",
         RAG_NO_MATCH_RESPONSE,
-        retrieved_docs=docs,
+        retrieved_docs=_PASSWORD_DOCS,
     )
     assert out != RAG_NO_MATCH_RESPONSE
     assert "forgot password" in out.lower()
-    assert _rescue_support_procedural_from_docs("So tell me how to reset the password", docs)
+    assert _rescue_support_procedural_from_docs("So tell me how to reset the password", _PASSWORD_DOCS)
+
+
+def test_password_change_phrasing_rescued_from_docs() -> None:
+    out = _finalize_user_visible_answer(
+        "Tell me how can I change my password?",
+        RAG_NO_MATCH_RESPONSE,
+        retrieved_docs=_PASSWORD_DOCS,
+    )
+    assert out != RAG_NO_MATCH_RESPONSE
+    assert "Not found in the document." not in out
+    assert "forgot password" in out.lower()
+
+
+def test_password_change_no_docs_uses_cs_not_blunt() -> None:
+    out = _finalize_user_visible_answer(
+        "Tell me how can I change my password?",
+        RAG_NO_MATCH_RESPONSE,
+    )
+    assert out != RAG_NO_MATCH_RESPONSE
+    assert out == CS_NO_MATCH_RESPONSE_EN
+    assert "Not found in the document." not in out
+
+
+def test_assistant_meta_capability_questions() -> None:
+    cases = [
+        ("What are your capabilities?", "capabilities"),
+        ("What can I ask you?", "ask_scope"),
+        ("Who are you?", "identity"),
+    ]
+    for query, expected_intent in cases:
+        assert _classify_assistant_meta_intent(query) == expected_intent
+        answer = _assistant_meta_direct_answer(query)
+        assert answer
+        assert "Not found in the document." not in answer
 
 
 if __name__ == "__main__":
     test_classify_query_route_conversational()
     test_finalize_maps_sentinel_for_conversational()
     test_finalize_maps_sentinel_for_getting_me()
-    test_finalize_keeps_sentinel_for_document_miss()
+    test_finalize_cs_tone_for_document_miss()
     test_finalize_maps_sentinel_for_behavior_complaint()
     test_conversational_redirect_constant()
     test_support_procedural_voice_phrasing()
     test_support_procedural_rescue_from_docs()
+    test_password_change_phrasing_rescued_from_docs()
+    test_password_change_no_docs_uses_cs_not_blunt()
+    test_assistant_meta_capability_questions()
     print("All conversational router tests passed.")

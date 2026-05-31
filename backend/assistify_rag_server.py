@@ -62,6 +62,24 @@ from typing import Optional, TYPE_CHECKING, List, Set, Dict, Tuple, Any, Union, 
 # Voice pipeline globals (fix NameError)
 _active_voice_task = None
 _active_voice_conn_id = None
+
+# Minimum PCM16 buffer before stop_recording / VAD will transcribe (~1.5s @ 16kHz mono)
+_VOICE_MIN_TRANSCRIBE_BYTES = 48000
+
+
+def _voice_transcribe_in_flight(conn_id: str | None = None) -> bool:
+    """True when a voice STT task is running (optionally scoped to one connection)."""
+    if _active_voice_task is None or _active_voice_task.done():
+        return False
+    if conn_id is not None and _active_voice_conn_id != conn_id:
+        return False
+    return True
+
+
+def _assign_voice_transcribe_task(task: asyncio.Task, conn_id: str) -> None:
+    global _active_voice_task, _active_voice_conn_id
+    _active_voice_task = task
+    _active_voice_conn_id = conn_id
 _pipeline_run_count = 0
 _sessions_blocked = False
 _sessions_blocked_since = 0.0
@@ -11950,6 +11968,7 @@ def _is_support_procedural_query(query: str) -> bool:
     patterns = (
         r"^\s*how\s+(?:do|can|to)\s+i\s+",
         r"^\s*(?:how\s+to|how\s+do\s+i|how\s+can\s+i)\s+",
+        r"^\s*(?:tell\s+me\s+)?how\s+(?:do|can|to)\s+i\s+",
         r"^\s*(?:tell\s+me\s+)?how\s+to\s+",
         r"^\s*how\s+(?:many|long|much)\b",
         r"^\s*when\s+(?:is|are)\b",
@@ -12000,7 +12019,10 @@ def _rescue_support_procedural_from_docs(query: str, retrieved_docs: list[dict])
         if not text:
             continue
         low = text.lower()
-        password_reset = ("password" in low and "reset" in low) or doc_id == "password_reset"
+        password_reset = (
+            ("password" in low and ("reset" in low or "change" in low or "forgot" in low))
+            or doc_id == "password_reset"
+        )
         if not password_reset and not any(m in low for m in procedural_markers):
             continue
         cleaned = re.sub(r"\s+", " ", text).strip()
@@ -27930,7 +27952,7 @@ def _finalize_user_visible_answer(
         rescued = _rescue_support_procedural_from_docs(query, retrieved_docs)
         if rescued:
             return rescued
-    return answer
+    return _customer_service_no_match_response(query, language)
 
 
 def _classify_assistant_meta_intent(query: str) -> str:
@@ -28208,7 +28230,17 @@ def _not_found_response(query: str, confidence: str):
     return RAG_NO_MATCH_RESPONSE
 
 
-def _apply_not_found_ux(query: str, answer: str, doc_dicts: List[Dict[str, Any]]) -> str:
+def _customer_service_no_match_response(query: str, language: str | None = None) -> str:
+    lang = _route_response_language(query, language)
+    return CS_NO_MATCH_RESPONSE_AR if lang == "ar" else CS_NO_MATCH_RESPONSE_EN
+
+
+def _apply_not_found_ux(
+    query: str,
+    answer: str,
+    doc_dicts: List[Dict[str, Any]],
+    language: str | None = None,
+) -> str:
     ans = str(answer or "").strip()
     if not ans:
         return ans
@@ -28216,7 +28248,9 @@ def _apply_not_found_ux(query: str, answer: str, doc_dicts: List[Dict[str, Any]]
     def _finalize(a: str) -> str:
         raw = str(a or "").strip()
         if raw.lower() == RAG_NO_MATCH_RESPONSE.lower():
-            return _finalize_user_visible_answer(query, RAG_NO_MATCH_RESPONSE)
+            return _finalize_user_visible_answer(
+                query, RAG_NO_MATCH_RESPONSE, language, doc_dicts or None
+            )
         if _is_arabic_text(raw):
             cleaned = _polish_final_response_text(query, raw)
         else:
@@ -28234,7 +28268,7 @@ def _apply_not_found_ux(query: str, answer: str, doc_dicts: List[Dict[str, Any]]
         logger.info("[POSTPROCESS FINAL ANSWER] %s", ans[:280])
         return ans
 
-    final = _finalize_user_visible_answer(query, RAG_NO_MATCH_RESPONSE)
+    final = _finalize_user_visible_answer(query, RAG_NO_MATCH_RESPONSE, language, doc_dicts or None)
     logger.info("[POSTPROCESS FINAL ANSWER] %s", final[:280])
     return final
 
@@ -29987,6 +30021,21 @@ def _shared_rag_final_answer_decision( # type: ignore
     list_debug_blocked_reason = ""
     list_local_support = _collect_local_window_support(routed_docs or doc_dicts or [])
     list_local_override = _has_strong_local_window_support(list_local_support, confidence_threshold=0.58)
+
+    if _is_support_procedural_query(query):
+        _early_support = _rescue_support_procedural_from_docs(query, routed_docs or doc_dicts or [])
+        if _early_support:
+            logger.info("[SUPPORT PROCEDURAL EARLY] query=%s chars=%s", str(query or "")[:180], len(_early_support))
+            return {
+                "intent": intent,
+                "query_family": family_v2,
+                "answer": _early_support,
+                "used_llm": False,
+                "answer_type": "support_procedural_rescue",
+                "extractor_items_count": 0,
+                "source_mode": "support_kb",
+                "_list_local_support": dict(list_local_support or {}),
+            }
 
     # Default stub — overridden with a real closure inside list_entity/list_structure branch.
     # Ensures the name is always bound even when that branch is not taken.
@@ -41015,7 +41064,7 @@ async def query_rag(data: QueryRequest, request: Request, user=Depends(require_l
         normalized_query_for_output, _ = _normalize_definition_query_before_retrieval(_post_text)
         ai_response = _force_clean_definition_sentence(normalized_query_for_output or _post_text, ai_response, retrieved_docs)
     ai_response = _cleanup_final_answer_text(ai_response)
-    ai_response = _finalize_user_visible_answer(_post_text, ai_response)
+    ai_response = _finalize_user_visible_answer(_post_text, ai_response, retrieved_docs=retrieved_docs)
     logger.info("[HTTP FINAL ANSWER BEFORE RETURN] %s", str(ai_response or "")[:320])
     return {"answer": ai_response}
 
@@ -42777,8 +42826,14 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
         logger.info(f"===== VOICE SESSION START  [{conn_id}] =====")
         logger.info(f"  GPU before: reserved={mem_before['gpu_reserved_mb']:.0f}MB  alloc={mem_before['gpu_allocated_mb']:.0f}MB  |  CPU RSS={mem_before['cpu_rss_mb']:.0f}MB")
 
-        # Cancel any previously-active voice task (Part 1 — only 1 at a time)
-        if _active_voice_task and not _active_voice_task.done():
+        # Cancel any previously-active voice task (Part 1 — only 1 at a time).
+        # Never cancel the task that is currently executing (self-cancel race).
+        current_task = asyncio.current_task()
+        if (
+            _active_voice_task
+            and not _active_voice_task.done()
+            and _active_voice_task is not current_task
+        ):
             logger.warning(
                 "[VOICE PERF] duplicate_session_blocked=True prev_conn=%s current_conn=%s",
                 _active_voice_conn_id, conn_id,
@@ -43212,7 +43267,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                     
                     # If we've had enough consecutive silent chunks AND we have audio buffered
                     # AND we actually detected speech at some point (prevents noise-only transcriptions)
-                    if silence_counter >= silence_chunks_needed and len(audio_buffer) > 48000 and speech_start_time is not None:
+                    if silence_counter >= silence_chunks_needed and len(audio_buffer) > _VOICE_MIN_TRANSCRIBE_BYTES and speech_start_time is not None:
                         # Transcribe everything we've accumulated
                         # 48000 bytes = 1.5s minimum audio — prevents firing on short single words
                         speech_end_time = current_time
@@ -43233,10 +43288,19 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                         first_audio_arrival = None
                         speech_start_time = None
 
-                        logger.info(f"{connection_id} ✓ TRANSCRIBE TRIGGERED: {len(chunk)} bytes ({audio_duration_sec:.2f}s audio) after {triggered_after} silent chunks")
-                        task = asyncio.create_task(_auto_transcribe(chunk, websocket, connection_id, timing_meta, lang=session_language))
-                        _active_voice_task = task
-                    elif silence_counter >= silence_chunks_needed and len(audio_buffer) <= 48000 and speech_start_time is not None:
+                        if _voice_transcribe_in_flight(connection_id):
+                            logger.info(
+                                f"{connection_id} VAD transcribe skipped — transcription already in flight"
+                            )
+                            audio_buffer.clear()
+                            silence_counter = 0
+                            first_audio_arrival = None
+                            speech_start_time = None
+                        else:
+                            logger.info(f"{connection_id} ✓ TRANSCRIBE TRIGGERED: {len(chunk)} bytes ({audio_duration_sec:.2f}s audio) after {triggered_after} silent chunks")
+                            task = asyncio.create_task(_auto_transcribe(chunk, websocket, connection_id, timing_meta, lang=session_language))
+                            _assign_voice_transcribe_task(task, connection_id)
+                    elif silence_counter >= silence_chunks_needed and len(audio_buffer) <= _VOICE_MIN_TRANSCRIBE_BYTES and speech_start_time is not None:
                         # Buffer too small to be a real utterance — drain it
                         logger.debug(f"{connection_id} Buffer too small ({len(audio_buffer)} bytes < 48000 min), discarding")
                         audio_buffer.clear()
@@ -43265,15 +43329,43 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
                             # Handle control messages like stop/start recording
                             action = payload.get("action")
                             if action == "stop_recording":
-                                # User stopped recording - NOW transcribe the full audio buffer
-                                if len(audio_buffer) > 0:
+                                # User stopped recording — transcribe unless VAD already started STT.
+                                if _voice_transcribe_in_flight(connection_id):
+                                    if len(audio_buffer) > 0:
+                                        logger.info(
+                                            f"{connection_id} ⏹ MANUAL STOP skipped — transcription already in flight "
+                                            f"(discarding {len(audio_buffer)} trailing bytes)"
+                                        )
+                                        audio_buffer.clear()
+                                    else:
+                                        logger.info(
+                                            f"{connection_id} ⏹ MANUAL STOP skipped — transcription already in flight"
+                                        )
+                                    silence_counter = 0
+                                    speech_start_time = None
+                                    first_audio_arrival = None
+                                elif len(audio_buffer) > 0:
                                     chunk = bytes(audio_buffer)
                                     audio_duration_sec = len(chunk) / (SAMPLE_RATE * 2)
                                     audio_buffer.clear()
                                     silence_counter = 0
-                                    logger.info(f"{connection_id} ⏹ MANUAL STOP: transcribing {len(chunk)} bytes ({audio_duration_sec:.2f}s audio)")
-                                    task = asyncio.create_task(_auto_transcribe(chunk, websocket, connection_id, lang=session_language))
-                                    _active_voice_task = task
+                                    speech_start_time = None
+                                    first_audio_arrival = None
+                                    # Match auto_transcribe minimum (~0.5s); short utterances VAD won't auto-fire.
+                                    if len(chunk) < 16000:
+                                        logger.info(
+                                            f"{connection_id} ⏹ MANUAL STOP ignored — buffer too short "
+                                            f"({len(chunk)} bytes, {audio_duration_sec:.2f}s)"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"{connection_id} ⏹ MANUAL STOP: transcribing {len(chunk)} bytes "
+                                            f"({audio_duration_sec:.2f}s audio)"
+                                        )
+                                        task = asyncio.create_task(
+                                            _auto_transcribe(chunk, websocket, connection_id, lang=session_language)
+                                        )
+                                        _assign_voice_transcribe_task(task, connection_id)
                             elif action == "clear_audio_buffer":
                                 # User muted - clear the buffer without transcribing
                                 if len(audio_buffer) > 0:

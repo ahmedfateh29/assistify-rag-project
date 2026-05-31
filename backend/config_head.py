@@ -128,6 +128,14 @@ from backend.response_validator import validate_response
 
 RAG_STRICT_DISTANCE_THRESHOLD = float(os.getenv("RAG_STRICT_DISTANCE_THRESHOLD", "0.70"))
 RAG_NO_MATCH_RESPONSE = "Not found in the document."
+CS_NO_MATCH_RESPONSE_EN = (
+    "I don't have that specific detail in our help docs yet, but I can help with "
+    "account access, orders, or returns. What would you like to know?"
+)
+CS_NO_MATCH_RESPONSE_AR = (
+    "ليس لدي هذا التفصيل المحدد في مستندات المساعدة بعد، لكن يمكنني المساعدة في "
+    "الوصول إلى الحساب، الطلبات، أو الإرجاع. بماذا تود المساعدة؟"
+)
 CONVERSATIONAL_REDIRECT_EN = (
     "Thank you for reaching out. I'm here and ready to help with your support questions "
     "based on our knowledge base—for example, password reset, returns, or shipping. "
