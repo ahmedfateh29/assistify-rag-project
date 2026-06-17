@@ -10,7 +10,7 @@
       "receipt"
     ],
     "missing_topics": [],
-    "duration_s": 8.218
+    "duration_s": 13.813
   },
   {
     "id": "kb_password_reset",
@@ -23,7 +23,7 @@
       "reset link"
     ],
     "missing_topics": [],
-    "duration_s": 0.896
+    "duration_s": 3.718
   },
   {
     "id": "kb_shipping",
@@ -36,15 +36,15 @@
       "shipping"
     ],
     "missing_topics": [],
-    "duration_s": 0.81
+    "duration_s": 3.7
   },
   {
     "id": "kb_outofscope",
     "question": "What is the capital of France?",
     "num_chunks": 3,
-    "top_similarity": 0.3924258856076954,
+    "top_similarity": 0.3840083681151244,
     "found_topics": [],
     "missing_topics": [],
-    "duration_s": 0.903
+    "duration_s": 3.721
   }
 ]

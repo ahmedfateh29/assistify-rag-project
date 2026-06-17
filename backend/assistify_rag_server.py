@@ -25927,6 +25927,12 @@ def _is_targeted_list_question(query: str) -> bool:
         return True
     if re.match(r"^\s*(?:what|which)\s+are\b", q):
         return True
+    # Comparison questions ("X compared to Y", "X vs Y", "difference between
+    # A and B") are not bullet-list extractions. Excluding them here keeps the
+    # v2 classifier consistent with the legacy compare family and prevents the
+    # list-coherence sanitizer from rejecting tabular/numeric answers.
+    if _is_compare_query(q):
+        return False
     tokens = re.findall(r"[a-z]{3,}", q)
     plural_tokens = [tok for tok in tokens if tok.endswith("s") and tok not in {"this", "was", "is", "does"}]
     if re.match(r"^\s*(?:name|give|mention|identify)\b", q) and plural_tokens:
@@ -31649,6 +31655,23 @@ def _shared_rag_final_answer_decision( # type: ignore
             "_list_local_support": dict(list_local_support or {}),
         }
 
+    # Comparison/numeric questions (e.g. "net sales for Americas in 2023
+    # compared to 2022") are poorly served by the deterministic sentence
+    # extractor, which tends to emit a table heading fragment. Defer them to
+    # the LLM so it can read the retrieved table context and compute the
+    # comparison instead.
+    if _doc_router_implies_comparison(query):
+        logger.info("[ANSWER ROUTE] mode=generic deterministic=skipped reason=comparison_query action=llm_required")
+        return {
+            "intent": intent,
+            "query_family": family_v2,
+            "answer": "",
+            "used_llm": True,
+            "answer_type": "generic_llm_required",
+            "extractor_items_count": 0,
+            "source_mode": "generic",
+            "_list_local_support": dict(list_local_support or {}),
+        }
     generic_route_answer = _build_grounded_llm_answer(query, route_docs)
     if generic_route_answer:
         if not _should_allow_generic_answer(query, route_docs, family_v2, "generic_route_grounded"):
