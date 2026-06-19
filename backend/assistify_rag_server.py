@@ -438,6 +438,141 @@ serializer = URLSafeSerializer(SESSION_SECRET)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Assistify")
 
+# ========== MULTI-TENANCY: request tenant resolution ==========
+# Every request carries the tenant in the signed session cookie issued by the
+# login server. For customers the login server overwrites `tenant_id` with the
+# business they selected (`active_tenant_id`); staff/superadmin carry their home
+# tenant. We resolve the effective tenant here so retrieval, conversations, and
+# analytics can all be scoped to a single business and never cross over.
+#
+# The resolved tenant is stored in a ContextVar so the deep retrieval call chain
+# can read it without threading the id through dozens of function signatures.
+# Each tenant gets its own ChromaDB collection (see get_tenant_rag), so even
+# under concurrent requests one business can never read another's vectors.
+import contextvars as _contextvars
+
+_request_tenant_id: "_contextvars.ContextVar[int]" = _contextvars.ContextVar(
+    "request_tenant_id", default=DEFAULT_TENANT_ID
+)
+
+
+def resolve_request_tenant(user) -> int:
+    """Resolve the effective tenant id for a request from the session cookie.
+
+    Order of preference: the customer's actively selected business
+    (`active_tenant_id`), then the user's home `tenant_id`, then the default
+    tenant. Anonymous/legacy requests fall back to the default tenant so
+    single-tenant installs keep working unchanged.
+    """
+    if not user:
+        return DEFAULT_TENANT_ID
+    for key in ("active_tenant_id", "tenant_id"):
+        val = user.get(key)
+        if val is None:
+            continue
+        try:
+            tid = int(val)
+        except (TypeError, ValueError):
+            continue
+        if tid > 0:
+            return tid
+    return DEFAULT_TENANT_ID
+
+
+def require_request_tenant(user) -> int:
+    """Like resolve_request_tenant but rejects a logged-in customer that has no
+    active business selected, so a customer can never silently fall back to
+    another tenant's knowledge base.
+    """
+    tid = resolve_request_tenant(user)
+    role = str((user or {}).get("role") or "").lower()
+    if role == "customer":
+        has_tenant = any(
+            (user or {}).get(k) is not None for k in ("active_tenant_id", "tenant_id")
+        )
+        if not has_tenant:
+            raise HTTPException(status_code=403, detail="No active business selected.")
+    return tid
+
+
+class _TenantScope:
+    """Context manager that binds the current request's tenant for the duration
+    of a request, resetting it afterwards (safe for async/concurrent requests)."""
+
+    __slots__ = ("tenant_id", "_token")
+
+    def __init__(self, tenant_id):
+        try:
+            self.tenant_id = int(tenant_id)
+        except (TypeError, ValueError):
+            self.tenant_id = DEFAULT_TENANT_ID
+        self._token = None
+
+    def __enter__(self):
+        self._token = _request_tenant_id.set(self.tenant_id)
+        return self.tenant_id
+
+    def __exit__(self, *exc):
+        if self._token is not None:
+            try:
+                _request_tenant_id.reset(self._token)
+            except Exception:
+                pass
+        return False
+
+
+def current_tenant_id() -> int:
+    """Return the tenant bound to the current request context (default tenant
+    if none has been set)."""
+    try:
+        return int(_request_tenant_id.get())
+    except Exception:
+        return DEFAULT_TENANT_ID
+
+
+# ---- Tenant-aware analytics wrappers ----
+# `from backend.config_head import *` (above) already bound `log_usage` and
+# `log_kb_event` in this module's namespace. We shadow them with thin wrappers
+# that automatically attribute each event to the tenant bound to the current
+# request, so analytics are isolated per business without having to thread
+# tenant_id through the ~15 call sites in the chat pipeline.
+from backend.analytics import (
+    log_usage as _analytics_log_usage,
+    log_kb_event as _analytics_log_kb_event,
+)
+
+
+def log_usage(*args, tenant_id=None, **kwargs):  # noqa: F811 (intentional shadow)
+    if tenant_id is None:
+        tenant_id = current_tenant_id()
+    return _analytics_log_usage(*args, tenant_id=tenant_id, **kwargs)
+
+
+def log_kb_event(*args, tenant_id=None, **kwargs):  # noqa: F811 (intentional shadow)
+    if tenant_id is None:
+        tenant_id = current_tenant_id()
+    return _analytics_log_kb_event(*args, tenant_id=tenant_id, **kwargs)
+
+
+def analytics_scope_tenant(user, requested_tenant_id=None):
+    """Resolve which tenant an analytics/admin read should be scoped to.
+
+    - superadmin: may target a specific tenant (via `requested_tenant_id`) or,
+      when none is given, see platform-wide data (returns None => no filter).
+    - business admin/employee: always restricted to their own tenant; any
+      requested override is ignored so they can never read another business's
+      analytics.
+    """
+    role = str((user or {}).get("role") or "").lower()
+    if role == "superadmin":
+        if requested_tenant_id is None:
+            return None
+        try:
+            return int(requested_tenant_id)
+        except (TypeError, ValueError):
+            return None
+    return resolve_request_tenant(user)
+
 # ========== CONVERSATION MEMORY ==========
 conversation_history = defaultdict(list)
 MAX_CONVERSATIONS = 1000  # Maximum number of conversations to keep in memory
@@ -499,6 +634,65 @@ def _find_conversation(data: dict, conversation_id: str) -> dict | None:
     return None
 
 
+def _coerce_owner(user) -> str | None:
+    """Extract the owning username from a session-user dict (or None)."""
+    if isinstance(user, dict):
+        name = str(user.get("username") or "").strip()
+        return name or None
+    if isinstance(user, str):
+        return user.strip() or None
+    return None
+
+
+def _conv_tenant_of(conversation: dict) -> int:
+    """Tenant a stored conversation belongs to (legacy rows default tenant)."""
+    val = conversation.get("tenant_id") if isinstance(conversation, dict) else None
+    if val is None:
+        return DEFAULT_TENANT_ID
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return DEFAULT_TENANT_ID
+
+
+def _conversation_in_scope(conversation: dict, tenant_id: int, owner: str | None) -> bool:
+    """Return True if a conversation may be accessed by (tenant_id, owner).
+
+    Tenant must always match. Owner must match when both the caller and the
+    stored conversation declare one; legacy rows without an owner are claimable
+    by the first scoped accessor. This guarantees a customer of one business can
+    never read another business's (or another user's) chat history.
+    """
+    if conversation is None:
+        return False
+    try:
+        if _conv_tenant_of(conversation) != int(tenant_id):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if owner is None:
+        # Caller did not assert an owner (e.g. internal/admin path): tenant
+        # scoping already applied above.
+        return True
+    c_owner = conversation.get("owner")
+    if c_owner is None or str(c_owner) == "":
+        return True  # legacy/unclaimed row in this tenant
+    return str(c_owner) == str(owner)
+
+
+def _stamp_conversation_scope(conversation: dict, tenant_id: int, owner: str | None) -> None:
+    """Persistently tag a conversation with its tenant/owner if not already set."""
+    if not isinstance(conversation, dict):
+        return
+    if conversation.get("tenant_id") is None:
+        try:
+            conversation["tenant_id"] = int(tenant_id)
+        except (TypeError, ValueError):
+            conversation["tenant_id"] = DEFAULT_TENANT_ID
+    if owner and not conversation.get("owner"):
+        conversation["owner"] = str(owner)
+
+
 def _conversation_title_from_text(text: str) -> str:
     words = re.findall(r"\S+", str(text or "").strip())
     if not words:
@@ -509,35 +703,59 @@ def _conversation_title_from_text(text: str) -> str:
     return title[:80]
 
 
-def create_conversation(title: str | None = None) -> dict:
+def create_conversation(title: str | None = None, tenant_id=None, owner: str | None = None) -> dict:
     data = _load_conversation_store()
     now = _utc_now_iso()
+    try:
+        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
     conversation = {
         "id": str(uuid.uuid4()),
         "title": (title or "New chat").strip() or "New chat",
         "messages": [],
+        "tenant_id": tid,
+        "owner": str(owner).strip() if owner else None,
         "created_at": now,
         "updated_at": now,
     }
     data["conversations"].insert(0, conversation)
     _save_conversation_store(data)
-    logger.info("[CONV] created id=%s", conversation["id"])
+    logger.info("[CONV] created id=%s tenant=%s owner=%s", conversation["id"], tid, owner)
     return conversation
 
 
-def get_or_create_conversation(conversation_id: str | None = None) -> dict:
+def get_or_create_conversation(conversation_id: str | None = None, tenant_id=None, owner: str | None = None) -> dict:
+    try:
+        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
     data = _load_conversation_store()
     if conversation_id:
         existing = _find_conversation(data, conversation_id)
         if existing is not None:
+            if not _conversation_in_scope(existing, tid, owner):
+                # A conversation id from a different tenant/owner must never be
+                # reused — start a fresh one for this caller instead.
+                logger.warning("[CONV] id=%s out of scope for tenant=%s owner=%s; creating new", conversation_id, tid, owner)
+                return create_conversation(tenant_id=tid, owner=owner)
+            _stamp_conversation_scope(existing, tid, owner)
+            _save_conversation_store(data)
             logger.info("[CONV] loaded id=%s", conversation_id)
             return existing
-    return create_conversation()
+    return create_conversation(tenant_id=tid, owner=owner)
 
 
-def list_conversations_summary() -> list[dict]:
+def list_conversations_summary(tenant_id=None, owner: str | None = None) -> list[dict]:
+    try:
+        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
     data = _load_conversation_store()
-    conversations = [c for c in data.get("conversations", []) if isinstance(c, dict)]
+    conversations = [
+        c for c in data.get("conversations", [])
+        if isinstance(c, dict) and _conversation_in_scope(c, tid, owner)
+    ]
     conversations.sort(key=lambda c: str(c.get("updated_at") or ""), reverse=True)
     return [
         {
@@ -550,25 +768,34 @@ def list_conversations_summary() -> list[dict]:
     ]
 
 
-def load_conversation_messages(conversation_id: str) -> list[dict]:
+def load_conversation_messages(conversation_id: str, tenant_id=None, owner: str | None = None) -> list[dict]:
+    try:
+        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
     data = _load_conversation_store()
     conversation = _find_conversation(data, conversation_id)
-    if conversation is None:
+    if conversation is None or not _conversation_in_scope(conversation, tid, owner):
         raise KeyError(conversation_id)
     logger.info("[CONV] loaded id=%s", conversation_id)
     messages = conversation.get("messages") or []
     return [m for m in messages if isinstance(m, dict)]
 
 
-def append_conversation_message(conversation_id: str, role: str, text: str) -> dict:
+def append_conversation_message(conversation_id: str, role: str, text: str, tenant_id=None, owner: str | None = None) -> dict:
     role_value = str(role or "").strip().lower()
     if role_value not in {"user", "assistant"}:
         raise ValueError("role must be 'user' or 'assistant'")
     text_value = str(text or "").strip()
+    try:
+        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
     data = _load_conversation_store()
     conversation = _find_conversation(data, conversation_id)
-    if conversation is None:
+    if conversation is None or not _conversation_in_scope(conversation, tid, owner):
         raise KeyError(conversation_id)
+    _stamp_conversation_scope(conversation, tid, owner)
     messages = conversation.setdefault("messages", [])
     messages.append({"role": role_value, "text": text_value})
     if role_value == "user" and (not conversation.get("title") or conversation.get("title") == "New chat"):
@@ -587,15 +814,19 @@ def _conversation_summary(conversation: dict) -> dict:
     }
 
 
-def rename_conversation(conversation_id: str, title: str) -> dict:
+def rename_conversation(conversation_id: str, title: str, tenant_id=None, owner: str | None = None) -> dict:
     title_value = re.sub(r"\s+", " ", str(title or "")).strip()
     if not title_value:
         raise ValueError("title must not be empty")
     if len(title_value) > 80:
         title_value = title_value[:80].rstrip()
+    try:
+        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
     data = _load_conversation_store()
     conversation = _find_conversation(data, conversation_id)
-    if conversation is None:
+    if conversation is None or not _conversation_in_scope(conversation, tid, owner):
         raise KeyError(conversation_id)
     conversation["title"] = title_value
     conversation["updated_at"] = _utc_now_iso()
@@ -604,9 +835,16 @@ def rename_conversation(conversation_id: str, title: str) -> dict:
     return _conversation_summary(conversation)
 
 
-def delete_conversation(conversation_id: str) -> None:
+def delete_conversation(conversation_id: str, tenant_id=None, owner: str | None = None) -> None:
+    try:
+        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
     data = _load_conversation_store()
     conversations = [c for c in data.get("conversations", []) if isinstance(c, dict)]
+    target = _find_conversation(data, conversation_id)
+    if target is None or not _conversation_in_scope(target, tid, owner):
+        raise KeyError(conversation_id)
     remaining = [c for c in conversations if c.get("id") != conversation_id]
     if len(remaining) == len(conversations):
         raise KeyError(conversation_id)
@@ -3758,7 +3996,91 @@ def _build_grounded_explanation(query, item, context_docs):
     return f"This refers to {item_text}, which in the document is associated with {context_phrase}."
 
 
-def _build_grounded_explanations_for_items(query, items, context_docs):
+def _is_undirected_explain_more(user_text) -> bool:
+    """True when a follow-up is a broad 'explain more' (no specific item),
+    e.g. 'explain more', 'tell me more', 'elaborate', 'expand'."""
+    t = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+    if not t:
+        return False
+    if t in {"more", "more please", "explain", "explain more", "tell me more", "elaborate", "expand"}:
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:please\s+)?(?:can\s+you\s+)?(?:explain|elaborate|expand|tell\s+me)"
+            r"(?:\s+(?:more|further|again|on\s+(?:it|this|that)|it|this|that))?",
+            t,
+        )
+    )
+
+
+def _build_consolidated_grounded_explanation(query, items, context_docs) -> str:
+    """For an undirected 'explain more', produce ONE concise, grounded
+    summary instead of a repetitive per-item template. Only items that
+    actually appear in the retrieved context are referenced."""
+    parts: list[str] = []
+    docs_iterable = context_docs if isinstance(context_docs, (list, tuple)) else [context_docs]
+    for context_doc in docs_iterable:
+        if context_doc is None:
+            continue
+        if isinstance(context_doc, dict):
+            text = (
+                context_doc.get("text")
+                or context_doc.get("page_content")
+                or context_doc.get("content")
+                or ""
+            )
+        elif isinstance(context_doc, bytes):
+            text = context_doc.decode("utf-8", errors="ignore")
+        else:
+            text = str(context_doc)
+        text = re.sub(r"\s+", " ", text or "").strip()
+        if text:
+            parts.append(text)
+    context_text = " ".join(parts).strip()
+    if not context_text:
+        return ""
+
+    haystack = context_text.lower()
+    anchored: list[str] = []
+    seen: set[str] = set()
+    for raw_item in items or []:
+        head = _followup_item_head(raw_item)
+        if not head:
+            continue
+        key = head.lower()
+        if key in seen:
+            continue
+        if _followup_text_mentions_item(haystack, head):
+            anchored.append(head)
+            seen.add(key)
+    if not anchored:
+        return ""
+
+    names = _join_short_item_names(anchored, max_items=6) or ", ".join(anchored)
+    return (
+        "Regarding your question, here are the related points from our help "
+        f"materials: {names}."
+    )
+
+
+def _build_grounded_explanations_for_items(
+    query, items, context_docs, user_text=None, targeted_item=None
+):
+    # Directed follow-up about one specific item keeps the precise,
+    # per-item grounded explanation.
+    if targeted_item:
+        explanation = _build_grounded_explanation(query, targeted_item, context_docs)
+        if explanation and explanation != RAG_NO_MATCH_RESPONSE:
+            return explanation
+        return ""
+
+    # Broad/undirected "explain more" gets a single consolidated answer so
+    # the customer doesn't receive a repetitive template per list item.
+    if user_text is not None and _is_undirected_explain_more(user_text):
+        consolidated = _build_consolidated_grounded_explanation(query, items, context_docs)
+        if consolidated:
+            return consolidated
+
     explanations: list[str] = []
     for explanation_item in items or []:
         explanation = _build_grounded_explanation(query, explanation_item, context_docs)
@@ -4002,7 +4324,7 @@ async def _handle_followup_query(text: str, connection_id: str):
                     print(f"[FOLLOWUP QUERY] {_rescue_query}")
                     logger.info("[FOLLOWUP QUERY] %s", _rescue_query)
                     try:
-                        _raw_rescue = live_rag.search(
+                        _raw_rescue = _active_rag().search(
                             query=_rescue_query,
                             top_k=3,
                             return_dicts=True,
@@ -6635,7 +6957,7 @@ from backend.knowledge_base import (
 )
 
 class LiveRAGManager:
-    def __init__(self):
+    def __init__(self, tenant_id=None):
         # Lazy initialization: defer heavy VectorStore / embedding model loading
         # until the first search call. This keeps module import fast and
         # avoids pulling large models into memory when not needed (e.g., tests).
@@ -6643,18 +6965,44 @@ class LiveRAGManager:
         db_path = str(Path(__file__).resolve().parent / "chroma_db_v3")
         self._init_args["persist_directory"] = db_path
         self.vs: Optional[VectorStore] = None
-        # Force the runtime to prefer the populated support docs collection
-        self.collection_name = "support_docs_v3_latest"
-        self._preferred_collection = os.environ.get("ASSISTIFY_COLLECTION_NAME", "").strip() or self.collection_name
+        # Resolve the tenant this manager serves. The default tenant keeps the
+        # historical auto-resolution behavior (no explicit collection name) so
+        # existing single-tenant data continues to work unchanged. Other tenants
+        # bind to their own namespaced collection, which VectorStore enforces in
+        # its per-tenant "explicit" resolution branch — guaranteeing a query for
+        # one business can never read another business's vectors.
+        try:
+            self.tenant_id = DEFAULT_TENANT_ID if tenant_id is None else int(tenant_id)
+        except (TypeError, ValueError):
+            self.tenant_id = DEFAULT_TENANT_ID
+        if self.tenant_id == DEFAULT_TENANT_ID:
+            self.collection_name = "support_docs_v3_latest"
+            # None => preserve legacy auto-resolution inside VectorStore.
+            self._vs_collection_name = None
+        else:
+            try:
+                self.collection_name = tenant_collection_name(self.tenant_id)
+            except Exception:
+                self.collection_name = f"t{self.tenant_id}_support_docs_v3_latest"
+            self._vs_collection_name = self.collection_name
+        # The ASSISTIFY_COLLECTION_NAME override only applies to the default
+        # tenant; honoring it for every tenant would break isolation.
+        if self.tenant_id == DEFAULT_TENANT_ID:
+            self._preferred_collection = os.environ.get("ASSISTIFY_COLLECTION_NAME", "").strip() or self.collection_name
+        else:
+            self._preferred_collection = self.collection_name
         
     def search(self, query: str, top_k: int = 5, distance_threshold: float = 1.0, return_dicts: bool = False, enable_rerank: bool = True):
         """High-level search orchestration."""
-        print(f"\n[LiveRAGManager] Query: '{query}'")
+        print(f"\n[LiveRAGManager] tenant={self.tenant_id} Query: '{query}'")
 
         # Lazy-create VectorStore on first use (safe, idempotent)
         if self.vs is None:
             try:
-                self.vs = VectorStore(persist_directory=str(self._init_args.get("persist_directory") or ""))
+                self.vs = VectorStore(
+                    persist_directory=str(self._init_args.get("persist_directory") or ""),
+                    collection_name=self._vs_collection_name,
+                )
                 # If a preferred collection is set but empty, VectorStore logic will
                 # handle fallback; keep behavior consistent with previous design.
             except Exception as e:
@@ -6689,8 +7037,45 @@ class LiveRAGManager:
 
     # --- DEPRECATED OLD SEARCH HELPERS REMOVED ---
 
-# Inject the new pipeline wrapper
+# Inject the new pipeline wrapper. `live_rag` serves the default tenant and
+# preserves the historical single-tenant retrieval behavior exactly.
 live_rag = LiveRAGManager()
+
+# Per-tenant retrieval managers. Each non-default tenant gets its own
+# LiveRAGManager (and therefore its own ChromaDB collection + cached VectorStore),
+# so retrieval is physically isolated per business.
+_tenant_rag_managers: dict = {}
+_tenant_rag_lock = RLock()
+
+
+def get_tenant_rag(tenant_id=None) -> "LiveRAGManager":
+    """Return the retrieval manager bound to a tenant's knowledge base.
+
+    The default tenant reuses the legacy `live_rag` singleton; every other
+    tenant gets a lazily-created, cached manager pinned to its own collection.
+    """
+    try:
+        tid = int(tenant_id) if tenant_id is not None else DEFAULT_TENANT_ID
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
+    if tid <= 0:
+        tid = DEFAULT_TENANT_ID
+    if tid == DEFAULT_TENANT_ID:
+        return live_rag
+    with _tenant_rag_lock:
+        mgr = _tenant_rag_managers.get(tid)
+        if mgr is None:
+            mgr = LiveRAGManager(tenant_id=tid)
+            _tenant_rag_managers[tid] = mgr
+        return mgr
+
+
+def _active_rag() -> "LiveRAGManager":
+    """Retrieval manager for the tenant bound to the current request context."""
+    try:
+        return get_tenant_rag(current_tenant_id())
+    except Exception:
+        return live_rag
 
 
 def _sync_live_retrieval_collection(target_collection_name: str | None = None) -> str:
@@ -7573,7 +7958,7 @@ async def _reindex_file_auto(filename: str):
 
         # ---- STEP 4: verify the new content is searchable ----
         snippet = _pick_verification_snippet(text)
-        verify = live_rag.search(snippet, top_k=3, distance_threshold=1.5, enable_rerank=True) if snippet else []
+        verify = _active_rag().search(snippet, top_k=3, distance_threshold=1.5, enable_rerank=True) if snippet else []
         if snippet:
             logger.info("[RERANK ACTIVE]")
         if verify:
@@ -11973,7 +12358,12 @@ def _is_support_procedural_query(query: str) -> bool:
         r"^\s*how\s+(?:many|long|much)\b",
         r"^\s*when\s+(?:is|are)\b",
         r"^\s*what\s+payment\b",
-        r"^\s*what\s+are\s+(?:your|the)\b",
+        # Tightened: only treat "what are your/the ..." as a support FAQ when
+        # it targets a support-domain topic, so document essay questions like
+        # "what are the steps in the planning process?" are NOT misrouted.
+        r"^\s*what\s+are\s+(?:your|the)\s+(?:return|refund|exchange|shipping|"
+        r"delivery|payment|support|business|opening|store|warrant|"
+        r"cancellation|contact)\b",
         r"support\s+hours\b",
         r".\breset\b.*\bpassword\b",
         r".\bpassword\b.*\breset\b",
@@ -17464,7 +17854,7 @@ def _search_with_query_expansion(query_text: str, top_k: int, distance_threshold
 
     for q in expanded:
         try:
-            found = live_rag.search(
+            found = _active_rag().search(
                 q,
                 top_k=per_query_k,
                 distance_threshold=distance_threshold,
@@ -17549,7 +17939,7 @@ def _search_fast_minimal(query_text: str, top_k: int) -> list[dict]:
         actual_top_k = capped_k
     logger.info("[TOPK TRACE] requested=%s actual=%s function=_search_fast_minimal", requested_top_k, actual_top_k)
     try:
-        out = live_rag.search(
+        out = _active_rag().search(
             query_text,
             top_k=actual_top_k,
             distance_threshold=_distance_threshold_for_query(query_text),
@@ -18503,7 +18893,7 @@ def _retrieve_with_section_bias(query_text: str, retrieved_docs: list[dict], top
     if family == "overview_chapter_compare" and matched.get("compare_terms"):
         for term in matched.get("compare_terms", []):
             try:
-                extra = live_rag.search(
+                extra = _active_rag().search(
                     term,
                     top_k=3,
                     distance_threshold=max(_distance_threshold_for_query(query_text), 1.25),
@@ -27961,6 +28351,43 @@ def _finalize_user_visible_answer(
     return _customer_service_no_match_response(query, language)
 
 
+def _apply_customer_support_tone(
+    query: str,
+    answer: str,
+    language: str | None = None,
+    retrieved_docs: list[dict] | None = None,
+) -> str:
+    """Wrap a model/document answer in a friendly customer-support voice.
+
+    - The strict ``RAG_NO_MATCH_RESPONSE`` sentinel is never surfaced to the
+      customer; it is mapped to the human "not found" fallback (which may be
+      rescued from docs / routed to a conversational reply).
+    - Bullet / numbered list answers get a short, professional lead-in so the
+      reply reads like a support agent rather than a raw dump.
+    """
+    raw = str(answer or "").strip()
+    if not raw:
+        return raw
+
+    if raw.lower() == RAG_NO_MATCH_RESPONSE.lower():
+        return _finalize_user_visible_answer(query, RAG_NO_MATCH_RESPONSE, language, retrieved_docs)
+
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    is_list = len(lines) >= 2 and all(
+        re.match(r"^\s*(?:[-*\u2022]|\d+[.)])\s+", ln) for ln in lines
+    )
+    if is_list:
+        lang = _route_response_language(query, language)
+        intro = (
+            "إليك الخطوات من مواد المساعدة لدينا:"
+            if lang == "ar"
+            else "Here are the steps from our help materials:"
+        )
+        return f"{intro}\n{raw}"
+
+    return raw
+
+
 def _classify_assistant_meta_intent(query: str) -> str:
     q = _normalize_query_for_router(query)
     if not q:
@@ -31158,7 +31585,7 @@ def _shared_rag_final_answer_decision( # type: ignore
                     _micro_total = 0
                     for _q in _queries:
                         try:
-                            _batch = live_rag.search(
+                            _batch = _active_rag().search(
                                 query=_q,
                                 top_k=12,
                                 return_dicts=True,
@@ -33930,7 +34357,7 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
                 enable_rerank=True,
             )
             if (not rescue_docs) and rescue_family == "overview_chapter_compare":
-                rescue_docs = live_rag.search(
+                rescue_docs = _active_rag().search(
                     _overview_seed_query(),
                     top_k=6,
                     distance_threshold=max(_distance_threshold_for_query(text), 1.8),
@@ -37446,7 +37873,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     seen_docs: set[tuple[str, str, str]] = set()
                     native_queries = _native_arabic_retrieval_queries(original_arabic_text)
                     for idx, native_query in enumerate(native_queries):
-                        found_docs = live_rag.search(
+                        found_docs = _active_rag().search(
                             native_query,
                             top_k=10 if idx == 0 else 6,
                             distance_threshold=_distance_threshold_for_query(native_query),
@@ -37687,7 +38114,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 exact_query = " ".join(protected_terms)
                 exact_docs: list[dict] = []
                 try:
-                    exact_docs = live_rag.search(
+                    exact_docs = _active_rag().search(
                         exact_query,
                         top_k=5,
                         distance_threshold=max(_distance_threshold_for_query(exact_query), 1.10),
@@ -37827,7 +38254,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 if protected_terms:
                     rag_docs_check = _filter_docs_by_protected_terms(rag_docs_check or [], protected_terms)
                 if (not rag_docs_check) and _is_overview_query(text_for_rag):
-                    rag_docs_check = live_rag.search(
+                    rag_docs_check = _active_rag().search(
                         _overview_seed_query(),
                         top_k=5,
                         distance_threshold=max(_distance_threshold_for_query(text_for_rag), 1.50),
@@ -37925,7 +38352,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
         else:
             relevant_docs = _search_fast_minimal(text, top_k=top_k_req)
         if (not relevant_docs) and _is_overview_query(text):
-            relevant_docs = live_rag.search(
+            relevant_docs = _active_rag().search(
                 _overview_seed_query(),
                 top_k=5,
                 distance_threshold=max(_distance_threshold_for_query(text), 1.50),
@@ -40985,14 +41412,18 @@ class QueryRequest(BaseModel):
 
 @app.get("/conversations")
 async def get_conversations(user=Depends(require_login())):
-    return {"conversations": list_conversations_summary()}
+    tenant_id = resolve_request_tenant(user)
+    owner = _coerce_owner(user)
+    return {"conversations": list_conversations_summary(tenant_id=tenant_id, owner=owner)}
 
 
 @app.get("/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str, user=Depends(require_login())):
+    tenant_id = resolve_request_tenant(user)
+    owner = _coerce_owner(user)
     data = _load_conversation_store()
     conversation = _find_conversation(data, conversation_id)
-    if conversation is None:
+    if conversation is None or not _conversation_in_scope(conversation, tenant_id, owner):
         raise HTTPException(status_code=404, detail="Conversation not found.")
     logger.info("[CONV] loaded id=%s", conversation_id)
     return conversation
@@ -41000,7 +41431,9 @@ async def get_conversation(conversation_id: str, user=Depends(require_login())):
 
 @app.post("/conversations")
 async def post_conversation(user=Depends(require_login())):
-    return create_conversation()
+    tenant_id = resolve_request_tenant(user)
+    owner = _coerce_owner(user)
+    return create_conversation(tenant_id=tenant_id, owner=owner)
 
 
 @app.patch("/conversations/{conversation_id}")
@@ -41009,8 +41442,10 @@ async def patch_conversation(
     data: ConversationRenameRequest,
     user=Depends(require_login()),
 ):
+    tenant_id = resolve_request_tenant(user)
+    owner = _coerce_owner(user)
     try:
-        return rename_conversation(conversation_id, data.title)
+        return rename_conversation(conversation_id, data.title, tenant_id=tenant_id, owner=owner)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KeyError as exc:
@@ -41019,8 +41454,10 @@ async def patch_conversation(
 
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation_endpoint(conversation_id: str, user=Depends(require_login())):
+    tenant_id = resolve_request_tenant(user)
+    owner = _coerce_owner(user)
     try:
-        delete_conversation(conversation_id)
+        delete_conversation(conversation_id, tenant_id=tenant_id, owner=owner)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation not found.") from exc
     return {"success": True, "id": conversation_id}
@@ -41032,8 +41469,12 @@ async def post_conversation_message(
     data: ConversationMessageRequest,
     user=Depends(require_login()),
 ):
+    tenant_id = resolve_request_tenant(user)
+    owner = _coerce_owner(user)
     try:
-        conversation = append_conversation_message(conversation_id, data.role, data.text)
+        conversation = append_conversation_message(
+            conversation_id, data.role, data.text, tenant_id=tenant_id, owner=owner
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KeyError as exc:
@@ -41042,14 +41483,21 @@ async def post_conversation_message(
 
 @app.post("/query")
 async def query_rag(data: QueryRequest, request: Request, user=Depends(require_login())):
-    logger.info("[FLOW] entering query_rag")
+    # Bind this request to the caller's business so every downstream retrieval,
+    # conversation write, and analytics event is scoped to a single tenant.
+    # Starlette runs each request in its own task-local context, so this set()
+    # is isolated to the current request.
+    tenant_id = require_request_tenant(user)
+    _request_tenant_id.set(tenant_id)
+    _owner = _coerce_owner(user)
+    logger.info("[FLOW] entering query_rag (tenant=%s)", tenant_id)
     logger.info("[FLOW] query_before = %s", (data.text or "")[:400])
     persistent_conversation_id: str | None = None
     if data.conversation_id:
-        conversation = get_or_create_conversation(data.conversation_id)
+        conversation = get_or_create_conversation(data.conversation_id, tenant_id=tenant_id, owner=_owner)
         persistent_conversation_id = str(conversation["id"])
         connection_id = persistent_conversation_id
-        append_conversation_message(persistent_conversation_id, "user", data.text)
+        append_conversation_message(persistent_conversation_id, "user", data.text, tenant_id=tenant_id, owner=_owner)
         bind_conversation_memory(connection_id, persistent_conversation_id)
     else:
         # Stable per-user connection_id so follow-up state persists across HTTP
@@ -41074,13 +41522,19 @@ async def query_rag(data: QueryRequest, request: Request, user=Depends(require_l
     _post_text = data.text if _is_memory_rewrite_query(data.text) else _maybe_rewrite_about_entity_question(data.text)
     ai_response, retrieved_docs = await call_llm_with_rag(_post_text, connection_id, user)
     if persistent_conversation_id:
-        append_conversation_message(persistent_conversation_id, "assistant", ai_response)
+        append_conversation_message(persistent_conversation_id, "assistant", ai_response, tenant_id=tenant_id, owner=_owner)
         persist_runtime_memory(connection_id, persistent_conversation_id)
     # Skip definition/cleanup post-processing for follow-up clarifications:
     # those answers are already finalized inside _handle_followup_query and
     # would otherwise be reshaped by definition-style cleaners that expect a
     # fresh retrieval, not a clarification.
     if _is_followup_query(_post_text, connection_id):
+        # Map the internal strict sentinel ("Not found in the document.") to the
+        # friendly customer-support message so it is never shown to the customer.
+        # This only rewrites the not-found sentinel; real follow-up answers pass
+        # through unchanged (so definition-style cleaners are still skipped).
+        if str(ai_response or "").strip().lower() == RAG_NO_MATCH_RESPONSE.lower():
+            ai_response = _finalize_user_visible_answer(_post_text, ai_response, retrieved_docs=retrieved_docs)
         logger.info("[HTTP FINAL ANSWER BEFORE RETURN] (followup) %s", str(ai_response or "")[:320])
         return {"answer": ai_response}
     if _classify_query_family_v2(_post_text) != "fact_entity":
@@ -41118,12 +41572,23 @@ def admin_knowledge_page(request: Request, user=Depends(require_login("admin")))
     return HTMLResponse(content=content)
 
 
+def _kb_admin_scope_tenant(user) -> int | None:
+    """Tenant id to scope a KB-admin read/write to, or None for the default
+    tenant (which keeps the historical, un-namespaced collection behavior)."""
+    tid = require_request_tenant(user)
+    _request_tenant_id.set(tid)
+    try:
+        return None if int(tid) == int(DEFAULT_TENANT_ID) else int(tid)
+    except (TypeError, ValueError):
+        return None
+
+
 @app.get("/rag/files")
 def get_rag_files(user=Depends(require_login("admin"))):
-    """Return uploaded files indexed in the RAG collection."""
+    """Return uploaded files indexed in the RAG collection (tenant-scoped)."""
     try:
         from backend.knowledge_base import list_uploaded_files
-        files = list_uploaded_files()
+        files = list_uploaded_files(tenant_id=_kb_admin_scope_tenant(user))
         return {"files": files}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -41134,7 +41599,7 @@ def rag_debug(user=Depends(require_login("admin"))):
     """Return ALL entries in ChromaDB for debugging — shows ids, filenames, and text previews."""
     try:
         from backend.knowledge_base import get_or_create_collection
-        collection = get_or_create_collection()
+        collection = get_or_create_collection(tenant_id=_kb_admin_scope_tenant(user))
         if not collection:
             return {"count": 0, "entries": []}
         result = collection.get(include=["metadatas", "documents"]) or {}  # type: ignore[call-overload]
@@ -41158,8 +41623,10 @@ def rag_debug(user=Depends(require_login("admin"))):
 @app.get("/rag/retrieve-debug")
 def rag_retrieve_debug(query: str, top_k: int = 7, user=Depends(require_login("admin"))):
     """Run retrieval only and return chosen chunks with source/page metadata."""
+    # Bind to the admin's tenant so the debug view reflects only that business's KB.
+    _request_tenant_id.set(require_request_tenant(user))
     try:
-        docs = live_rag.search(
+        docs = _active_rag().search(
             query,
             top_k=max(1, min(int(top_k or 1), 10)),
             distance_threshold=RAG_STRICT_DISTANCE_THRESHOLD,
@@ -41302,7 +41769,7 @@ def debug_runtime_rag(query: str | None = None, user=Depends(require_login("admi
 
         # Execute retrieval probe via live_rag
         try:
-            docs = live_rag.search(rewritten, top_k=top_k_used, distance_threshold=dist, return_dicts=True, enable_rerank=True)
+            docs = _active_rag().search(rewritten, top_k=top_k_used, distance_threshold=dist, return_dicts=True, enable_rerank=True)
             logger.info("[RERANK ACTIVE]")
         except Exception as e:
             docs = {'error': f'retrieval failed: {e}'}
@@ -41329,22 +41796,28 @@ def debug_runtime_rag(query: str | None = None, user=Depends(require_login("admi
 
 
 @app.get("/analytics/summary")
-def get_analytics_summary(user=Depends(require_login("admin"))):
-    """Legacy endpoint - returns basic summary"""
+def get_analytics_summary(tenant_id: int | None = None, user=Depends(require_login("admin"))):
+    """Legacy endpoint - returns basic summary (tenant-scoped)"""
+    scope = analytics_scope_tenant(user, tenant_id)
     conn = sqlite3.connect(ANALYTICS_DB)
     c = conn.cursor()
-    c.execute("""
-        SELECT user_role, COUNT(*) FROM usage_stats GROUP BY user_role
-    """)
+    if scope is None:
+        c.execute("SELECT user_role, COUNT(*) FROM usage_stats GROUP BY user_role")
+    else:
+        c.execute(
+            "SELECT user_role, COUNT(*) FROM usage_stats WHERE tenant_id = ? GROUP BY user_role",
+            (int(scope),),
+        )
     data = c.fetchall()
     conn.close()
     return {"summary": data}
 
 @app.get("/analytics/comprehensive")
-def get_comprehensive_analytics_endpoint(days: int = 30, user=Depends(require_login("admin"))):
-    """New comprehensive analytics endpoint"""
+def get_comprehensive_analytics_endpoint(days: int = 30, tenant_id: int | None = None, user=Depends(require_login("admin"))):
+    """New comprehensive analytics endpoint (tenant-scoped)"""
     from backend.analytics import get_comprehensive_analytics
-    return get_comprehensive_analytics(days)
+    scope = analytics_scope_tenant(user, tenant_id)
+    return get_comprehensive_analytics(days, tenant_id=scope)
 
 @app.get("/analytics/tts-performance")
 def tts_performance_stats(user=Depends(require_login("admin"))):
@@ -41356,13 +41829,20 @@ def tts_performance_stats(user=Depends(require_login("admin"))):
     return adaptive_manager.get_stats()
 
 @app.get("/analytics/errors")
-def get_recent_errors(user=Depends(require_login("admin"))):
+def get_recent_errors(tenant_id: int | None = None, user=Depends(require_login("admin"))):
+    scope = analytics_scope_tenant(user, tenant_id)
     conn = sqlite3.connect(ANALYTICS_DB)
     c = conn.cursor()
-    c.execute("""
-        SELECT timestamp, username, error_message, response_time_ms FROM usage_stats
-        WHERE response_status != 'success' ORDER BY timestamp DESC LIMIT 50
-    """)
+    if scope is None:
+        c.execute("""
+            SELECT timestamp, username, error_message, response_time_ms FROM usage_stats
+            WHERE response_status != 'success' ORDER BY timestamp DESC LIMIT 50
+        """)
+    else:
+        c.execute("""
+            SELECT timestamp, username, error_message, response_time_ms FROM usage_stats
+            WHERE response_status != 'success' AND tenant_id = ? ORDER BY timestamp DESC LIMIT 50
+        """, (int(scope),))
     errors = c.fetchall()
     conn.close()
     return {"errors": [{"timestamp": e[0], "username": e[1], "error": e[2], "response_time": e[3]} for e in errors]}
@@ -41382,7 +41862,8 @@ async def submit_feedback(request: Request, user=Depends(require_login())):
         username=user.get("username"),
         user_role=user.get("role"),
         rating=rating,
-        feedback_text=feedback_text
+        feedback_text=feedback_text,
+        tenant_id=resolve_request_tenant(user),
     )
     return {"message": "Feedback submitted successfully"}
 
@@ -41577,6 +42058,98 @@ async def get_audio(filename: str):
 # duplicate concurrent indexing of the same upload and to keep strong
 # references so asyncio doesn't garbage-collect a running task.
 _pdf_indexing_tasks: dict = {}
+
+
+async def _finalize_tenant_pdf_upload_background(
+    *,
+    tenant_id: int,
+    filename: str,
+    original_filename: str,
+    file_ext: str,
+    save_path: Path,
+    source_metadata: dict,
+) -> None:
+    """Isolated ingestion path for NON-default tenants.
+
+    The default tenant keeps the historical, finely-tuned blue/green ingestion
+    pipeline (`_finalize_pdf_upload_background`). Every other business indexes
+    straight into its own '_latest' collection via the tenant-aware knowledge
+    base helpers, so a business's documents are physically stored in a separate
+    ChromaDB collection and can never be retrieved by another tenant.
+    """
+    try:
+        _set_kb_pipeline_stage("extracting", message="Extracting text", filename=filename)
+        text = _extract_text_from_asset(save_path)
+        if not text.strip():
+            _set_kb_pipeline_state("failed", message="No extractable text found", filename=filename)
+            return
+
+        normalized_filename = str(
+            (source_metadata or {}).get("normalized_filename")
+            or normalize_uploaded_filename(original_filename)
+        )
+        doc_id = str(
+            (source_metadata or {}).get("source_doc_id")
+            or canonical_source_doc_id(normalized_filename or original_filename)
+        )
+        metadata = dict(source_metadata or {})
+        metadata.update({
+            "file_ext": file_ext,
+            "ingestion_owner": "rag_server_upload_tenant",
+            "tenant_id": int(tenant_id),
+        })
+
+        _set_kb_pipeline_stage("chunking", message="Chunking document", filename=filename)
+        deleted = 0
+        async with _collection_mutation_lock:
+            # Remove any prior chunks for this file within THIS tenant only.
+            try:
+                prior_id = find_base_doc_id_by_filename(normalized_filename, tenant_id=tenant_id)
+                if prior_id:
+                    deleted += int(delete_documents_with_prefix(str(prior_id), tenant_id=tenant_id) or 0)
+            except Exception as _del_err:
+                logger.warning("[TENANT UPLOAD] prior-chunk cleanup skipped: %s", _del_err)
+            try:
+                deleted += int(delete_documents_with_prefix(str(doc_id), tenant_id=tenant_id) or 0)
+            except Exception:
+                pass
+            _cad = chunk_and_add_document(
+                doc_id=doc_id,
+                text=text,
+                metadata=metadata,
+                kb_version=_kb_global_version + 1,
+                tenant_id=tenant_id,
+            )
+            added = int(_cad) if isinstance(_cad, int) else 0
+
+        # Force the tenant retrieval manager to rebind to its (now populated)
+        # collection on the next query so new chunks are immediately visible.
+        try:
+            mgr = get_tenant_rag(tenant_id)
+            mgr.vs = None
+        except Exception as _rebind_err:
+            logger.warning("[TENANT UPLOAD] retrieval rebind skipped: %s", _rebind_err)
+
+        _set_kb_pipeline_state(
+            "ready",
+            message=f"Indexed {added} chunk(s) for tenant {tenant_id}",
+            filename=filename,
+        )
+        logger.info(
+            "[TENANT UPLOAD] tenant=%s filename=%s indexed=%s deleted=%s collection=%s",
+            tenant_id, filename, added, deleted, tenant_collection_name(tenant_id),
+        )
+        try:
+            await invalidate_all_caches(
+                action="upload", filename=filename,
+                chunks_added=added, chunks_deleted=deleted,
+                triggered_by="upload_tenant",
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception("[TENANT UPLOAD] finalize failed for %s: %s", filename, e)
+        _set_kb_pipeline_state("failed", message=f"Tenant ingestion failed: {e}", filename=filename)
 
 
 async def _finalize_pdf_upload_background(
@@ -41871,6 +42444,11 @@ async def _finalize_pdf_upload_background(
 async def upload_rag(request: Request, file: UploadFile = File(...), user=Depends(require_login("admin"))):
     verify_csrf(request)
 
+    # Scope this upload to the admin's business so documents are indexed into
+    # the tenant's own collection and stored under its own assets directory.
+    tenant_id = require_request_tenant(user)
+    _request_tenant_id.set(tenant_id)
+
     upload_id = uuid.uuid4().hex[:8]
     filename = f"{upload_id}_{Path(file.filename or 'upload').name}"
     original_filename = Path(file.filename or "upload").name
@@ -41885,6 +42463,42 @@ async def upload_rag(request: Request, file: UploadFile = File(...), user=Depend
     file_ext = filename.split('.')[-1].lower()
     if file_ext not in ["pdf", "txt"]:
         return {"message": "Unsupported file type. Use PDF or TXT."}
+
+    # ---- Non-default tenant: isolated ingestion into the tenant collection ----
+    if int(tenant_id) != int(DEFAULT_TENANT_ID):
+        _set_kb_pipeline_stage("uploading", message="Upload received; indexing into business knowledge base", filename=filename)
+        clear_all_conversation_history()
+        tenant_dir = tenant_assets_dir(tenant_id)
+        save_path = tenant_dir / filename
+        content = await file.read()
+        file_size_mb = len(content) / (1024 * 1024)
+        save_path.write_bytes(content)
+        logger.info("[TENANT UPLOAD] tenant=%s saved asset %s (%.2fMB)", tenant_id, save_path, file_size_mb)
+        if filename in _pdf_indexing_tasks and not _pdf_indexing_tasks[filename].done():
+            logger.info("upload_rag duplicate background task suppressed | filename=%s", filename)
+        else:
+            _bg_task = asyncio.create_task(
+                _finalize_tenant_pdf_upload_background(
+                    tenant_id=tenant_id,
+                    filename=filename,
+                    original_filename=original_filename,
+                    file_ext=file_ext,
+                    save_path=save_path,
+                    source_metadata=source_metadata,
+                )
+            )
+            _pdf_indexing_tasks[filename] = _bg_task
+        return {
+            "status": "processing",
+            "message": "File received. Indexing into your business knowledge base.",
+            "filename": filename,
+            "original_filename": original_filename,
+            "source_doc_id": source_doc_id,
+            "normalized_filename": normalized_filename,
+            "file_size_mb": file_size_mb,
+            "tenant_id": int(tenant_id),
+            "ready_state": dict(_kb_pipeline_state),
+        }
 
     _set_kb_pipeline_stage("uploading", message="Upload received; extracting and indexing document", filename=filename)
     # Hard-reset all in-memory conversation state immediately so that no old
@@ -42027,6 +42641,13 @@ async def rag_delete(doc_prefix: str, user=Depends(require_login("admin"))):
     if not doc_prefix:
         raise HTTPException(status_code=400, detail="doc_prefix is required")
 
+    # Scope this delete to the admin's business: chunk deletion is restricted to
+    # the tenant's own collections, and asset cleanup runs in the tenant's own
+    # directory. (scope_tid is None for the default tenant, preserving legacy
+    # cross-collection orphan cleanup behavior for it only.)
+    scope_tid = _kb_admin_scope_tenant(user)
+    req_assets_dir = ASSETS_DIR if scope_tid is None else tenant_assets_dir(scope_tid)
+
     # ---- 0. Compute every plausible filename / asset candidate ---------------
     import re as _re
     _bare = _re.sub(r'^upload_(?:[0-9a-fA-F]{8}_)?', '', doc_prefix)
@@ -42035,13 +42656,13 @@ async def rag_delete(doc_prefix: str, user=Depends(require_login("admin"))):
         asset_candidates.add(doc_prefix[len("upload_"):])
     asset_candidates = {c.strip() for c in asset_candidates if c and c.strip()}
 
-    # Also include the actual filenames currently sitting in ASSETS_DIR whose
-    # bare (UUID-stripped) name matches the requested target. This is how the
-    # admin UI's "delete by base name" call still finds the UUID-prefixed file.
+    # Also include the actual filenames currently sitting in the tenant assets
+    # dir whose bare (UUID-stripped) name matches the requested target. This is
+    # how the admin UI's "delete by base name" call still finds the file.
     try:
         target_bare = _re.sub(r'^[0-9a-fA-F]{8}_', '', _bare).lower()
         if target_bare:
-            for p in ASSETS_DIR.iterdir():
+            for p in req_assets_dir.iterdir():
                 if not p.is_file():
                     continue
                 if p.suffix.lower() not in {".pdf", ".txt", ".md"}:
@@ -42085,6 +42706,7 @@ async def rag_delete(doc_prefix: str, user=Depends(require_login("admin"))):
                 normalized_filename=normalized_target,
                 doc_prefix=doc_prefix,
                 extra_keys=sorted(asset_candidates),
+                tenant_id=scope_tid,
             )
             deleted = int(delete_report.get("deleted_count") or 0)
         except Exception as e:
@@ -42131,7 +42753,7 @@ async def rag_delete(doc_prefix: str, user=Depends(require_login("admin"))):
     for candidate in sorted(asset_candidates):
         if not candidate:
             continue
-        asset_path = ASSETS_DIR / candidate
+        asset_path = req_assets_dir / candidate
         if not (asset_path.exists() and asset_path.is_file()):
             continue
         ok, err = _try_unlink(asset_path)
@@ -42178,7 +42800,7 @@ async def rag_delete(doc_prefix: str, user=Depends(require_login("admin"))):
         remaining = -1
 
     kb_now_empty = (remaining == 0)
-    if kb_now_empty:
+    if kb_now_empty and scope_tid is None:
         # If nothing remains anywhere, also clear any active source that may
         # still be lingering from another code path, and re-point the live
         # retrieval handle to a fresh empty collection so subsequent queries
@@ -42191,6 +42813,14 @@ async def rag_delete(doc_prefix: str, user=Depends(require_login("admin"))):
         except Exception as sync_err:
             logger.warning("rag_delete: live retrieval re-sync failed: %s", sync_err)
         _set_kb_pipeline_state("ready", message="Knowledge base is empty after delete", filename=None)
+
+    # For non-default tenants, force the tenant retrieval manager to rebind so
+    # the deleted chunks immediately disappear from that business's search.
+    if scope_tid is not None:
+        try:
+            get_tenant_rag(scope_tid).vs = None
+        except Exception:
+            pass
 
     await invalidate_all_caches(action="delete", filename=doc_prefix,
                                  chunks_deleted=deleted, triggered_by="admin")
@@ -42233,7 +42863,10 @@ async def rag_update(req: dict, user=Depends(require_login("admin"))):
     metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
     if not doc_id or text is None:
         raise HTTPException(status_code=400, detail="doc_id and text are required")
-    _raw_update = update_document(doc_id=doc_id, text=text, metadata=metadata)
+    # Scope the update to the admin's tenant so it only touches that business's
+    # collection (None => default tenant keeps legacy collection behavior).
+    scope_tid = _kb_admin_scope_tenant(user)
+    _raw_update = update_document(doc_id=doc_id, text=text, metadata=metadata, tenant_id=scope_tid)
     chunks = int(_raw_update) if isinstance(_raw_update, int) else 0
     if chunks:
         await invalidate_all_caches(action="update", filename=doc_id,
@@ -42345,7 +42978,9 @@ async def rag_reindex_file(filename: str, user=Depends(require_login("admin"))):
     """
     if not filename:
         raise HTTPException(status_code=400, detail="filename is required")
-    save_path = ASSETS_DIR / filename
+    scope_tid = _kb_admin_scope_tenant(user)
+    req_assets_dir = ASSETS_DIR if scope_tid is None else tenant_assets_dir(scope_tid)
+    save_path = req_assets_dir / filename
     if not save_path.exists():
         raise HTTPException(status_code=404, detail="file not found")
 
@@ -42371,17 +43006,23 @@ async def rag_reindex_file(filename: str, user=Depends(require_login("admin"))):
             stored_filename=str(metadata.get("stored_filename") or filename),
             normalized_filename=str(metadata.get("normalized_filename") or ""),
             doc_prefix=doc_id,
+            tenant_id=scope_tid,
         )
         deleted = int(delete_report.get("deleted_count") or 0)
         _set_kb_pipeline_stage("chunking", message="Chunking document", filename=filename)
         _raw_chunks_ri = chunk_and_add_document(doc_id=doc_id, text=text, metadata=metadata,
                                         kb_version=_kb_global_version + 1,
-                                        progress_callback=lambda event: _on_ingest_progress(event, filename))
+                                        progress_callback=lambda event: _on_ingest_progress(event, filename),
+                                        tenant_id=scope_tid)
         chunks = int(_raw_chunks_ri) if isinstance(_raw_chunks_ri, int) else 0
         if chunks:
             _set_kb_pipeline_stage("activating", message="Activating live retrieval", filename=filename)
-            active_collection = _sync_live_retrieval_collection()
-            _register_active_source(str(metadata.get("normalized_filename") or filename))
+            if scope_tid is None:
+                active_collection = _sync_live_retrieval_collection()
+                _register_active_source(str(metadata.get("normalized_filename") or filename))
+            else:
+                get_tenant_rag(scope_tid).vs = None
+                active_collection = tenant_collection_name(scope_tid)
             await invalidate_all_caches(action="reindex", filename=filename,
                                          chunks_added=chunks, chunks_deleted=deleted,
                                          triggered_by="admin")
@@ -42404,11 +43045,13 @@ async def rag_reindex_all(user=Depends(require_login("admin"))):
     file and rebuilds them fresh, fixing any duplicate/orphan chunks that
     accumulated during a previous buggy run.
     """
-    if not ASSETS_DIR.exists():
+    scope_tid = _kb_admin_scope_tenant(user)
+    req_assets_dir = ASSETS_DIR if scope_tid is None else tenant_assets_dir(scope_tid)
+    if not req_assets_dir.exists():
         return {"message": "Assets directory not found", "files": []}
     _set_kb_pipeline_state("processing", message="Reindexing all assets", filename="*")
     results = []
-    for p in ASSETS_DIR.iterdir():
+    for p in req_assets_dir.iterdir():
         if not p.is_file():
             continue
         if p.suffix.lower() not in (".txt", ".pdf"):
@@ -42433,19 +43076,25 @@ async def rag_reindex_all(user=Depends(require_login("admin"))):
                 stored_filename=str(metadata.get("stored_filename") or filename),
                 normalized_filename=str(metadata.get("normalized_filename") or ""),
                 doc_prefix=doc_id,
+                tenant_id=scope_tid,
             )
             deleted = int(delete_report.get("deleted_count") or 0)
             _raw_cad = chunk_and_add_document(doc_id=doc_id, text=text, metadata=metadata,
-                                            kb_version=_kb_global_version + 1)
+                                            kb_version=_kb_global_version + 1,
+                                            tenant_id=scope_tid)
             chunks: int = _raw_cad if isinstance(_raw_cad, int) else 0
-            if chunks > 0:
+            if chunks > 0 and scope_tid is None:
                 _register_active_source(str(metadata.get("normalized_filename") or filename))
             results.append({"filename": filename, "chunks": chunks, "deleted_old": deleted, "delete_verification": delete_report, "status": "ok"})
         except Exception as e:
             results.append({"filename": filename, "status": "error", "error": str(e)})
     total_added = sum(r.get("chunks", 0) for r in results if r.get("status") == "ok")
     total_deleted = sum(r.get("deleted_old", 0) for r in results if r.get("status") == "ok")
-    active_collection = _sync_live_retrieval_collection()
+    if scope_tid is None:
+        active_collection = _sync_live_retrieval_collection()
+    else:
+        get_tenant_rag(scope_tid).vs = None
+        active_collection = tenant_collection_name(scope_tid)
     await invalidate_all_caches(action="reindex_all", filename="*",
                                  chunks_added=total_added, chunks_deleted=total_deleted,
                                  triggered_by="admin")
@@ -42765,6 +43414,14 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
     if not user:
         logger.debug(f"Websocket {connection_id}: no valid session cookie found; continuing as anonymous")
 
+    # Bind this connection to the caller's business. The whole WebSocket session
+    # runs in one task, so retrieval/conversation/analytics for this socket are
+    # scoped to a single tenant for its entire lifetime.
+    ws_tenant_id = resolve_request_tenant(user)
+    ws_owner = _coerce_owner(user)
+    _request_tenant_id.set(ws_tenant_id)
+    logger.info("Websocket %s bound to tenant=%s owner=%s", connection_id, ws_tenant_id, ws_owner)
+
     # Buffer for accumulating audio chunks
     audio_buffer = bytearray()
     first_audio_arrival = None  # Timestamp of when the first chunk of a speech segment arrived
@@ -42785,7 +43442,7 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
     def _activate_conversation(requested_id: str | None = None) -> str:
         nonlocal active_conversation_id
         clean_requested = str(requested_id or "").strip() or active_conversation_id
-        conversation = get_or_create_conversation(clean_requested)
+        conversation = get_or_create_conversation(clean_requested, tenant_id=ws_tenant_id, owner=ws_owner)
         conversation_id = str(conversation["id"])
         active_conversation_id = conversation_id
         bind_conversation_memory(connection_id, conversation_id)
@@ -43884,9 +44541,9 @@ def admin_kb_monitor_page(request: Request, user=Depends(require_login("admin"))
 
 
 @app.get("/api/kb-stats")
-def api_kb_stats(days: int = 30, user=Depends(require_login("admin"))):
+def api_kb_stats(days: int = 30, tenant_id: int | None = None, user=Depends(require_login("admin"))):
     """Return KB performance and mutation metrics for the monitoring dashboard."""
-    stats = get_kb_stats(days=days)
+    stats = get_kb_stats(days=days, tenant_id=analytics_scope_tenant(user, tenant_id))
     stats["kb_version"] = _kb_global_version
     stats["active_sessions"] = len(_active_ws_connections)
     stats["kb_event_subscribers"] = len(_kb_event_subscribers)
@@ -43894,9 +44551,12 @@ def api_kb_stats(days: int = 30, user=Depends(require_login("admin"))):
 
 
 @app.get("/api/kb-events")
-def api_kb_events(limit: int = 100, user=Depends(require_login("admin"))):
-    """Return recent KB mutation events for the monitoring dashboard."""
-    return {"events": get_kb_events(limit=limit), "kb_version": _kb_global_version}
+def api_kb_events(limit: int = 100, tenant_id: int | None = None, user=Depends(require_login("admin"))):
+    """Return recent KB mutation events for the monitoring dashboard (tenant-scoped)."""
+    return {
+        "events": get_kb_events(limit=limit, tenant_id=analytics_scope_tenant(user, tenant_id)),
+        "kb_version": _kb_global_version,
+    }
 
 
 @app.get("/internal/asr-status")

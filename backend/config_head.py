@@ -100,7 +100,9 @@ try:
         WHISPER_COMPUTE_TYPE, WHISPER_BEAM_SIZE, WHISPER_VAD_FILTER,
         LLM_URL, ASSETS_DIR, SESSION_SECRET, SESSION_COOKIE, 
         ANALYTICS_DB, DEVELOPMENT,
-        OLLAMA_HOST, OLLAMA_PORT, OLLAMA_MODEL
+        OLLAMA_HOST, OLLAMA_PORT, OLLAMA_MODEL,
+        DEFAULT_TENANT_ID, tenant_collection_base, tenant_collection_name,
+        tenant_assets_dir,
     )
 except Exception:
     # Fallbacks if config isn't importable
@@ -120,6 +122,35 @@ except Exception:
     OLLAMA_HOST = "127.0.0.1"
     OLLAMA_PORT = 11434
     OLLAMA_MODEL = "qwen2.5:3b"
+    # Multi-tenancy fallbacks (mirror config.py semantics: tenant 1 keeps
+    # historical collection / asset names; other tenants are namespaced).
+    DEFAULT_TENANT_ID = 1
+
+    def tenant_collection_base(tenant_id):
+        try:
+            tid = int(tenant_id)
+        except (TypeError, ValueError):
+            tid = DEFAULT_TENANT_ID
+        if tid <= 0:
+            tid = DEFAULT_TENANT_ID
+        return "support_docs_v3" if tid == DEFAULT_TENANT_ID else f"t{tid}_support_docs_v3"
+
+    def tenant_collection_name(tenant_id):
+        return f"{tenant_collection_base(tenant_id)}_latest"
+
+    def tenant_assets_dir(tenant_id):
+        try:
+            tid = int(tenant_id)
+        except (TypeError, ValueError):
+            tid = DEFAULT_TENANT_ID
+        if tid <= 0:
+            tid = DEFAULT_TENANT_ID
+        directory = ASSETS_DIR / f"tenant_{tid}"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return directory
 
 from backend.knowledge_base import search_documents, add_document, chunk_and_add_document, delete_document, delete_documents_with_prefix, delete_documents_by_filename, update_document, find_base_doc_id_by_filename, list_uploaded_files, count_documents
 from backend.database import init_database, save_conversation, start_session, end_session, get_stats
@@ -129,12 +160,19 @@ from backend.response_validator import validate_response
 RAG_STRICT_DISTANCE_THRESHOLD = float(os.getenv("RAG_STRICT_DISTANCE_THRESHOLD", "0.70"))
 RAG_NO_MATCH_RESPONSE = "Not found in the document."
 CS_NO_MATCH_RESPONSE_EN = (
-    "I don't have that specific detail in our help docs yet, but I can help with "
-    "account access, orders, or returns. What would you like to know?"
+    "I don't have that specific detail in our help materials yet. "
+    "I can help with questions covered in our knowledge base—what would you like to know?"
 )
 CS_NO_MATCH_RESPONSE_AR = (
-    "ليس لدي هذا التفصيل المحدد في مستندات المساعدة بعد، لكن يمكنني المساعدة في "
-    "الوصول إلى الحساب، الطلبات، أو الإرجاع. بماذا تود المساعدة؟"
+    "ليس لدي هذا التفصيل المحدد في مواد المساعدة لدينا بعد. "
+    "يمكنني المساعدة في الأسئلة المشمولة في قاعدة المعرفة لدينا—بماذا تود المساعدة؟"
+)
+CUSTOMER_SUPPORT_AGENT_SYSTEM_PROMPT = (
+    "You are Assistify, a friendly customer support agent for this business.\n"
+    "Answer using ONLY the provided context from our help materials.\n"
+    "Use clear, professional, conversational language.\n"
+    "If the answer is not in the context, respond with exactly:\n"
+    "Not found in the document."
 )
 CONVERSATIONAL_REDIRECT_EN = (
     "Thank you for reaching out. I'm here and ready to help with your support questions "

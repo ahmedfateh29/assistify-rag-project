@@ -249,6 +249,7 @@
     <header>
         <button class="menu-btn" onclick="openNav()">☰</button>
         <h1 class="header-title">Assistify</h1>
+        <select id="businessSwitcher" style="display:none;background:#2b2b2b;color:#fff;border:1px solid #444;border-radius:8px;padding:8px;max-width:200px;"></select>
         <div class="header-spacer"></div>
     </header>
 
@@ -273,5 +274,32 @@
             </a>
         </div>
     </div>
+    <script>
+        async function initBusinessSwitcher() {
+            const select = document.getElementById('businessSwitcher');
+            if (!select) return;
+            try {
+                const res = await fetch('/api/my-memberships');
+                const memberships = ((await res.json()).memberships || []).filter(m => m.status === 'approved');
+                if (memberships.length < 2) return;
+                select.style.display = 'block';
+                select.innerHTML = memberships.map(m =>
+                    `<option value="${m.tenant_id}">${m.tenant_name}</option>`
+                ).join('');
+                const active = {{ (user.get('active_tenant_id') or user.get('tenant_id')) | tojson }};
+                if (active) select.value = String(active);
+                select.addEventListener('change', async () => {
+                    const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+                    await fetch('/api/session/active-tenant', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+                        body: JSON.stringify({ tenant_id: Number(select.value) })
+                    });
+                    window.location.reload();
+                });
+            } catch (e) { /* customer may not have memberships API in older sessions */ }
+        }
+        initBusinessSwitcher();
+    </script>
 </body>
 </html>

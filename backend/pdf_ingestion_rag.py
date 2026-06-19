@@ -47,6 +47,11 @@ def _list_collection_names(client) -> List[str]:
     return names
 
 
+def _desc_name(name: str) -> str:
+    """Sort key that orders names descending under ascending sort (newest first)."""
+    return "".join(chr(255 - ord(ch)) if ord(ch) < 255 else ch for ch in str(name))
+
+
 # ================= STEP 15: PERFORMANCE CONFIG =================
 BATCH_SIZE = 16
 # Use GPU for RAG embedding/reranker when RAG_USE_GPU and CUDA available.
@@ -125,9 +130,18 @@ class DocumentChunk(BaseModel):
 
 # ================= EMBEDDING STORE =================
 class VectorStore:
-    def __init__(self, persist_directory: str = "./chroma_db"):
+    def __init__(self, persist_directory: str = "./chroma_db", collection_name: str = None):
         from backend.knowledge_base import client as kb_client
         self.client = kb_client
+        # Explicit per-tenant collection (collection-per-tenant isolation).
+        # When set, the active-collection scan is restricted to this tenant's
+        # own collections and the global ASSISTIFY_COLLECTION_NAME env var is
+        # ignored so tenants never bind to each other's data.
+        self.collection_name = (collection_name or "").strip() or None
+        if self.collection_name and self.collection_name.endswith("_latest"):
+            self.collection_base = self.collection_name[: -len("_latest")]
+        else:
+            self.collection_base = self.collection_name
         self.collection = self._resolve_active_collection()
         logger.info(f"Loading embedding model: {EMBEDDING_MODEL} on {DEVICE}")
         self.embedding_model_name = EMBEDDING_MODEL
@@ -267,6 +281,37 @@ class VectorStore:
 
     def _resolve_active_collection(self):
         """Pick a usable collection with data; avoid binding to an empty default."""
+        # ----- Per-tenant explicit collection branch -----
+        explicit = getattr(self, "collection_name", None)
+        base = getattr(self, "collection_base", None)
+        if explicit:
+            try:
+                owned = []
+                for nm in _list_collection_names(self.client):
+                    if nm == explicit or (base and (nm == base or nm.startswith(base + "_"))):
+                        owned.append(nm)
+
+                def _sortkey(n):
+                    # explicit (_latest) first, then newest timestamped name.
+                    return (0 if n == explicit else 1, _desc_name(n))
+
+                for nm in sorted(owned, key=_sortkey):
+                    try:
+                        col = self.client.get_collection(name=nm)
+                        if col.count() > 0:
+                            logger.info(f"[TENANT] Active collection '{nm}' (count={col.count()})")
+                            return col
+                    except Exception:
+                        continue
+                # No populated tenant collection yet — create/return the _latest.
+                logger.info(f"[TENANT] No populated collection for '{explicit}'; creating empty.")
+                return self.client.get_or_create_collection(
+                    name=explicit, metadata={"hnsw:space": "cosine"}
+                )
+            except Exception as e:
+                logger.warning(f"Tenant collection resolution for '{explicit}' failed: {e}")
+                # Fall through to legacy behavior as a last resort.
+
         preferred = os.environ.get("ASSISTIFY_COLLECTION_NAME", "").strip()
         if preferred:
             try:

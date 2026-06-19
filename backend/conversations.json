@@ -1,7 +1,40 @@
 {
   "conversations": [
     {
-      "id": "23d5621e-6758-4c76-b9a9-a6cdf60d0e05",
+      "id": "4236c5b3-6f75-4c89-a6cf-c4cc4b5bd125",
+      "title": "How do you get into me?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "How do you get into me?"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        },
+        {
+          "role": "user",
+          "text": "Hi!"
+        },
+        {
+          "role": "assistant",
+          "text": "Hello! Thank you for contacting support. How can I help you today?"
+        }
+      ],
+      "created_at": "2026-06-18T21:52:26.924618+00:00",
+      "updated_at": "2026-06-19T19:24:05.060646+00:00",
+      "tenant_id": 1,
+      "owner": "admin"
+    },
+    {
+      "id": "5f8a20e0-5b3b-4bf2-8e2f-6d5546de1096",
+      "title": "New chat",
+      "messages": [],
+      "created_at": "2026-06-18T21:50:20.954803+00:00",
+      "updated_at": "2026-06-18T21:50:20.954803+00:00"
+    },
+    {
+      "id": "0e397a5c-0b55-43b3-89e2-887327dc1d05",
       "title": "hi",
       "messages": [
         {
@@ -14,43 +47,47 @@
         },
         {
           "role": "user",
-          "text": "describe management as a process"
+          "text": "What is scientific management?"
         },
         {
           "role": "assistant",
-          "text": "Management as a process involves several interconnected functions: planning, organizing, leading (or directing), coordinating, and controlling. This process is characterized by its social nature, encompassing interactions with various stakeholders including employees, investors, suppliers, government bodies, creditors, debtors, and customers. Management's universality means these functions are applicable across all types of organizations-both profit-making and non-profit making."
-        }
-      ],
-      "created_at": "2026-06-18T17:22:52.682054+00:00",
-      "updated_at": "2026-06-18T17:24:15.747339+00:00"
-    },
-    {
-      "id": "27b31235-11a8-46c0-98c3-4ee9578eca5b",
-      "title": "How does Henry Fields summarize the process of...",
-      "messages": [
+          "text": "Scientific Management is the art of knowing exactly what you want your men to do and then making sure they do it in the best and cheapest way."
+        },
         {
           "role": "user",
-          "text": "How does Henry Fields summarize the process of management?"
+          "text": "What are the six Ms of management?"
         },
         {
           "role": "assistant",
-          "text": "Key ideas summarized: - Henry Fayol's definition: Management involves planning, organizing, commanding, coordinating, and controlling (Fayol). - Modern management principles emphasize defining goals and utilizing resources effectively to achieve them. - The process starts with establishing objectives, followed by grouping functions and personnel into an organizational structure through departmentalization. Comparison of concepts: - Fayol's model includes all five elements: planning, organizing, commanding, coordinating, and controlling. Other definitions focus on specific aspects or emphasize different priorities (e.g., C.W., George R., Harold Koontz)."
+          "text": "- People\n- Money\n- Machines\n- Materials\n- Methods\n- Markets"
         },
         {
           "role": "user",
-          "text": "I'm going to go to the hospital. I'm going to go to the hospital. I'm going to go to the hospital. I'm going to go to the hospital. I'm going to go to the hospital. I'm going to go to the hospital. I'm going to go to the hospital. I'm going to go to the hospital. I'm going to go to the hospital."
+          "text": "Who was Peter Drucker and what is MBO?"
         },
         {
           "role": "assistant",
-          "text": "I don't have that specific detail in our help docs yet, but I can help with account access, orders, or returns. What would you like to know?"
+          "text": "Peter Drucker presented Management by Objectives (MBO) in his 1954 book \"The Practice of Management.\" MBO focuses on setting objectives collaboratively between managers and subordinates. The goals are clearly defined so that every member within the or ganization understands their expectations and how they should work towards achieving organizational goals. This concept aims to create value for both employees and organizations by aligning individual efforts with collective success."
         },
         {
           "role": "user",
-          "text": "دا كده بيست برفورمنسي طبعا الخير"
+          "text": "What are the steps in the planning process?"
+        },
+        {
+          "role": "assistant",
+          "text": "- Development of planning premises\n- boundaries\n- very important\n- Identification of different alternatives\n- Evaluation and selection of best alternative\n- evaluated"
         },
         {
           "role": "user",
-          "text": "لا لا أنا ودارفت عامه بس فيه صبعاً خير"
+          "text": "explain more (follow-up)"
+        },
+        {
+          "role": "assistant",
+          "text": "Development of planning premises: After the for mulation of the objectives, the next step to be followed is developing of planning premises. Planning premises are the assumptions, boundaries, limits under which plan can be successfully implemented or can be executed Objective of the whole or ganisation Principles of Business Management 56 smoothly. It is a very important step because if there is a flaw in setting up premises then the whole planning process will go waste. The above diagram s hows that if each department's objective is fulfilled then it will lead to the achievement of the objective of the whole or ganization. It is important for the planner to take note of future opportunities and thre at along with internal strength and weakness of the or ganization while formulating its objectives. This refers to Identification of different alternatives, which in the document is associated with the steps in the planning process in the same list as Internal premises are controllable and e, Development of planning premises, and boundaries. This refers to Evaluation and selection of best alternative, which in the document is associated with the steps in the planning process in the same list as Internal premises are controllable and e, Development of planning premises, and boundaries. This refers to evaluated, which in the document is associated with the steps in the planning process in the same list as Development of planning premises, boundaries, and very important. (The document mentions this concept but does not provide a detailed explanation.)"
+        },
+        {
+          "role": "user",
+          "text": "What is the capital of France? (negative test)"
         },
         {
           "role": "assistant",
@@ -58,15 +95,95 @@
         },
         {
           "role": "user",
-          "text": "صباح الخير"
+          "text": "What is the capital of France?"
         },
         {
           "role": "assistant",
-          "text": "أهلاً! شكراً لتواصلك مع الدعم. كيف يمكنني مساعدتك اليوم؟"
+          "text": "Not found in the document."
         }
       ],
-      "created_at": "2026-06-01T12:49:21.577571+00:00",
-      "updated_at": "2026-06-01T13:08:38.156514+00:00"
+      "created_at": "2026-06-18T20:24:38.843321+00:00",
+      "updated_at": "2026-06-18T20:27:21.596391+00:00"
+    },
+    {
+      "id": "3c6fafb0-7f3a-4350-bad3-7c3f0f59b390",
+      "title": "What is scientific management?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "What is scientific management?"
+        },
+        {
+          "role": "assistant",
+          "text": "Scientific Management is the art of knowing exactly what you want your men to do and then making sure they do it in the best and cheapest way."
+        },
+        {
+          "role": "user",
+          "text": "explain more (follow-up)"
+        },
+        {
+          "role": "assistant",
+          "text": "Scientific Management, as described in the previous answer, focuses on understanding precisely what needs to be done by employees and then implementing methods to ensure these tasks are carried out efficiently and cost-effectively. This approach emphasizes precise planning and execution, aligning closely with the principles of management that involve optimizing resource usage across various disciplines for maximum output or results."
+        }
+      ],
+      "created_at": "2026-06-18T20:01:14.208654+00:00",
+      "updated_at": "2026-06-18T20:01:28.888018+00:00"
+    },
+    {
+      "id": "d22904ae-7fed-47f8-a8f2-c36db2f1031e",
+      "title": "hi",
+      "messages": [
+        {
+          "role": "user",
+          "text": "hi"
+        },
+        {
+          "role": "assistant",
+          "text": "Hello! Thank you for contacting support. How can I help you today?"
+        },
+        {
+          "role": "user",
+          "text": "What is scientific management?"
+        },
+        {
+          "role": "assistant",
+          "text": "Scientific Management is the art of knowing exactly what you want your men to do and then making sure they do it in the best and cheapest way."
+        },
+        {
+          "role": "user",
+          "text": "What are the six Ms of management?"
+        },
+        {
+          "role": "assistant",
+          "text": "- People\n- Money\n- Machines\n- Materials\n- Methods\n- Markets"
+        },
+        {
+          "role": "user",
+          "text": "Who was Peter Drucker and what is MBO?"
+        },
+        {
+          "role": "assistant",
+          "text": "Peter Drucker presented Management by Objectives (MBO) in his 1954 book \"The Practice of Management.\" MBO focuses on setting objectives collaboratively between managers and subordinates. The goals are clearly defined so that every member within the or ganization understands their expectations and how they should work towards achieving organizational goals. This concept aims to create value for both employees and organizations by aligning individual efforts with collective success."
+        },
+        {
+          "role": "user",
+          "text": "What are the steps in the planning process?"
+        },
+        {
+          "role": "assistant",
+          "text": "I don't have that specific detail in our help docs yet, but I can help with account access, orders, or returns. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "What is the capital of France?"
+        },
+        {
+          "role": "assistant",
+          "text": "Not found in the document."
+        }
+      ],
+      "created_at": "2026-06-18T19:52:42.482820+00:00",
+      "updated_at": "2026-06-18T20:02:59.626954+00:00"
     }
   ]
 }

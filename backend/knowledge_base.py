@@ -240,8 +240,13 @@ def delete_documents_by_source_identity(
     document_version: str = "",
     doc_prefix: str = "",
     extra_keys: Optional[list[str]] = None,
+    tenant_id=None,
 ) -> dict:
-    """Delete chunks matching any canonical or legacy source identity key."""
+    """Delete chunks matching any canonical or legacy source identity key.
+
+    When tenant_id is provided, deletion is restricted to collections owned by
+    that tenant so one tenant can never delete another tenant's documents.
+    """
     attempted, raw_keys_l, normalized_keys, id_prefixes_l = _identity_key_variants(
         source_doc_id,
         original_filename,
@@ -264,8 +269,20 @@ def delete_documents_by_source_identity(
             collections = []
 
         if not collections:
-            fallback = get_or_create_collection(allow_empty=True)
+            fallback = get_or_create_collection(allow_empty=True, tenant_id=tenant_id)
             collections = [fallback] if fallback else []
+
+        # Restrict to the tenant's own collections when scoped.
+        if tenant_id is not None:
+            base = tenant_base_name(tenant_id)
+
+            def _owned(c) -> bool:
+                nm = c if isinstance(c, str) else getattr(c, "name", None)
+                if not nm:
+                    return False
+                return nm == base or nm.startswith(base + "_")
+
+            collections = [c for c in collections if _owned(c)]
 
         for col in collections:
             if not col:
@@ -317,16 +334,60 @@ def delete_documents_by_source_identity(
         "collections": per_collection,
     }
 
-def get_or_create_collection(allow_empty: bool = False):
+def tenant_base_name(tenant_id) -> str:
+    """Tenant-scoped collection base (e.g. 'support_docs_v3' or 't2_support_docs_v3')."""
+    try:
+        from config import tenant_collection_base
+        return tenant_collection_base(tenant_id)
+    except Exception:
+        try:
+            tid = int(tenant_id)
+        except (TypeError, ValueError):
+            tid = 1
+        return "support_docs_v3" if tid == 1 else f"t{tid}_support_docs_v3"
+
+
+def get_or_create_collection(allow_empty: bool = False, tenant_id=None):
     """Get collection or create if doesn't exist.
     
     Args:
         allow_empty: If True, return a collection even if it has 0 documents.
                      Use this after delete_all_documents() to ensure the same
                      collection is reused for re-indexing.
+        tenant_id:   When provided, bind strictly to that tenant's collection
+                     (collection-per-tenant isolation). The scan/fallback logic
+                     is restricted to the tenant's own name prefix so a tenant
+                     can never bind to another tenant's data.
     """
     try:
         expected_dim = int(embedder.get_sentence_embedding_dimension())
+
+        # ----- Per-tenant isolation branch -----
+        if tenant_id is not None:
+            try:
+                from config import tenant_collection_name
+                tenant_name = tenant_collection_name(tenant_id)
+            except Exception:
+                tenant_name = f"{tenant_base_name(tenant_id)}_latest"
+            try:
+                col = client.get_or_create_collection(name=tenant_name, metadata={"hnsw:space": "cosine"})
+                probe_embedding = [0.0] * expected_dim
+                try:
+                    col.query(query_embeddings=[probe_embedding], n_results=1, include=["distances"])
+                except Exception as probe_err:
+                    msg = str(probe_err).lower()
+                    if "dimensionality" in msg or "attribute 'dimensionality'" in msg:
+                        logger.warning(f"Tenant collection '{tenant_name}' incompatible/corrupt; recreating: {probe_err}")
+                        try:
+                            client.delete_collection(name=tenant_name)
+                        except Exception:
+                            pass
+                        col = client.get_or_create_collection(name=tenant_name, metadata={"hnsw:space": "cosine"})
+                return col
+            except Exception as tenant_err:
+                logger.error(f"Tenant collection '{tenant_name}' unavailable: {tenant_err}")
+                return None
+
         # Default collection name (force populated collection usage)
         collection_name = "support_docs_v3_latest"
         preferred = os.environ.get("ASSISTIFY_COLLECTION_NAME", "").strip() or collection_name
@@ -382,6 +443,51 @@ def get_or_create_collection(allow_empty: bool = False):
         logger.error(f"Error getting collection: {e}")
         return None
 
+
+def resolve_tenant_active_collection(tenant_id):
+    """Return the active collection object for a tenant.
+
+    Scans only collections owned by the tenant (exact base name or
+    '<base>_*'), preferring the canonical '_latest' name and otherwise the
+    newest non-empty blue/green collection. Falls back to creating the
+    tenant's '_latest' collection when the tenant has no data yet.
+    """
+    base = tenant_base_name(tenant_id)
+    try:
+        from config import tenant_collection_name
+        latest_name = tenant_collection_name(tenant_id)
+    except Exception:
+        latest_name = f"{base}_latest"
+    try:
+        owned = []
+        for c in (client.list_collections() or []):
+            nm = c if isinstance(c, str) else getattr(c, "name", None)
+            if not nm:
+                continue
+            if nm == base or nm == latest_name or nm.startswith(base + "_"):
+                owned.append(nm)
+
+        def _sortkey(n):
+            # _latest first, then newest timestamped (descending).
+            return (0 if n == latest_name else 1, _invert_name(n))
+
+        for nm in sorted(owned, key=_sortkey):
+            try:
+                col = client.get_collection(name=nm)
+                if col.count() > 0:
+                    return col
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"resolve_tenant_active_collection scan failed: {e}")
+    return get_or_create_collection(allow_empty=True, tenant_id=tenant_id)
+
+
+def _invert_name(name: str) -> str:
+    """Helper for descending sort of timestamped collection names."""
+    return "".join(chr(255 - ord(ch)) if ord(ch) < 255 else ch for ch in str(name))
+
+
 def add_document(doc_id: str, text: str, metadata: dict = None):
     """
     Add a document to the knowledge base
@@ -418,6 +524,7 @@ def chunk_and_add_document(
     return_details: bool = False,
     target_collection_name: str = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    tenant_id=None,
 ):
     """
     Split *text* into fine-grained chunks and store each one with its own
@@ -930,7 +1037,7 @@ def chunk_and_add_document(
         except Exception as e:
             logger.warning(f"chunk_and_add_document: target collection '{target_collection_name}' failed: {e}")
     if not collection:
-        collection = get_or_create_collection(allow_empty=True)
+        collection = get_or_create_collection(allow_empty=True, tenant_id=tenant_id)
     if not collection:
         reason = "No active collection available"
         logger.error(f"chunk_and_add_document: {reason} | doc_id={doc_id}")
@@ -1119,7 +1226,7 @@ def chunk_and_add_document(
 
     return details if return_details else success
 
-def search_documents(query: str, top_k: int = 3, distance_threshold: float = 1.2):
+def search_documents(query: str, top_k: int = 3, distance_threshold: float = 1.2, tenant_id=None):
     """
     Search for relevant documents using semantic similarity.
 
@@ -1136,12 +1243,29 @@ def search_documents(query: str, top_k: int = 3, distance_threshold: float = 1.2
                               < 0.5  → very high relevance
                               0.5–1.0 → good relevance
                               > 1.0  → likely unrelated (filtered out)
+        tenant_id:          When provided (and not the default tenant), bind
+                            strictly to that tenant's collection so results can
+                            never come from another business's knowledge base.
 
     Returns:
         List of relevant document texts (may be empty if nothing is close enough)
     """
     try:
-        collection = get_or_create_collection()
+        # Only force the per-tenant isolation branch for non-default tenants.
+        # The default tenant keeps the historical auto-resolution behavior.
+        scoped_tenant = None
+        if tenant_id is not None:
+            try:
+                from config import DEFAULT_TENANT_ID as _DEF_T
+            except Exception:
+                _DEF_T = 1
+            try:
+                _tid = int(tenant_id)
+            except (TypeError, ValueError):
+                _tid = _DEF_T
+            if _tid != _DEF_T and _tid > 0:
+                scoped_tenant = _tid
+        collection = get_or_create_collection(tenant_id=scoped_tenant)
         if not collection:
             return []
 
@@ -1214,9 +1338,12 @@ def delete_document(doc_id: str):
         return False
 
 
-def delete_documents_with_prefix(prefix: str) -> int:
+def delete_documents_with_prefix(prefix: str, tenant_id=None) -> int:
     """
     Delete all documents whose id starts with the given prefix.
+
+    When tenant_id is provided, only the tenant's own collections are touched
+    (collection-per-tenant isolation).
 
     Returns the number of documents deleted.
     """
@@ -1228,12 +1355,31 @@ def delete_documents_with_prefix(prefix: str) -> int:
             collections = []
 
         if not collections:
-            fallback = get_or_create_collection(allow_empty=True)
+            fallback = get_or_create_collection(allow_empty=True, tenant_id=tenant_id)
             collections = [fallback] if fallback else []
+
+        if tenant_id is not None:
+            base = tenant_base_name(tenant_id)
+
+            def _owned(c) -> bool:
+                nm = c if isinstance(c, str) else getattr(c, "name", None)
+                if not nm:
+                    return False
+                return nm == base or nm.startswith(base + "_")
+
+            collections = [c for c in collections if _owned(c)]
 
         for col in collections:
             if not col:
                 continue
+            # ChromaDB >=0.6.0 returns collection NAMES (strings) from
+            # list_collections; resolve those to collection objects first.
+            if isinstance(col, str):
+                try:
+                    col = client.get_collection(name=col)
+                except Exception as get_err:
+                    logger.warning(f"delete_documents_with_prefix: could not open collection '{col}': {get_err}")
+                    continue
             try:
                 col_name = getattr(col, "name", "<unknown>")
                 result = col.get(include=["metadatas"]) or {}
@@ -1338,31 +1484,40 @@ def garbage_collect_support_collections(active_collection_name: str = "", delete
     }
 
 
-def update_document(doc_id: str, text: str, metadata: dict = None) -> int:
+def update_document(doc_id: str, text: str, metadata: dict = None, tenant_id=None) -> int:
     """
     Replace an existing uploaded document (and its chunked children) with
     new text.  This deletes any existing chunks with the same prefix and
     reindexes the new content using `chunk_and_add_document`.
 
+    When tenant_id is provided, both the delete and the re-index are scoped to
+    the tenant's own collection (collection-per-tenant isolation).
+
     Returns the number of chunks indexed for the updated document.
     """
     try:
         # Remove existing chunks that were created from this doc_id
-        delete_documents_with_prefix(str(doc_id))
+        delete_documents_with_prefix(str(doc_id), tenant_id=tenant_id)
         # Add new chunks
-        return chunk_and_add_document(doc_id=doc_id, text=text, metadata=metadata)
+        return chunk_and_add_document(doc_id=doc_id, text=text, metadata=metadata, tenant_id=tenant_id)
     except Exception as e:
         logger.error(f"Error updating document {doc_id}: {e}")
         return 0
 
 
-def find_base_doc_id_by_filename(filename: str) -> str | None:
+def find_base_doc_id_by_filename(filename: str, tenant_id=None) -> str | None:
     """
     Find the base doc_id (before the "_chunk_" suffix) for any indexed chunks
     that have metadata.filename == filename. Returns the base doc_id or None.
+
+    When tenant_id is provided, only the tenant's own active collection is
+    searched (collection-per-tenant isolation).
     """
     try:
-        collection = get_or_create_collection()
+        if tenant_id is None:
+            collection = get_or_create_collection()
+        else:
+            collection = resolve_tenant_active_collection(tenant_id)
         if not collection:
             return None
         # NOTE: "ids" must NOT be in include — ChromaDB always returns ids automatically
@@ -1432,17 +1587,23 @@ def delete_all_documents() -> tuple[int, str]:
         return 0, ""
 
 
-def list_uploaded_files() -> list:
+def list_uploaded_files(tenant_id=None) -> list:
     """
     Return a list of uploaded files discovered in the collection, along with
     the number of chunked entries indexed for each filename and the base
     doc_id used when originally indexed.
 
+    When tenant_id is provided, only the tenant's own collection is inspected
+    (collection-per-tenant isolation).
+
     Returns: [{"filename": str, "chunks": int, "doc_id": str}, ...]
     """
     out = {}
     try:
-        collection = get_or_create_collection()
+        if tenant_id is None:
+            collection = get_or_create_collection()
+        else:
+            collection = resolve_tenant_active_collection(tenant_id)
         if not collection:
             return []
         # NOTE: "ids" must NOT be in include — ChromaDB always returns ids automatically

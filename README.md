@@ -160,7 +160,21 @@ python scripts\preflight_check.py
 
 ### 2.2 Start all servers (recommended)
 
-The launcher starts services **in order**: Ollama → Piper TTS → LLM shim → RAG → Login. It also sets voice STT to CPU and RAG embeddings to GPU.
+**One command** from the project root (no `conda activate` needed — the launcher finds `assistify_main` automatically):
+
+```powershell
+python start_main_servers.py
+```
+
+This starts services **in order**: Ollama → Piper TTS → LLM shim → RAG → Login. It also sets `KMP_DUPLICATE_LIB_OK=TRUE` and frees occupied ports.
+
+**Wait until you see** `[OLLAMA]`, `[PIPER]`, `[LLM]`, `[RAG]`, and `[LOGIN]` each report **Ready** (first RAG start can take several minutes while faster-whisper loads). Leave this window open; press **Ctrl+C** to stop all services.
+
+Then open **http://127.0.0.1:7001/login** (`admin` / `admin` or `superadmin` / `superadmin123`).
+
+Per-service logs are written under `logs\` (`piper.log`, `llm.log`, `rag.log`, `login.log`).
+
+**Advanced / manual equivalent** (if you prefer explicit conda activation):
 
 ```powershell
 cd "c:\Users\a7med\Downloads\assistify-rag-project-final-rag-system\assistify-rag-project-final-rag-system"
@@ -174,9 +188,7 @@ python scripts\project_start_server.py --kill-ports --llm-port 8010
 | **`--kill-ports`** | Frees `5002`, `7000`, `7001`, `8010` if a previous run left listeners behind |
 | **`--llm-port 8010`** | Use when port **8000** fails with “permission denied” on Windows; set `LLM_SERVER_URL=http://127.0.0.1:8010` in `.env` to match |
 
-**Wait until you see** `[OLLAMA]`, `[PIPER]`, `[LLM]`, `[RAG]`, and `[LOGIN]` each report **Ready** (first RAG start can take several minutes while faster-whisper downloads). Leave this window open; press **Ctrl+C** to stop all services.
-
-Per-service logs are written under `logs\` (`piper.log`, `llm.log`, `rag.log`, `login.log`).
+Pass extra flags through the one-liner, e.g. `python start_main_servers.py --no-piper`.
 
 ### 2.3 Open the app
 
@@ -192,28 +204,30 @@ Log in with **`admin` / `admin`** (dev). After code or frontend changes, hard re
 
 ### 2.4 Alternative launcher options
 
+Flags can be passed via `python start_main_servers.py <flags>` or directly to `project_start_server.py`.
+
 **Ollama + RAG only** (skip the FastAPI LLM shim; RAG talks to Ollama directly):
 
 ```powershell
-python scripts\project_start_server.py --kill-ports --no-llm
+python start_main_servers.py --no-llm
 ```
 
 **No voice output** (skip Piper on 5002; chat still works, browser TTS may be used):
 
 ```powershell
-python scripts\project_start_server.py --kill-ports --llm-port 8010 --no-piper
+python start_main_servers.py --no-piper
 ```
 
 **Ollama already running** (do not start a second Ollama process):
 
 ```powershell
-python scripts\project_start_server.py --kill-ports --llm-port 8010 --no-ollama
+python start_main_servers.py --no-ollama
 ```
 
 **Development** (auto-reload on code changes):
 
 ```powershell
-python scripts\project_start_server.py --kill-ports --llm-port 8010 --reload
+python start_main_servers.py --reload
 ```
 
 Do **not** run `start_xtts_service.bat.disabled` unless you explicitly want the legacy XTTS GPU service instead of Piper.
@@ -294,8 +308,9 @@ assistify-rag-project-final-rag-system/
 ├── frontend/                # Static HTML/JS (chat UI)
 ├── tts_service/             # Piper TTS microservice (port 5002)
 ├── scripts/
-│   ├── project_start_server.py   # Recommended launcher (starts all services)
+│   ├── project_start_server.py   # Multi-server launcher (used by start_main_servers.py)
 │   └── preflight_check.py        # Pre-start sanity check
+├── start_main_servers.py         # Recommended one-command project start
 ├── logs/                    # Per-service logs (created at runtime)
 ├── environment_main.yml     # Conda env definition
 ├── config.py                # Shared configuration (GPU policy, Ollama, Whisper)
@@ -309,9 +324,7 @@ assistify-rag-project-final-rag-system/
 
 ```powershell
 cd "c:\Users\a7med\Downloads\assistify-rag-project-final-rag-system\assistify-rag-project-final-rag-system"
-conda activate assistify_main
-$env:KMP_DUPLICATE_LIB_OK = "TRUE"
-python scripts\project_start_server.py --kill-ports --llm-port 8010
+python start_main_servers.py
 ```
 
 Wait for all services **Ready**, then open **http://127.0.0.1:7001/login** (`admin` / `admin`).

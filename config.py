@@ -181,6 +181,55 @@ ANALYTICS_DB = Path(os.getenv("ANALYTICS_DB", str(ROOT / "backend" / "analytics.
 ASSETS_DIR = Path(os.getenv("ASSETS_DIR", str(ROOT / "backend" / "assets")))
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ========== MULTI-TENANCY ==========
+# Tenant isolation uses collection-per-tenant for the vector store and a
+# shared DB + tenant_id column for relational data. The default tenant keeps
+# the historical collection / asset names so existing single-tenant data
+# continues to work with zero migration.
+DEFAULT_TENANT_ID = int(os.getenv("DEFAULT_TENANT_ID", "1"))
+
+
+def _coerce_tenant_id(tenant_id) -> int:
+    """Best-effort conversion of a tenant id to a positive int.
+
+    Falls back to DEFAULT_TENANT_ID for None / blank / invalid values so
+    callers never accidentally build a collection name like 'tNone_...'.
+    """
+    try:
+        tid = int(tenant_id)
+    except (TypeError, ValueError):
+        return DEFAULT_TENANT_ID
+    return tid if tid > 0 else DEFAULT_TENANT_ID
+
+
+def tenant_collection_base(tenant_id) -> str:
+    """Base ChromaDB collection name for a tenant.
+
+    Tenant 1 (default) reuses the historical 'support_docs_v3' base so the
+    existing collections stay the active KB. Other tenants are namespaced as
+    't<id>_support_docs_v3'.
+    """
+    tid = _coerce_tenant_id(tenant_id)
+    if tid == DEFAULT_TENANT_ID:
+        return "support_docs_v3"
+    return f"t{tid}_support_docs_v3"
+
+
+def tenant_collection_name(tenant_id) -> str:
+    """Active ('_latest') collection name for a tenant."""
+    return f"{tenant_collection_base(tenant_id)}_latest"
+
+
+def tenant_assets_dir(tenant_id) -> Path:
+    """Per-tenant uploads directory (created on demand)."""
+    tid = _coerce_tenant_id(tenant_id)
+    directory = ASSETS_DIR / f"tenant_{tid}"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return directory
+
 # Embedding model
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
 
@@ -223,6 +272,10 @@ __all__ = [
     "DB_PATH",
     "ANALYTICS_DB",
     "ASSETS_DIR",
+    "DEFAULT_TENANT_ID",
+    "tenant_collection_base",
+    "tenant_collection_name",
+    "tenant_assets_dir",
     "EMBEDDING_MODEL",
     "DEVELOPMENT",
     "MODEL_PATH",

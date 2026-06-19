@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <title>Access Requests - Assistify Admin</title>
+    <style>
+        :root { --accent: #10a37f; --bg: #232323; --panel: #2b2b2b; --light: #fff; --muted: #9ca3af; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: var(--bg); color: var(--light); margin: 0; padding: 24px; }
+        .container { max-width: 900px; margin: 0 auto; background: var(--panel); border-radius: 12px; padding: 24px; }
+        h1 { color: var(--accent); }
+        .card { background: #202020; border-radius: 10px; padding: 16px; margin: 12px 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+        button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 8px 14px; cursor: pointer; font-weight: 600; }
+        button.reject { background: #a33; }
+        a { color: var(--accent); }
+    </style>
+    <script src="/static/security.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>Customer Access Requests</h1>
+        <p><a href="/admin">← Back to admin dashboard</a></p>
+        <div id="pending"></div>
+        <h2>Approved Customers</h2>
+        <div id="approved"></div>
+    </div>
+    <script>
+        function csrf() {
+            return (window.Security && Security.getCSRFToken()) || '';
+        }
+
+        async function load() {
+            try {
+                const [pendingRes, approvedRes] = await Promise.all([
+                    fetch('/api/access-requests?status=pending', { credentials: 'same-origin' }),
+                    fetch('/api/access-requests?status=approved', { credentials: 'same-origin' })
+                ]);
+                if (!pendingRes.ok) {
+                    alert(await Security.parseApiError(pendingRes));
+                    return;
+                }
+                if (!approvedRes.ok) {
+                    alert(await Security.parseApiError(approvedRes));
+                    return;
+                }
+                const pending = (await pendingRes.json()).requests || [];
+                const approved = (await approvedRes.json()).requests || [];
+                document.getElementById('pending').innerHTML = pending.length ? pending.map(r => `
+                    <div class="card">
+                        <div><strong>${r.username}</strong><br><span style="color:#9ca3af">Requested ${r.requested_at || ''}</span></div>
+                        <div>
+                            <button onclick="approve(${r.id})">Approve</button>
+                            <button class="reject" onclick="reject(${r.id})">Reject</button>
+                        </div>
+                    </div>
+                `).join('') : '<p style="color:#9ca3af">No pending requests.</p>';
+                document.getElementById('approved').innerHTML = approved.length ? approved.map(r => `
+                    <div class="card">
+                        <div><strong>${r.username}</strong></div>
+                        <button class="reject" onclick="revoke(${r.id})">Revoke access</button>
+                    </div>
+                `).join('') : '<p style="color:#9ca3af">No approved customers yet.</p>';
+            } catch (err) {
+                alert('Could not load requests: ' + (err.message || err));
+            }
+        }
+
+        async function approve(id) {
+            try {
+                const res = await fetch('/api/access-requests/' + id + '/approve', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'X-CSRF-Token': csrf() }
+                });
+                if (!res.ok) {
+                    alert(await Security.parseApiError(res));
+                    return;
+                }
+                load();
+            } catch (err) {
+                alert('Approve failed: ' + (err.message || err));
+            }
+        }
+
+        async function reject(id) {
+            try {
+                const res = await fetch('/api/access-requests/' + id + '/reject', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf() },
+                    body: '{}'
+                });
+                if (!res.ok) {
+                    alert(await Security.parseApiError(res));
+                    return;
+                }
+                load();
+            } catch (err) {
+                alert('Reject failed: ' + (err.message || err));
+            }
+        }
+
+        async function revoke(id) {
+            if (!confirm('Revoke this customer\'s access?')) return;
+            try {
+                const res = await fetch('/api/memberships/' + id + '/revoke', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'X-CSRF-Token': csrf() }
+                });
+                if (!res.ok) {
+                    alert(await Security.parseApiError(res));
+                    return;
+                }
+                load();
+            } catch (err) {
+                alert('Revoke failed: ' + (err.message || err));
+            }
+        }
+
+        load();
+    </script>
+</body>
+</html>

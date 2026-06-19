@@ -64,8 +64,37 @@ from config import (
     EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID,
     ENFORCE_HTTPS, ALLOWED_HOSTS, IS_PRODUCTION,
     RATE_LIMIT_LOGIN, RATE_LIMIT_REGISTER, RATE_LIMIT_OTP,
-    BCRYPT_ROUNDS
+    BCRYPT_ROUNDS, DEFAULT_TENANT_ID
 )
+
+try:
+    from Login_system.memberships import (
+        ensure_membership_schema,
+        list_memberships_for_user,
+        list_memberships_for_tenant,
+        get_membership,
+        get_membership_by_id,
+        create_access_request,
+        update_membership_status,
+        approved_memberships,
+        resolve_active_tenant_id,
+        customer_has_approved_access,
+        backfill_default_tenant_memberships,
+    )
+except ImportError:
+    from memberships import (
+        ensure_membership_schema,
+        list_memberships_for_user,
+        list_memberships_for_tenant,
+        get_membership,
+        get_membership_by_id,
+        create_access_request,
+        update_membership_status,
+        approved_memberships,
+        resolve_active_tenant_id,
+        customer_has_approved_access,
+        backfill_default_tenant_memberships,
+    )
 
 # Password hashing with configurable cost
 # Use bcrypt_sha256 (no 72-byte limit) + pbkdf2_sha256 (legacy) for backward compatibility
@@ -171,16 +200,19 @@ async def global_exception_handler(request: Request, exc: Exception):
     
     # Return generic error to user (hide sensitive details in production)
     if IS_PRODUCTION:
+        msg = "Internal server error. Please contact support."
         return JSONResponse(
             status_code=500,
-            content={"error": "Internal server error. Please contact support."}
+            content={"detail": msg, "error": msg}
         )
     else:
         # Show details in development for debugging
+        msg = str(exc)
         return JSONResponse(
             status_code=500,
             content={
-                "error": str(exc),
+                "detail": msg,
+                "error": msg,
                 "type": type(exc).__name__,
                 "path": request.url.path
             }
@@ -236,7 +268,7 @@ async def security_headers_middleware(request: Request, call_next):
             response.set_cookie(
                 key="csrf_token",
                 value=csrf_token_value,
-                httponly=True,
+                httponly=False,
                 secure=ENFORCE_HTTPS,
                 samesite="lax",
                 max_age=86400  # 24 hours
@@ -398,13 +430,61 @@ def create_session_token(username: str, role: str, auth_provider: str = "local",
         **extra_data
     }
     
-    # Get user ID for session tracking
+    # Get user ID + tenant for session tracking and tenant resolution.
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE username=?", (username,))
+    c.execute(
+        """
+        SELECT u.id, u.tenant_id, t.slug
+        FROM users u
+        LEFT JOIN tenants t ON u.tenant_id = t.id
+        WHERE u.username=?
+        """,
+        (username,),
+    )
     row = c.fetchone()
     conn.close()
-    
+
+    # Embed tenant identity in the signed cookie so downstream services
+    # (e.g. the RAG server) can scope every request without another DB hit.
+    # Caller-provided tenant_id (via **extra_data) wins if present.
+    if "tenant_id" not in session_data:
+        session_data["tenant_id"] = (row[1] if row and row[1] is not None else DEFAULT_TENANT_ID)
+    if "tenant_slug" not in session_data and row and len(row) > 2 and row[2]:
+        session_data["tenant_slug"] = row[2]
+
+    role_val = str(session_data.get("role") or role or "").lower()
+    username_val = str(session_data.get("username") or username or "")
+    user_tenant_raw = session_data.get("tenant_id")
+    if user_tenant_raw is None and row and row[1] is not None:
+        user_tenant_raw = row[1]
+
+    if "active_tenant_id" not in session_data:
+        conn_active = get_db()
+        active_tid = resolve_active_tenant_id(
+            conn_active,
+            role=role_val,
+            username=username_val,
+            user_tenant_id=user_tenant_raw,
+            session_active_tenant_id=extra_data.get("active_tenant_id"),
+            requested_tenant_id=extra_data.get("active_tenant_id"),
+        )
+        conn_active.close()
+        if active_tid is not None:
+            session_data["active_tenant_id"] = active_tid
+        elif role_val != "customer":
+            session_data["active_tenant_id"] = int(user_tenant_raw or DEFAULT_TENANT_ID)
+
+    if role_val == "customer" and session_data.get("active_tenant_id"):
+        session_data["tenant_id"] = session_data["active_tenant_id"]
+        conn_slug = get_db()
+        c_slug = conn_slug.cursor()
+        c_slug.execute("SELECT slug FROM tenants WHERE id=?", (session_data["active_tenant_id"],))
+        slug_row = c_slug.fetchone()
+        conn_slug.close()
+        if slug_row and slug_row[0]:
+            session_data["tenant_slug"] = slug_row[0]
+
     if row:
         user_id = row[0]
         # Track session for concurrent session limits
@@ -574,13 +654,19 @@ STATIC_DIR = os.path.abspath(os.path.join(BASE_DIR, "static"))
 # Mount static files
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# CSRF token function for Jinja2 templates
-def csrf_token():
-    """Generate CSRF token - returns a lambda that returns the token from cookie"""
-    return lambda: secrets.token_urlsafe(32)
+# CSRF token for Jinja2 templates — must match the csrf_token cookie set at login.
+from jinja2 import pass_context
+
+@pass_context
+def csrf_token(context):
+    """Return the request's csrf_token cookie for hidden fields and meta tags."""
+    request = context.get("request")
+    if request is not None:
+        return request.cookies.get("csrf_token") or ""
+    return ""
 
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
-templates.env.globals['csrf_token'] = csrf_token()
+templates.env.globals['csrf_token'] = csrf_token
 
 
 def resolve_template(name: str) -> str:
@@ -608,13 +694,15 @@ def get_db():
     return conn
 
 
-def create_user(username, password, role, mfa_enabled=0, mfa_secret=None):
+def create_user(username, password, role, mfa_enabled=0, mfa_secret=None, tenant_id=None):
+    if tenant_id is None:
+        tenant_id = DEFAULT_TENANT_ID
     conn = get_db()
     c = conn.cursor()
     c.execute("""
-        INSERT OR IGNORE INTO users (username, password_hash, role, mfa_enabled, mfa_secret)
-        VALUES (?, ?, ?, ?, ?)
-    """, (username, pwd_context.hash(password), role, int(mfa_enabled), mfa_secret))
+        INSERT OR IGNORE INTO users (username, password_hash, role, mfa_enabled, mfa_secret, tenant_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (username, pwd_context.hash(password), role, int(mfa_enabled), mfa_secret, tenant_id))
     conn.commit()
     conn.close()
 
@@ -631,6 +719,32 @@ def verify_csrf(request: Request):
 def init_db():
     conn = get_db()
     c = conn.cursor()
+
+    # ----- Multi-tenancy: central tenants registry -----
+    # Authoritative list of tenants. Each domain manager (admin) and their
+    # users belong to exactly one tenant; the default tenant keeps legacy data.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tenants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            slug TEXT UNIQUE NOT NULL,
+            active INTEGER DEFAULT 1,
+            plan TEXT DEFAULT 'standard',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Ensure the default tenant exists with the canonical id.
+    c.execute("SELECT id FROM tenants WHERE id=?", (DEFAULT_TENANT_ID,))
+    if not c.fetchone():
+        c.execute(
+            "INSERT INTO tenants (id, name, slug, active, plan) VALUES (?, ?, ?, 1, 'standard')",
+            (DEFAULT_TENANT_ID, "Default", "default"),
+        )
+    ensure_membership_schema(c)
+    conn.commit()
+    backfill_default_tenant_memberships(conn, DEFAULT_TENANT_ID)
+    conn.commit()
+
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users';")
     if not c.fetchone():
         c.execute("""
@@ -648,12 +762,15 @@ def init_db():
                 auth_provider TEXT DEFAULT 'local',
                 email_verified INTEGER DEFAULT 0,
                 full_name TEXT,
+                tenant_id INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        create_user("admin", "admin123", "admin")
-        create_user("employee", "employee123", "employee")
-        create_user("customer", "customer123", "customer")
+        # Platform owner: not bound to any single tenant's data.
+        create_user("superadmin", "superadmin123", "superadmin", tenant_id=DEFAULT_TENANT_ID)
+        create_user("admin", "admin123", "admin", tenant_id=DEFAULT_TENANT_ID)
+        create_user("employee", "employee123", "employee", tenant_id=DEFAULT_TENANT_ID)
+        create_user("customer", "customer123", "customer", tenant_id=DEFAULT_TENANT_ID)
         conn.commit()
     else:
         # Check if columns exist, add if not
@@ -684,6 +801,11 @@ def init_db():
             c.execute("ALTER TABLE users ADD COLUMN created_at TIMESTAMP")
             # Set default value for existing rows
             c.execute("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+            conn.commit()
+        if 'tenant_id' not in columns:
+            c.execute(f"ALTER TABLE users ADD COLUMN tenant_id INTEGER DEFAULT {DEFAULT_TENANT_ID}")
+            # Backfill existing rows onto the default tenant.
+            c.execute("UPDATE users SET tenant_id=? WHERE tenant_id IS NULL", (DEFAULT_TENANT_ID,))
             conn.commit()
     
     # Add username_changed_at column
@@ -820,7 +942,16 @@ def init_db():
             )
         """)
         conn.commit()
-    
+
+    # Multi-tenant: scope support tickets to a business so admins/employees of
+    # one tenant can never see another tenant's customer support tickets.
+    c.execute("PRAGMA table_info(support_tickets)")
+    _ticket_cols = [col[1] for col in c.fetchall()]
+    if "tenant_id" not in _ticket_cols:
+        c.execute(f"ALTER TABLE support_tickets ADD COLUMN tenant_id INTEGER DEFAULT {DEFAULT_TENANT_ID}")
+        c.execute("UPDATE support_tickets SET tenant_id=? WHERE tenant_id IS NULL", (DEFAULT_TENANT_ID,))
+        conn.commit()
+
     # Create query feedback table (thumbs up/down)
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='query_feedback';")
     if not c.fetchone():
@@ -903,14 +1034,46 @@ def auth_user(username_or_email, password):
     return None, None
 
 
-def get_current_user(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    try:
-        if token:
-            data = serializer.loads(token)
-            return data
-    except Exception:
-        return None
+def _resolve_post_login_redirect(role: str, username: str) -> str:
+    role = str(role or "").lower()
+    if role == "superadmin":
+        return "/superadmin"
+    if role == "admin":
+        return "/admin"
+    if role == "employee":
+        return "/employee"
+    conn = get_db()
+    approved = approved_memberships(conn, username)
+    conn.close()
+    if not approved:
+        return "/select-business"
+    return "/main"
+
+
+def _assert_target_user_in_caller_tenant(caller: dict, target_user_id: int) -> dict:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, username, role, tenant_id FROM users WHERE id=?", (int(target_user_id),))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    caller_role = str((caller or {}).get("role") or "").lower()
+    if caller_role == "superadmin":
+        return {"id": row[0], "username": row[1], "role": row[2], "tenant_id": row[3]}
+    caller_tid = int((caller or {}).get("tenant_id") or DEFAULT_TENANT_ID)
+    target_tid = row[3]
+    if target_tid is None or int(target_tid) != caller_tid:
+        raise HTTPException(status_code=403, detail="Cannot manage users outside your business")
+    return {"id": row[0], "username": row[1], "role": row[2], "tenant_id": row[3]}
+
+
+def _tenant_scope_sql(user) -> tuple[str, list]:
+    role = str((user or {}).get("role") or "").lower()
+    if role == "superadmin":
+        return "", []
+    tid = int((user or {}).get("tenant_id") or DEFAULT_TENANT_ID)
+    return " AND tenant_id = ?", [tid]
 
 
 def get_or_create_google_user(google_id: str, email: str, name: str, picture: str):
@@ -953,11 +1116,11 @@ def get_or_create_google_user(google_id: str, email: str, name: str, picture: st
         username = f"{base_username}{counter}"
         counter += 1
     
-    # Insert new Google user as customer
+    # Insert new Google user as customer (default tenant for self-service signups)
     c.execute("""
-        INSERT INTO users (username, password_hash, role, google_id, email, profile_picture, auth_provider, active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (username, "", "customer", google_id, email, picture, "google", 1))
+        INSERT INTO users (username, password_hash, role, google_id, email, profile_picture, auth_provider, active, tenant_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (username, "", "customer", google_id, email, picture, "google", 1, None))
     
     conn.commit()
     conn.close()
@@ -1345,14 +1508,15 @@ async def verify_otp_code(
     conn = get_db()
     c = conn.cursor()
     c.execute("""
-        INSERT INTO users (username, password_hash, role, email, full_name, email_verified, auth_provider, active)
-        VALUES (?, ?, ?, ?, ?, 1, 'local', 1)
+        INSERT INTO users (username, password_hash, role, email, full_name, email_verified, auth_provider, active, tenant_id)
+        VALUES (?, ?, ?, ?, ?, 1, 'local', 1, ?)
     """, (
         user_data["username"],
         user_data["password_hash"],
         user_data["role"],
         user_data["email"],
-        user_data["full_name"]
+        user_data["full_name"],
+        None,
     ))
     conn.commit()
     conn.close()
@@ -1502,8 +1666,11 @@ async def google_callback(request: Request):
         
         csrf_token = str(uuid.uuid4())
         
-        # Redirect to main page
-        response = RedirectResponse(url="/main", status_code=status.HTTP_303_SEE_OTHER)
+        # Redirect based on role / membership
+        response = RedirectResponse(
+            url=_resolve_post_login_redirect(user_data["role"], user_data["username"]),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
         response.set_cookie(
             key=SESSION_COOKIE, 
             value=session_token, 
@@ -1623,7 +1790,7 @@ async def login(request: Request, username: str = Form(...), password: str = For
         elif role == "employee":
             redirect_url = "/employee"
         else:
-            redirect_url = "/main"
+            redirect_url = _resolve_post_login_redirect(role, actual_username)
         response = RedirectResponse(url=redirect_url, status_code=302)
         response.set_cookie(
             SESSION_COOKIE,
@@ -1654,7 +1821,11 @@ async def login(request: Request, username: str = Form(...), password: str = For
 def list_users(request: Request, user=Depends(require_login("admin"))):
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT id, username, role, mfa_enabled FROM users")
+    scope_sql, scope_params = _tenant_scope_sql(user)
+    c.execute(
+        f"SELECT id, username, role, mfa_enabled FROM users WHERE 1=1{scope_sql}",
+        scope_params,
+    )
     rows = c.fetchall()
     conn.close()
     users = [{"id": r[0], "username": r[1], "role": r[2], "mfa_enabled": bool(r[3])} for r in rows]
@@ -1696,7 +1867,8 @@ class UserCreate(BaseModel):
 @app.post("/users")
 def create_user_api(request: Request, data: UserCreate, admin=Depends(require_login("admin"))):
     verify_csrf(request)
-    create_user(data.username, data.password, data.role)
+    tenant_id = int(admin.get("tenant_id") or DEFAULT_TENANT_ID)
+    create_user(data.username, data.password, data.role, tenant_id=tenant_id)
     return {"status": "created", "username": data.username}
 
 
@@ -1856,10 +2028,14 @@ def admin_audit_logs_page(request: Request, user=Depends(require_login("admin"))
 
 @app.get("/api/users")
 def list_users(request: Request, user=Depends(require_api_auth("admin"))):
-    """Admin: Get all users (admin, employee, customer)"""
+    """Admin: Get users for the admin's own business (superadmin: all users)."""
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT id, username, role, active, email, full_name FROM users ORDER BY id")
+    scope_sql, scope_params = _tenant_scope_sql(user)
+    c.execute(
+        f"SELECT id, username, role, active, email, full_name FROM users WHERE 1=1{scope_sql} ORDER BY id",
+        scope_params,
+    )
     rows = c.fetchall()
     conn.close()
     users = []
@@ -1877,10 +2053,20 @@ def list_users(request: Request, user=Depends(require_api_auth("admin"))):
 
 @app.get("/api/customers")
 def list_customers(request: Request, user=Depends(require_api_role("admin", "employee"))):
-    """Employee: Get only customer accounts"""
+    """Tenant-scoped customer accounts (approved memberships for this business)."""
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT id, username, active, email, full_name, created_at FROM users WHERE role='customer' ORDER BY id")
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    c.execute(
+        """
+        SELECT u.id, u.username, u.active, u.email, u.full_name, u.created_at, m.status
+        FROM tenant_memberships m
+        JOIN users u ON u.username = m.username
+        WHERE m.tenant_id = ? AND m.status = 'approved' AND u.role = 'customer'
+        ORDER BY u.id
+        """,
+        (tenant_id,),
+    )
     rows = c.fetchall()
     conn.close()
     customers = []
@@ -1888,10 +2074,11 @@ def list_customers(request: Request, user=Depends(require_api_role("admin", "emp
         customers.append({
             "id": row[0],
             "username": row[1],
-            "active": bool(row[2]) if len(row) > 2 else True,
-            "email": row[3] if len(row) > 3 else None,
-            "full_name": row[4] if len(row) > 4 else None,
-            "created_at": row[5] if len(row) > 5 else None
+            "active": bool(row[2]) if row[2] is not None else True,
+            "email": row[3],
+            "full_name": row[4],
+            "created_at": row[5],
+            "membership_status": row[6],
         })
     return customers
 
@@ -1913,13 +2100,35 @@ async def create_new_user(request: Request, user=Depends(require_login("admin"))
     if role not in ["admin", "employee", "customer"]:
         raise HTTPException(status_code=400, detail="Invalid role")
     
+    # New users inherit the creating admin's tenant so a domain manager can
+    # only add users into their own tenant.
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    if role == "admin":
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(
+            "SELECT COALESCE(allow_multiple_admins, 0) FROM tenants WHERE id=?",
+            (tenant_id,),
+        )
+        allow_row = c.fetchone()
+        c.execute(
+            "SELECT COUNT(*) FROM users WHERE tenant_id=? AND role='admin' AND active=1",
+            (tenant_id,),
+        )
+        admin_count = (c.fetchone() or [0])[0]
+        conn.close()
+        if admin_count >= 1 and not (allow_row and allow_row[0]):
+            raise HTTPException(
+                status_code=403,
+                detail="This business allows only one admin. Contact the platform owner to enable multiple admins.",
+            )
     try:
         conn = get_db()
         c = conn.cursor()
         c.execute("""
-            INSERT INTO users (username, password_hash, role, active)
-            VALUES (?, ?, ?, 1)
-        """, (username, pwd_context.hash(password), role))
+            INSERT INTO users (username, password_hash, role, active, tenant_id)
+            VALUES (?, ?, ?, 1, ?)
+        """, (username, pwd_context.hash(password), role, tenant_id))
         conn.commit()
         conn.close()
         return {"status": "created", "username": username}
@@ -1930,22 +2139,17 @@ async def create_new_user(request: Request, user=Depends(require_login("admin"))
 @app.post("/api/users/{user_id}/deactivate")
 async def deactivate_user_api(request: Request, user_id: int, user=Depends(require_login("admin"))):
     verify_csrf(request)
+    target = _assert_target_user_in_caller_tenant(user, user_id)
     conn = get_db()
     c = conn.cursor()
-    
-    # Get username for audit
-    c.execute("SELECT username FROM users WHERE id=?", (user_id,))
-    row = c.fetchone()
-    if row:
-        username = row[0]
-        c.execute("UPDATE users SET active=0 WHERE id=?", (user_id,))
-        
-        # Audit log
-        c.execute("""
-            INSERT INTO audit_logs (user_id, username, action, old_value, new_value, ip_address, performed_by)
-            VALUES (?, ?, 'ACCOUNT_DEACTIVATED', 'active', 'inactive', ?, ?)
-        """, (user_id, username, request.client.host, user.get("username")))
-        
+    c.execute("UPDATE users SET active=0 WHERE id=?", (user_id,))
+    c.execute(
+        """
+        INSERT INTO audit_logs (user_id, username, action, old_value, new_value, ip_address, performed_by)
+        VALUES (?, ?, 'ACCOUNT_DEACTIVATED', 'active', 'inactive', ?, ?)
+        """,
+        (user_id, target["username"], request.client.host, user.get("username")),
+    )
     conn.commit()
     conn.close()
     return {"status": "deactivated"}
@@ -1954,22 +2158,17 @@ async def deactivate_user_api(request: Request, user_id: int, user=Depends(requi
 @app.post("/api/users/{user_id}/activate")
 async def activate_user_api(request: Request, user_id: int, user=Depends(require_login("admin"))):
     verify_csrf(request)
+    target = _assert_target_user_in_caller_tenant(user, user_id)
     conn = get_db()
     c = conn.cursor()
-    
-    # Get username for audit
-    c.execute("SELECT username FROM users WHERE id=?", (user_id,))
-    row = c.fetchone()
-    if row:
-        username = row[0]
-        c.execute("UPDATE users SET active=1 WHERE id=?", (user_id,))
-        
-        # Audit log
-        c.execute("""
-            INSERT INTO audit_logs (user_id, username, action, old_value, new_value, ip_address, performed_by)
-            VALUES (?, ?, 'ACCOUNT_ACTIVATED', 'inactive', 'active', ?, ?)
-        """, (user_id, username, request.client.host, user.get("username")))
-        
+    c.execute("UPDATE users SET active=1 WHERE id=?", (user_id,))
+    c.execute(
+        """
+        INSERT INTO audit_logs (user_id, username, action, old_value, new_value, ip_address, performed_by)
+        VALUES (?, ?, 'ACCOUNT_ACTIVATED', 'inactive', 'active', ?, ?)
+        """,
+        (user_id, target["username"], request.client.host, user.get("username")),
+    )
     conn.commit()
     conn.close()
     return {"status": "activated"}
@@ -1991,6 +2190,530 @@ def delete_user_api(request: Request, user_id: int, user=Depends(require_login("
         conn.commit()
         conn.close()
     return {"status": "deleted"}
+
+
+# ========== SUPERADMIN: TENANT & DOMAIN-MANAGER MANAGEMENT ==========
+# These JSON APIs are restricted to the platform owner (superadmin). They let
+# the owner provision tenants and seed each tenant's first domain manager
+# (an 'admin' user bound to that tenant_id). They mirror the style of the
+# /api/users/... endpoints above (CSRF on mutating POSTs, sqlite3 error
+# handling, JSON request bodies).
+
+_MEMBERSHIP_STATUSES = ("pending", "approved", "rejected", "revoked")
+_ROLE_COUNT_ROLES = ("admin", "employee", "customer")
+
+
+def _empty_membership_stats() -> dict[str, int]:
+    return {status: 0 for status in _MEMBERSHIP_STATUSES}
+
+
+def _empty_role_counts() -> dict[str, int]:
+    return {role: 0 for role in _ROLE_COUNT_ROLES}
+
+
+def build_tenant_details(conn, tenant_ids: list[int]) -> dict[int, dict]:
+    """Assemble per-tenant rosters and membership stats for superadmin listing."""
+    if not tenant_ids:
+        return {}
+
+    details = {
+        tid: {
+            "role_counts": _empty_role_counts(),
+            "admins": [],
+            "employees": [],
+            "membership_customers": [],
+            "membership_stats": _empty_membership_stats(),
+        }
+        for tid in tenant_ids
+    }
+
+    c = conn.cursor()
+    placeholders = ",".join("?" * len(tenant_ids))
+
+    c.execute(
+        f"""
+        SELECT tenant_id, role, COUNT(*)
+        FROM users
+        WHERE tenant_id IN ({placeholders})
+          AND role IN ('admin', 'employee', 'customer')
+        GROUP BY tenant_id, role
+        """,
+        tenant_ids,
+    )
+    for tenant_id, role, count in c.fetchall():
+        bucket = details.get(tenant_id)
+        if bucket and role in bucket["role_counts"]:
+            bucket["role_counts"][role] = count
+
+    c.execute(
+        f"""
+        SELECT id, username, email, full_name, active, tenant_id, role
+        FROM users
+        WHERE tenant_id IN ({placeholders})
+          AND role IN ('admin', 'employee')
+        ORDER BY tenant_id, role, username
+        """,
+        tenant_ids,
+    )
+    for row in c.fetchall():
+        tenant_id = row[5]
+        bucket = details.get(tenant_id)
+        if not bucket:
+            continue
+        user = {
+            "id": row[0],
+            "username": row[1],
+            "email": row[2],
+            "full_name": row[3],
+            "active": bool(row[4]) if row[4] is not None else True,
+        }
+        if row[6] == "admin":
+            bucket["admins"].append(user)
+        else:
+            bucket["employees"].append(user)
+
+    c.execute(
+        f"""
+        SELECT tenant_id, status, COUNT(*)
+        FROM tenant_memberships
+        WHERE tenant_id IN ({placeholders})
+        GROUP BY tenant_id, status
+        """,
+        tenant_ids,
+    )
+    for tenant_id, status, count in c.fetchall():
+        bucket = details.get(tenant_id)
+        if bucket and status in bucket["membership_stats"]:
+            bucket["membership_stats"][status] = count
+
+    c.execute(
+        f"""
+        SELECT u.id, u.username, u.email, u.full_name, u.active, m.tenant_id, m.reviewed_at
+        FROM tenant_memberships m
+        JOIN users u ON u.username = m.username
+        WHERE m.tenant_id IN ({placeholders})
+          AND m.status = 'approved'
+          AND u.role = 'customer'
+        ORDER BY m.tenant_id, u.username
+        """,
+        tenant_ids,
+    )
+    for row in c.fetchall():
+        tenant_id = row[5]
+        bucket = details.get(tenant_id)
+        if not bucket:
+            continue
+        bucket["membership_customers"].append({
+            "id": row[0],
+            "username": row[1],
+            "email": row[2],
+            "full_name": row[3],
+            "active": bool(row[4]) if row[4] is not None else True,
+            "approved_at": row[6],
+        })
+
+    return details
+
+
+@app.get("/api/tenants")
+def list_tenants(request: Request, user=Depends(require_api_role("superadmin"))):
+    """Superadmin: list all tenants with rosters and membership stats."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, name, slug, active, plan, created_at,
+               COALESCE(allow_multiple_admins, 0) AS allow_multiple_admins
+        FROM tenants
+        ORDER BY id
+    """)
+    rows = c.fetchall()
+    tenant_ids = [row[0] for row in rows]
+
+    user_counts: dict[int, int] = {}
+    if tenant_ids:
+        placeholders = ",".join("?" * len(tenant_ids))
+        c.execute(
+            f"SELECT tenant_id, COUNT(*) FROM users WHERE tenant_id IN ({placeholders}) GROUP BY tenant_id",
+            tenant_ids,
+        )
+        for tenant_id, count in c.fetchall():
+            user_counts[tenant_id] = count
+
+    extra_by_tenant = build_tenant_details(conn, tenant_ids)
+    conn.close()
+
+    tenants = []
+    for row in rows:
+        tenant_id = row[0]
+        extra = extra_by_tenant.get(tenant_id, {
+            "role_counts": _empty_role_counts(),
+            "admins": [],
+            "employees": [],
+            "membership_customers": [],
+            "membership_stats": _empty_membership_stats(),
+        })
+        tenants.append({
+            "id": tenant_id,
+            "name": row[1],
+            "slug": row[2],
+            "active": bool(row[3]) if row[3] is not None else True,
+            "plan": row[4],
+            "created_at": row[5],
+            "allow_multiple_admins": bool(row[6]) if len(row) > 6 else False,
+            "user_count": user_counts.get(tenant_id, 0),
+            **extra,
+        })
+    return tenants
+
+
+@app.post("/api/tenants/create")
+async def create_tenant_api(request: Request, user=Depends(require_api_role("superadmin"))):
+    """Superadmin: create a new tenant. Body: {name, slug, plan?}."""
+    verify_csrf(request)
+    data = await request.json()
+    name = (data.get("name") or "").strip()
+    slug = (data.get("slug") or "").strip().lower()
+    plan = (data.get("plan") or "standard").strip() or "standard"
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Tenant name required")
+    if not slug:
+        raise HTTPException(status_code=400, detail="Tenant slug required")
+    if not re.match(r"^[a-z0-9-]+$", slug):
+        raise HTTPException(
+            status_code=400,
+            detail="Slug must contain only lowercase letters, numbers, and hyphens",
+        )
+
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO tenants (name, slug, active, plan) VALUES (?, ?, 1, ?)",
+            (name, slug, plan),
+        )
+        tenant_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return {"status": "created", "id": tenant_id, "slug": slug}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="slug already exists")
+
+
+@app.post("/api/tenants/{tenant_id}/managers")
+async def create_tenant_manager_api(request: Request, tenant_id: int, user=Depends(require_api_role("superadmin"))):
+    """Superadmin: create a domain manager ('admin') bound to a tenant.
+
+    Body: {username, password, full_name?, email?}.
+    """
+    verify_csrf(request)
+    data = await request.json()
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    full_name = (data.get("full_name") or "").strip() or None
+    email = (data.get("email") or "").strip() or None
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password required")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    # The target tenant must exist before we bind a manager to it.
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM tenants WHERE id=?", (tenant_id,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    try:
+        c.execute("""
+            INSERT INTO users (username, password_hash, role, active, tenant_id, auth_provider, full_name, email)
+            VALUES (?, ?, 'admin', 1, ?, 'local', ?, ?)
+        """, (username, pwd_context.hash(password), tenant_id, full_name, email))
+        conn.commit()
+        conn.close()
+        return {"status": "created", "username": username, "tenant_id": tenant_id}
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+
+@app.post("/api/tenants/{tenant_id}/deactivate")
+async def deactivate_tenant_api(request: Request, tenant_id: int, user=Depends(require_api_role("superadmin"))):
+    """Superadmin: deactivate a tenant (sets tenants.active = 0)."""
+    verify_csrf(request)
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM tenants WHERE id=?", (tenant_id,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    c.execute("UPDATE tenants SET active=0 WHERE id=?", (tenant_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deactivated", "tenant_id": tenant_id}
+
+
+@app.post("/api/tenants/{tenant_id}/activate")
+async def activate_tenant_api(request: Request, tenant_id: int, user=Depends(require_api_role("superadmin"))):
+    """Superadmin: activate a tenant (sets tenants.active = 1)."""
+    verify_csrf(request)
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM tenants WHERE id=?", (tenant_id,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    c.execute("UPDATE tenants SET active=1 WHERE id=?", (tenant_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "activated", "tenant_id": tenant_id}
+
+
+# ========== TENANT MEMBERSHIPS & CUSTOMER ACCESS WORKFLOW ==========
+
+@app.get("/api/businesses")
+def list_businesses(user=Depends(require_api_auth())):
+    """List active businesses customers can request access to."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, name, slug, plan FROM tenants WHERE active=1 ORDER BY name"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "name": r[1], "slug": r[2], "plan": r[3]}
+        for r in rows
+    ]
+
+
+@app.get("/api/my-memberships")
+def my_memberships(user=Depends(require_api_auth("customer"))):
+    conn = get_db()
+    memberships = list_memberships_for_user(conn, user.get("username"))
+    conn.close()
+    return {"memberships": memberships}
+
+
+@app.post("/api/access-requests")
+async def submit_access_request(request: Request, user=Depends(require_api_auth("customer"))):
+    verify_csrf(request)
+    data = await request.json()
+    tenant_id = data.get("tenant_id")
+    if tenant_id is None:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+    conn = get_db()
+    try:
+        membership = create_access_request(conn, user.get("username"), int(tenant_id))
+    except ValueError as exc:
+        conn.close()
+        code = str(exc)
+        if code == "tenant_not_found":
+            raise HTTPException(status_code=404, detail="Business not found")
+        if code == "tenant_inactive":
+            raise HTTPException(status_code=400, detail="Business is not active")
+        if code == "already_requested":
+            raise HTTPException(status_code=400, detail="Request already pending or approved")
+        raise HTTPException(status_code=400, detail=code)
+    c = conn.cursor()
+    c.execute("SELECT name FROM tenants WHERE id=?", (int(tenant_id),))
+    tenant_name = (c.fetchone() or [f"Business {tenant_id}"])[0]
+    c.execute(
+        "SELECT username FROM users WHERE role='admin' AND tenant_id=? AND active=1",
+        (int(tenant_id),),
+    )
+    for (admin_username,) in c.fetchall():
+        create_notification(
+            admin_username,
+            "admin",
+            "access_requested",
+            "New access request",
+            f"{user.get('username')} requested access to {tenant_name}.",
+            link="/admin/access-requests",
+            priority="normal",
+        )
+    conn.close()
+    return {"status": "pending", "membership": membership}
+
+
+@app.get("/api/access-requests")
+def list_access_requests(
+    request: Request,
+    user=Depends(require_api_role("admin")),
+    status: str = "pending",
+):
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    conn = get_db()
+    memberships = list_memberships_for_tenant(conn, tenant_id, status=status or None)
+    conn.close()
+    return {"requests": memberships}
+
+
+@app.post("/api/access-requests/{membership_id}/approve")
+async def approve_access_request(
+    request: Request,
+    membership_id: int,
+    user=Depends(require_api_role("admin")),
+):
+    verify_csrf(request)
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    conn = get_db()
+    membership = get_membership_by_id(conn, membership_id)
+    if not membership or int(membership["tenant_id"]) != tenant_id:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Access request not found")
+    updated = update_membership_status(
+        conn, membership_id, "approved", user.get("username")
+    )
+    conn.close()
+    create_notification(
+        membership["username"],
+        "customer",
+        "access_approved",
+        "Access approved",
+        f"Your access to {membership.get('tenant_name', 'the business')} was approved.",
+        link="/select-business",
+        priority="normal",
+    )
+    return {"status": "approved", "membership": updated}
+
+
+@app.post("/api/access-requests/{membership_id}/reject")
+async def reject_access_request(
+    request: Request,
+    membership_id: int,
+    user=Depends(require_api_role("admin")),
+):
+    verify_csrf(request)
+    data = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    notes = (data or {}).get("notes")
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    conn = get_db()
+    membership = get_membership_by_id(conn, membership_id)
+    if not membership or int(membership["tenant_id"]) != tenant_id:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Access request not found")
+    updated = update_membership_status(
+        conn, membership_id, "rejected", user.get("username"), notes=notes
+    )
+    conn.close()
+    create_notification(
+        membership["username"],
+        "customer",
+        "access_rejected",
+        "Access request declined",
+        f"Your access request to {membership.get('tenant_name', 'the business')} was declined.",
+        link="/select-business",
+        priority="normal",
+    )
+    return {"status": "rejected", "membership": updated}
+
+
+@app.post("/api/memberships/{membership_id}/revoke")
+async def revoke_membership(
+    request: Request,
+    membership_id: int,
+    user=Depends(require_api_role("admin")),
+):
+    verify_csrf(request)
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    conn = get_db()
+    membership = get_membership_by_id(conn, membership_id)
+    if not membership or int(membership["tenant_id"]) != tenant_id:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Membership not found")
+    updated = update_membership_status(
+        conn, membership_id, "revoked", user.get("username")
+    )
+    conn.close()
+    create_notification(
+        membership["username"],
+        "customer",
+        "access_revoked",
+        "Access revoked",
+        f"Your access to {membership.get('tenant_name', 'the business')} was revoked.",
+        link="/select-business",
+        priority="high",
+    )
+    return {"status": "revoked", "membership": updated}
+
+
+@app.post("/api/session/active-tenant")
+async def set_active_tenant(request: Request, user=Depends(require_api_auth("customer"))):
+    verify_csrf(request)
+    data = await request.json()
+    tenant_id = data.get("tenant_id")
+    if tenant_id is None:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+    conn = get_db()
+    membership = get_membership(conn, user.get("username"), int(tenant_id))
+    if not membership or membership["status"] != "approved" or not membership.get("tenant_active", True):
+        conn.close()
+        raise HTTPException(status_code=403, detail="No approved access to this business")
+    conn.close()
+    token = create_session_token(
+        user.get("username"),
+        user.get("role"),
+        auth_provider=user.get("auth_provider", "local"),
+        active_tenant_id=int(tenant_id),
+        tenant_id=int(tenant_id),
+    )
+    response = JSONResponse({"status": "ok", "active_tenant_id": int(tenant_id)})
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        secure=ENFORCE_HTTPS,
+        samesite="strict",
+        max_age=86400,
+    )
+    return response
+
+
+@app.get("/select-business", response_class=HTMLResponse)
+def select_business_page(request: Request, user=Depends(require_login("customer"))):
+    return templates.TemplateResponse(
+        "select_business.html",
+        {"request": request, "user": user},
+    )
+
+
+@app.get("/superadmin", response_class=HTMLResponse)
+def superadmin_page(request: Request, user=Depends(require_login("superadmin"))):
+    return templates.TemplateResponse(
+        "superadmin.html",
+        {"request": request, "user": user},
+    )
+
+
+@app.get("/admin/access-requests", response_class=HTMLResponse)
+def admin_access_requests_page(request: Request, user=Depends(require_login("admin"))):
+    return templates.TemplateResponse(
+        "admin_access_requests.html",
+        {"request": request, "user": user},
+    )
+
+
+@app.post("/api/tenants/{tenant_id}/settings")
+async def update_tenant_settings_api(
+    request: Request,
+    tenant_id: int,
+    user=Depends(require_api_role("superadmin")),
+):
+    verify_csrf(request)
+    data = await request.json()
+    allow_multiple = 1 if data.get("allow_multiple_admins") else 0
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE tenants SET allow_multiple_admins=? WHERE id=?",
+        (allow_multiple, int(tenant_id)),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "updated", "allow_multiple_admins": bool(allow_multiple)}
 
 
 # Employee-specific customer activation/deactivation
@@ -2771,18 +3494,79 @@ async def proxy_upload_rag(request: Request, file: UploadFile = File(...), user=
         raise HTTPException(status_code=500, detail=f"Failed to forward uploaded document: {str(e)}")
 
 
+# ========== TENANT-AWARE KNOWLEDGE ASSET HELPERS ==========
+def _assets_root() -> Path:
+    """Root assets directory shared by all tenants (each tenant gets a subdir)."""
+    return Path(__file__).resolve().parent.parent / 'backend' / 'assets'
+
+
+def _user_tenant_id(user) -> int:
+    """Resolve the caller's tenant id from the session payload (default fallback)."""
+    try:
+        role = str((user or {}).get("role") or "").lower()
+        if role == "customer" and (user or {}).get("active_tenant_id") is not None:
+            tid = int(user.get("active_tenant_id"))
+            return tid if tid > 0 else DEFAULT_TENANT_ID
+        tid = int((user or {}).get("tenant_id"))
+        return tid if tid > 0 else DEFAULT_TENANT_ID
+    except (TypeError, ValueError):
+        return DEFAULT_TENANT_ID
+
+
+def _tenant_assets_dir(user) -> Path:
+    """Per-tenant uploads directory (mirrors config.tenant_assets_dir on the RAG side)."""
+    return _assets_root() / f"tenant_{_user_tenant_id(user)}"
+
+
+def _knowledge_search_dirs(user) -> list:
+    """Directories to inspect for a tenant's documents.
+
+    The tenant's own subdir is authoritative. For the default tenant we also
+    include the assets root so legacy files (uploaded before multi-tenancy, or
+    not yet moved by the migration) still appear.
+    """
+    dirs = [_tenant_assets_dir(user)]
+    if _user_tenant_id(user) == DEFAULT_TENANT_ID:
+        dirs.append(_assets_root())
+    return dirs
+
+
+def _resolve_tenant_asset_file(user, filename):
+    """Locate a stored asset for this tenant. Checks the tenant subdir first,
+    then (default tenant only) the legacy root. Returns a resolved Path or None.
+    Path-traversal safe: only the basename is used."""
+    name = Path(str(filename or "")).name
+    if not name:
+        return None
+    for base in _knowledge_search_dirs(user):
+        candidate = base / name
+        try:
+            rp = candidate.resolve()
+            if not str(rp).startswith(str(base.resolve())):
+                continue
+            if rp.exists() and rp.is_file():
+                return rp
+        except Exception:
+            continue
+    return None
+
+
 @app.get("/api/knowledge/files")
 def list_knowledge_files(request: Request, user=Depends(require_api_role("admin", "employee"))):
-    """List all files in the knowledge base assets directory."""
-    assets_dir = Path(__file__).resolve().parent.parent / 'backend' / 'assets'
-    if not assets_dir.exists():
-        return []
-    
+    """List all files in the caller's tenant knowledge base assets directory."""
     files = []
-    for file_path in assets_dir.iterdir():
-        if file_path.is_file() and file_path.suffix.lower() in ['.txt', '.pdf', '.md']:
-            stat = file_path.stat()
+    seen = set()
+    for assets_dir in _knowledge_search_dirs(user):
+        if not assets_dir.exists():
+            continue
+        for file_path in assets_dir.iterdir():
+            if not (file_path.is_file() and file_path.suffix.lower() in ['.txt', '.pdf', '.md']):
+                continue
             stored_name = file_path.name
+            if stored_name in seen:
+                continue  # tenant subdir wins over legacy root
+            seen.add(stored_name)
+            stat = file_path.stat()
             files.append({
                 "name": stored_name,
                 "stored_name": stored_name,
@@ -2812,19 +3596,9 @@ async def proxy_kb_status(request: Request, user=Depends(require_api_role("admin
 
 @app.get("/api/knowledge/files/{filename}")
 def get_knowledge_file_content(request: Request, filename: str, user=Depends(require_role("admin", "employee"))):
-    """Get the content of a knowledge base file."""
-    assets_dir = Path(__file__).resolve().parent.parent / 'backend' / 'assets'
-    file_path = assets_dir / filename
-    
-    # Security check: ensure the file is within assets directory
-    try:
-        file_path = file_path.resolve()
-        if not str(file_path).startswith(str(assets_dir.resolve())):
-            raise HTTPException(status_code=403, detail="Access denied")
-    except Exception:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    if not file_path.exists() or not file_path.is_file():
+    """Get the content of a knowledge base file (scoped to the caller's tenant)."""
+    file_path = _resolve_tenant_asset_file(user, filename)
+    if file_path is None:
         raise HTTPException(status_code=404, detail="File not found")
     
     display_name = _display_filename(filename)
@@ -2855,19 +3629,9 @@ def get_knowledge_file_content(request: Request, filename: str, user=Depends(req
 
 @app.get("/api/knowledge/files/{filename}/download")
 def download_knowledge_file(request: Request, filename: str, inline: bool = False, user=Depends(require_role("admin", "employee"))):
-    """Download a knowledge base file."""
-    assets_dir = Path(__file__).resolve().parent.parent / 'backend' / 'assets'
-    file_path = assets_dir / filename
-    
-    # Security check
-    try:
-        file_path = file_path.resolve()
-        if not str(file_path).startswith(str(assets_dir.resolve())):
-            raise HTTPException(status_code=403, detail="Access denied")
-    except Exception:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    if not file_path.exists() or not file_path.is_file():
+    """Download a knowledge base file (scoped to the caller's tenant)."""
+    file_path = _resolve_tenant_asset_file(user, filename)
+    if file_path is None:
         raise HTTPException(status_code=404, detail="File not found")
     
     suffix = file_path.suffix.lower()
@@ -2884,18 +3648,9 @@ def download_knowledge_file(request: Request, filename: str, inline: bool = Fals
 
 @app.get("/api/knowledge/files/{filename}/preview")
 def preview_knowledge_pdf(request: Request, filename: str, user=Depends(require_role("admin", "employee"))):
-    """Serve PDF as inline content for in-browser preview iframe."""
-    assets_dir = Path(__file__).resolve().parent.parent / 'backend' / 'assets'
-    file_path = assets_dir / filename
-
-    try:
-        file_path = file_path.resolve()
-        if not str(file_path).startswith(str(assets_dir.resolve())):
-            raise HTTPException(status_code=403, detail="Access denied")
-    except Exception:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    if not file_path.exists() or not file_path.is_file():
+    """Serve PDF as inline content for in-browser preview iframe (tenant-scoped)."""
+    file_path = _resolve_tenant_asset_file(user, filename)
+    if file_path is None:
         raise HTTPException(status_code=404, detail="File not found")
 
     if file_path.suffix.lower() != '.pdf':
@@ -2910,18 +3665,9 @@ def preview_knowledge_pdf(request: Request, filename: str, user=Depends(require_
 
 @app.get("/api/knowledge/files/{filename}/pdf-data")
 def get_knowledge_pdf_data(request: Request, filename: str, user=Depends(require_role("admin", "employee"))):
-    """Return PDF bytes as base64 for reliable in-browser rendering."""
-    assets_dir = Path(__file__).resolve().parent.parent / 'backend' / 'assets'
-    file_path = assets_dir / filename
-
-    try:
-        file_path = file_path.resolve()
-        if not str(file_path).startswith(str(assets_dir.resolve())):
-            raise HTTPException(status_code=403, detail="Access denied")
-    except Exception:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    if not file_path.exists() or not file_path.is_file():
+    """Return PDF bytes as base64 for reliable in-browser rendering (tenant-scoped)."""
+    file_path = _resolve_tenant_asset_file(user, filename)
+    if file_path is None:
         raise HTTPException(status_code=404, detail="File not found")
 
     if file_path.suffix.lower() != '.pdf':
@@ -2939,19 +3685,12 @@ def get_knowledge_pdf_data(request: Request, filename: str, user=Depends(require
 async def update_knowledge_file(request: Request, filename: str, user=Depends(require_login("admin"))):
     """Proxy text-file updates to the RAG server, the ingestion owner."""
     verify_csrf(request)
-    
-    assets_dir = Path(__file__).resolve().parent.parent / 'backend' / 'assets'
-    file_path = assets_dir / filename
-    
-    # Security check
-    try:
-        file_path = file_path.resolve()
-        if not str(file_path).startswith(str(assets_dir.resolve())):
-            raise HTTPException(status_code=403, detail="Access denied")
-    except Exception:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    if file_path.suffix.lower() != '.txt':
+
+    # Path-traversal safety: only operate on the basename.
+    safe_name = Path(str(filename or "")).name
+    if not safe_name or safe_name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if Path(safe_name).suffix.lower() != '.txt':
         raise HTTPException(status_code=400, detail="Can only edit text files")
     
     data = await request.json()
@@ -2960,12 +3699,15 @@ async def update_knowledge_file(request: Request, filename: str, user=Depends(re
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             async with session.put(
-                f"{RAG_HTTP_BASE}/rag/files/{filename}",
+                f"{RAG_HTTP_BASE}/rag/files/{safe_name}",
                 json={"content": content},
                 headers=_rag_proxy_headers(request),
             ) as resp:
                 data = await _rag_json_or_error(resp)
-                _PDF_TEXT_CACHE.pop(str(file_path), None)
+                # Evict any cached extracted text for this tenant's copy.
+                _resolved = _resolve_tenant_asset_file(user, safe_name)
+                if _resolved is not None:
+                    _PDF_TEXT_CACHE.pop(str(_resolved), None)
                 return data
     except HTTPException:
         raise
@@ -2980,26 +3722,24 @@ async def delete_knowledge_file(request: Request, filename: str, user=Depends(re
     """Proxy deletion to the RAG server, which owns assets and Chroma cleanup."""
     verify_csrf(request)
 
-    assets_dir = Path(__file__).resolve().parent.parent / 'backend' / 'assets'
-    file_path = assets_dir / filename
+    # Path-traversal safety: only operate on the basename.
+    safe_name = Path(str(filename or "")).name
+    if not safe_name or safe_name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
-    # Security check
-    try:
-        file_path = file_path.resolve()
-        if not str(file_path).startswith(str(assets_dir.resolve())):
-            raise HTTPException(status_code=403, detail="Access denied")
-    except Exception:
-        raise HTTPException(status_code=404, detail="File not found")
+    # Resolve the tenant's copy (best-effort) for cache eviction before delete.
+    _resolved = _resolve_tenant_asset_file(user, safe_name)
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
             async with session.post(
                 f"{RAG_HTTP_BASE}/rag/delete",
-                params={"doc_prefix": filename},
+                params={"doc_prefix": safe_name},
                 headers=_rag_proxy_headers(request),
             ) as resp:
                 data = await _rag_json_or_error(resp)
-                _PDF_TEXT_CACHE.pop(str(file_path), None)
+                if _resolved is not None:
+                    _PDF_TEXT_CACHE.pop(str(_resolved), None)
                 return data
     except HTTPException:
         raise
@@ -3680,6 +4420,12 @@ async def websocket_proxy(websocket: WebSocket):
         "role": user.get("role")
     })
 
+    # Forward the browser's session cookie to the RAG server so it can resolve
+    # the authenticated user + tenant_id for this socket (per-tenant routing).
+    # Without this the RAG /ws sees an anonymous connection.
+    _ws_cookie = websocket.headers.get("cookie")
+    _ws_fwd_headers = {"Cookie": _ws_cookie} if _ws_cookie else None
+
     # Open a websocket client connection to the RAG server and bridge messages
     try:
         async with aiohttp.ClientSession() as session:
@@ -3689,7 +4435,7 @@ async def websocket_proxy(websocket: WebSocket):
             max_attempts = 5
             for attempt in range(1, max_attempts + 1):
                 try:
-                    backend_ws = await session.ws_connect(RAG_WS_URL, timeout=3)
+                    backend_ws = await session.ws_connect(RAG_WS_URL, headers=_ws_fwd_headers, timeout=3)
                     break
                 except Exception as e:
                     # Log and retry with a small backoff
@@ -3887,7 +4633,13 @@ async def create_support_ticket(request: Request, user=Depends(require_api_auth(
         raise HTTPException(status_code=404, detail="User not found")
     
     customer_id = customer_row[0]
-    
+
+    # Scope the ticket to the customer's active business so only that tenant's
+    # staff can ever see or act on it.
+    ticket_tenant_id = int(
+        user.get("active_tenant_id") or user.get("tenant_id") or DEFAULT_TENANT_ID
+    )
+
     # Generate ticket number
     ticket_number = generate_ticket_number()
     
@@ -3897,9 +4649,9 @@ async def create_support_ticket(request: Request, user=Depends(require_api_auth(
     # Create ticket
     c.execute("""
         INSERT INTO support_tickets 
-        (ticket_number, customer_id, customer_username, subject, description, status, priority, assigned_to_role)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (ticket_number, customer_id, user.get("username"), subject, description, "open", priority, assigned_to_role))
+        (ticket_number, customer_id, customer_username, subject, description, status, priority, assigned_to_role, tenant_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (ticket_number, customer_id, user.get("username"), subject, description, "open", priority, assigned_to_role, ticket_tenant_id))
     
     ticket_id = c.lastrowid
     
@@ -3913,8 +4665,11 @@ async def create_support_ticket(request: Request, user=Depends(require_api_auth(
         VALUES (?, ?, ?, ?)
     """, (ticket_id, user.get("username"), user.get("role"), description))
     
-    # Notify all employees
-    c.execute("SELECT username FROM users WHERE role='employee' AND active=1")
+    # Notify only employees of THIS business (tenant isolation).
+    c.execute(
+        "SELECT username FROM users WHERE role='employee' AND active=1 AND tenant_id=?",
+        (ticket_tenant_id,),
+    )
     employees = c.fetchall()
     for (emp_username,) in employees:
         create_notification(
@@ -3961,13 +4716,15 @@ def get_my_tickets(request: Request, user=Depends(require_api_auth())):
             ORDER BY created_at DESC
         """, (user.get("username"),))
     elif user.get("role") == "employee":
-        # Employees see tickets assigned to them or unassigned (not escalated to admin only)
+        # Employees see tickets for THEIR business assigned to them or unassigned
+        _tid = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
         c.execute("""
             SELECT id, ticket_number, subject, description, status, priority,
                    customer_username, assigned_to, created_at, updated_at, escalated_to_admin
             FROM support_tickets
             WHERE (assigned_to_role='employee' OR assigned_to IS NULL OR assigned_to=?) 
               AND escalated_to_admin=0
+              AND tenant_id=?
             ORDER BY 
                 CASE priority 
                     WHEN 'urgent' THEN 1
@@ -3976,13 +4733,15 @@ def get_my_tickets(request: Request, user=Depends(require_api_auth())):
                     WHEN 'low' THEN 4
                 END,
                 created_at DESC
-        """, (user.get("username"),))
+        """, (user.get("username"), _tid))
     elif user.get("role") == "admin":
-        # Admins see all tickets
+        # Admins see all tickets for THEIR business only
+        _tid = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
         c.execute("""
             SELECT id, ticket_number, subject, description, status, priority,
                    customer_username, assigned_to, assigned_to_role, created_at, updated_at, escalated_to_admin
             FROM support_tickets
+            WHERE tenant_id=?
             ORDER BY 
                 CASE WHEN escalated_to_admin=1 THEN 0 ELSE 1 END,
                 CASE priority 
@@ -3992,7 +4751,7 @@ def get_my_tickets(request: Request, user=Depends(require_api_auth())):
                     WHEN 'low' THEN 4
                 END,
                 created_at DESC
-        """)
+        """, (_tid,))
     else:
         conn.close()
         return {"tickets": []}
@@ -4043,7 +4802,7 @@ def get_ticket_details(ticket_id: int, request: Request, user=Depends(require_lo
     c.execute("""
         SELECT id, ticket_number, customer_id, customer_username, subject, description,
                status, priority, assigned_to, assigned_to_role, created_at, updated_at,
-               resolved_at, escalated_to_admin, resolution_notes
+               resolved_at, escalated_to_admin, resolution_notes, tenant_id
         FROM support_tickets
         WHERE id=?
     """, (ticket_id,))
@@ -4054,9 +4813,16 @@ def get_ticket_details(ticket_id: int, request: Request, user=Depends(require_lo
         raise HTTPException(status_code=404, detail="Ticket not found")
     
     # Verify access
-    if user.get("role") == "customer" and ticket_row[3] != user.get("username"):
+    _role = str(user.get("role") or "").lower()
+    if _role == "customer" and ticket_row[3] != user.get("username"):
         conn.close()
         raise HTTPException(status_code=403, detail="Access denied")
+    # Staff (admin/employee) may only access tickets within their own business.
+    if _role in ("admin", "employee"):
+        _ticket_tenant = ticket_row[15] if len(ticket_row) > 15 and ticket_row[15] is not None else DEFAULT_TENANT_ID
+        if int(_ticket_tenant) != int(user.get("tenant_id") or DEFAULT_TENANT_ID):
+            conn.close()
+            raise HTTPException(status_code=403, detail="Access denied")
     
     # Get messages
     c.execute("""
@@ -4124,18 +4890,25 @@ async def add_ticket_message(ticket_id: int, request: Request, user=Depends(requ
     c = conn.cursor()
     
     # Verify ticket exists and get customer info
-    c.execute("SELECT customer_username, assigned_to, status FROM support_tickets WHERE id=?", (ticket_id,))
+    c.execute("SELECT customer_username, assigned_to, status, tenant_id FROM support_tickets WHERE id=?", (ticket_id,))
     ticket_row = c.fetchone()
     if not ticket_row:
         conn.close()
         raise HTTPException(status_code=404, detail="Ticket not found")
     
-    customer_username, assigned_to, status = ticket_row
+    customer_username, assigned_to, status, ticket_tenant_id = ticket_row
     
     # Verify access
-    if user.get("role") == "customer" and customer_username != user.get("username"):
+    _role = str(user.get("role") or "").lower()
+    if _role == "customer" and customer_username != user.get("username"):
         conn.close()
         raise HTTPException(status_code=403, detail="Access denied")
+    # Staff may only act on tickets within their own business.
+    if _role in ("admin", "employee"):
+        _tt = ticket_tenant_id if ticket_tenant_id is not None else DEFAULT_TENANT_ID
+        if int(_tt) != int(user.get("tenant_id") or DEFAULT_TENANT_ID):
+            conn.close()
+            raise HTTPException(status_code=403, detail="Access denied")
     
     # Add message
     c.execute("""
@@ -4404,32 +5177,33 @@ async def mark_all_read(request: Request, user=Depends(require_login())):
 
 @app.get("/api/admin/support/summary")
 def get_admin_support_summary(request: Request, user=Depends(require_role("admin"))):
-    """Get support ticket summary for admin dashboard"""
+    """Get support ticket summary for the admin's own business."""
     conn = get_db()
     c = conn.cursor()
+    _tid = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
     
     # Total tickets
-    c.execute("SELECT COUNT(*) FROM support_tickets")
+    c.execute("SELECT COUNT(*) FROM support_tickets WHERE tenant_id=?", (_tid,))
     total_tickets = c.fetchone()[0]
     
     # Open tickets
-    c.execute("SELECT COUNT(*) FROM support_tickets WHERE status='open'")
+    c.execute("SELECT COUNT(*) FROM support_tickets WHERE status='open' AND tenant_id=?", (_tid,))
     open_tickets = c.fetchone()[0]
     
     # Escalated tickets
-    c.execute("SELECT COUNT(*) FROM support_tickets WHERE escalated_to_admin=1 AND status!='resolved'")
+    c.execute("SELECT COUNT(*) FROM support_tickets WHERE escalated_to_admin=1 AND status!='resolved' AND tenant_id=?", (_tid,))
     escalated_tickets = c.fetchone()[0]
     
     # Resolved today
-    c.execute("SELECT COUNT(*) FROM support_tickets WHERE DATE(resolved_at)=DATE('now')")
+    c.execute("SELECT COUNT(*) FROM support_tickets WHERE DATE(resolved_at)=DATE('now') AND tenant_id=?", (_tid,))
     resolved_today = c.fetchone()[0]
     
     # Tickets by priority
     c.execute("""
         SELECT priority, COUNT(*) FROM support_tickets 
-        WHERE status!='resolved'
+        WHERE status!='resolved' AND tenant_id=?
         GROUP BY priority
-    """)
+    """, (_tid,))
     by_priority = {row[0]: row[1] for row in c.fetchall()}
     
     # Recent negative feedback without tickets

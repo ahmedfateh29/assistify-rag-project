@@ -6,7 +6,38 @@ except Exception:
     from pathlib import Path as _P
     ANALYTICS_DB = _P(__file__).resolve().parent / "analytics.db"
 
+try:
+    from config import DEFAULT_TENANT_ID
+except Exception:
+    DEFAULT_TENANT_ID = 1
+
 ANALYTICS_DB = str(ANALYTICS_DB)
+
+
+def _coerce_tenant_id(tenant_id) -> int:
+    try:
+        tid = int(tenant_id)
+    except (TypeError, ValueError):
+        return DEFAULT_TENANT_ID
+    return tid if tid > 0 else DEFAULT_TENANT_ID
+
+
+def _ensure_tenant_column(cursor, table: str):
+    """Add tenant_id to an existing analytics table and backfill default tenant."""
+    try:
+        cursor.execute(f"PRAGMA table_info({table})")
+        cols = [row[1] for row in cursor.fetchall()]
+        if "tenant_id" not in cols:
+            cursor.execute(
+                f"ALTER TABLE {table} ADD COLUMN tenant_id INTEGER DEFAULT {DEFAULT_TENANT_ID}"
+            )
+            cursor.execute(
+                f"UPDATE {table} SET tenant_id=? WHERE tenant_id IS NULL",
+                (DEFAULT_TENANT_ID,),
+            )
+    except Exception:
+        pass
+
 
 def init_analytics_db():
     conn = sqlite3.connect(ANALYTICS_DB)
@@ -17,6 +48,7 @@ def init_analytics_db():
         CREATE TABLE IF NOT EXISTS usage_stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            tenant_id INTEGER DEFAULT 1,
             username TEXT,
             user_role TEXT,
             query_text TEXT,
@@ -34,6 +66,7 @@ def init_analytics_db():
         CREATE TABLE IF NOT EXISTS satisfaction_ratings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            tenant_id INTEGER DEFAULT 1,
             username TEXT,
             user_role TEXT,
             query_id INTEGER,
@@ -63,6 +96,7 @@ def init_analytics_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_start DATETIME DEFAULT CURRENT_TIMESTAMP,
             session_end DATETIME,
+            tenant_id INTEGER DEFAULT 1,
             username TEXT,
             user_role TEXT,
             queries_count INTEGER DEFAULT 0,
@@ -76,6 +110,7 @@ def init_analytics_db():
         CREATE TABLE IF NOT EXISTS kb_document_versions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            tenant_id INTEGER DEFAULT 1,
             action TEXT,
             filename TEXT,
             chunks_added INTEGER DEFAULT 0,
@@ -85,49 +120,61 @@ def init_analytics_db():
         )
     """)
 
+    # Backfill tenant_id for databases created before multi-tenancy.
+    for _tbl in ("usage_stats", "satisfaction_ratings", "session_analytics", "kb_document_versions"):
+        _ensure_tenant_column(c, _tbl)
+
     conn.commit()
     conn.close()
 
 
 def log_usage(username, user_role, query_text, response_status="success", error_message=None, 
-              response_time_ms=0, rag_docs_found=0, query_length=0, response_length=0):
+              response_time_ms=0, rag_docs_found=0, query_length=0, response_length=0, tenant_id=None):
     """Enhanced usage logging with performance metrics"""
     conn = sqlite3.connect(ANALYTICS_DB)
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO usage_stats (username, user_role, query_text, response_status, error_message,
+        INSERT INTO usage_stats (tenant_id, username, user_role, query_text, response_status, error_message,
                                 response_time_ms, rag_docs_found, query_length, response_length)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (username, user_role, query_text, response_status, error_message,
+        (_coerce_tenant_id(tenant_id), username, user_role, query_text, response_status, error_message,
          response_time_ms, rag_docs_found, query_length, response_length),
     )
     conn.commit()
     conn.close()
 
 
-def log_satisfaction(username, user_role, rating, feedback_text=None, query_id=None):
+def log_satisfaction(username, user_role, rating, feedback_text=None, query_id=None, tenant_id=None):
     """Log user satisfaction rating"""
     conn = sqlite3.connect(ANALYTICS_DB)
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO satisfaction_ratings (username, user_role, query_id, rating, feedback_text)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO satisfaction_ratings (tenant_id, username, user_role, query_id, rating, feedback_text)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (username, user_role, query_id, rating, feedback_text),
+        (_coerce_tenant_id(tenant_id), username, user_role, query_id, rating, feedback_text),
     )
     conn.commit()
     conn.close()
 
 
-def get_comprehensive_analytics(days=30):
-    """Get comprehensive analytics for dashboard"""
+def get_comprehensive_analytics(days=30, tenant_id=None):
+    """Get comprehensive analytics for dashboard (optionally scoped to one tenant)"""
     conn = sqlite3.connect(ANALYTICS_DB)
     c = conn.cursor()
     
     cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+
+    # Optional tenant scope appended to each WHERE clause.
+    if tenant_id is None:
+        tclause = ""
+        tparam = ()
+    else:
+        tclause = " AND tenant_id = ?"
+        tparam = (_coerce_tenant_id(tenant_id),)
     
     # Query success rate
     c.execute("""
@@ -137,8 +184,7 @@ def get_comprehensive_analytics(days=30):
             ROUND(AVG(response_time_ms), 2) as avg_response_time,
             ROUND(AVG(CASE WHEN response_status = 'success' THEN response_time_ms END), 2) as avg_success_time
         FROM usage_stats
-        WHERE timestamp > ?
-    """, (cutoff_date,))
+        WHERE timestamp > ?""" + tclause, (cutoff_date, *tparam))
     query_stats = c.fetchone()
     
     # Usage by role
@@ -146,21 +192,21 @@ def get_comprehensive_analytics(days=30):
         SELECT user_role, COUNT(*) as count,
                ROUND(AVG(response_time_ms), 2) as avg_time
         FROM usage_stats
-        WHERE timestamp > ?
+        WHERE timestamp > ?""" + tclause + """
         GROUP BY user_role
         ORDER BY count DESC
-    """, (cutoff_date,))
+    """, (cutoff_date, *tparam))
     usage_by_role = c.fetchall()
     
     # Top errors
     c.execute("""
         SELECT error_message, COUNT(*) as count
         FROM usage_stats
-        WHERE response_status != 'success' AND timestamp > ?
+        WHERE response_status != 'success' AND timestamp > ?""" + tclause + """
         GROUP BY error_message
         ORDER BY count DESC
         LIMIT 10
-    """, (cutoff_date,))
+    """, (cutoff_date, *tparam))
     top_errors = c.fetchall()
     
     # Average satisfaction rating
@@ -170,8 +216,7 @@ def get_comprehensive_analytics(days=30):
             COUNT(*) as total_ratings,
             SUM(CASE WHEN rating >= 4 THEN 1 ELSE 0 END) as positive_ratings
         FROM satisfaction_ratings
-        WHERE timestamp > ?
-    """, (cutoff_date,))
+        WHERE timestamp > ?""" + tclause, (cutoff_date, *tparam))
     satisfaction = c.fetchone()
     
     # RAG performance
@@ -181,8 +226,7 @@ def get_comprehensive_analytics(days=30):
             SUM(CASE WHEN rag_docs_found > 0 THEN 1 ELSE 0 END) as queries_with_docs,
             COUNT(*) as total_queries
         FROM usage_stats
-        WHERE timestamp > ?
-    """, (cutoff_date,))
+        WHERE timestamp > ?""" + tclause, (cutoff_date, *tparam))
     rag_stats = c.fetchone()
     
     # Hourly distribution
@@ -191,10 +235,10 @@ def get_comprehensive_analytics(days=30):
             strftime('%H', timestamp) as hour,
             COUNT(*) as count
         FROM usage_stats
-        WHERE timestamp > ?
+        WHERE timestamp > ?""" + tclause + """
         GROUP BY hour
         ORDER BY hour
-    """, (cutoff_date,))
+    """, (cutoff_date, *tparam))
     hourly_distribution = c.fetchall()
     
     # Daily trend (last 7 days)
@@ -204,10 +248,10 @@ def get_comprehensive_analytics(days=30):
             COUNT(*) as total_queries,
             SUM(CASE WHEN response_status = 'success' THEN 1 ELSE 0 END) as successful_queries
         FROM usage_stats
-        WHERE timestamp > datetime('now', '-7 days')
+        WHERE timestamp > datetime('now', '-7 days')""" + tclause + """
         GROUP BY day
         ORDER BY day DESC
-    """)
+    """, tparam)
     daily_trend = c.fetchall()
     
     conn.close()
@@ -242,22 +286,34 @@ def get_comprehensive_analytics(days=30):
     }
 
 
-def get_summary(limit=100):
+def get_summary(limit=100, tenant_id=None):
     conn = sqlite3.connect(ANALYTICS_DB)
     c = conn.cursor()
-    c.execute("SELECT user_role, COUNT(*) FROM usage_stats GROUP BY user_role")
+    if tenant_id is None:
+        c.execute("SELECT user_role, COUNT(*) FROM usage_stats GROUP BY user_role")
+    else:
+        c.execute(
+            "SELECT user_role, COUNT(*) FROM usage_stats WHERE tenant_id = ? GROUP BY user_role",
+            (_coerce_tenant_id(tenant_id),),
+        )
     data = c.fetchall()
     conn.close()
     return data
 
 
-def get_recent_errors(limit=50):
+def get_recent_errors(limit=50, tenant_id=None):
     conn = sqlite3.connect(ANALYTICS_DB)
     c = conn.cursor()
-    c.execute(
-        "SELECT timestamp, username, error_message FROM usage_stats WHERE response_status != 'success' ORDER BY timestamp DESC LIMIT ?",
-        (limit,),
-    )
+    if tenant_id is None:
+        c.execute(
+            "SELECT timestamp, username, error_message FROM usage_stats WHERE response_status != 'success' ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        )
+    else:
+        c.execute(
+            "SELECT timestamp, username, error_message FROM usage_stats WHERE response_status != 'success' AND tenant_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (_coerce_tenant_id(tenant_id), limit),
+        )
     rows = c.fetchall()
     conn.close()
     return rows
@@ -266,7 +322,7 @@ def get_recent_errors(limit=50):
 # ========== KNOWLEDGE BASE EVENT TRACKING ==========
 
 def log_kb_event(action: str, filename: str, chunks_added: int = 0, chunks_deleted: int = 0,
-                 kb_version: int = 0, triggered_by: str = "system"):
+                 kb_version: int = 0, triggered_by: str = "system", tenant_id=None):
     """Log a knowledge base document mutation event.
 
     Args:
@@ -276,15 +332,16 @@ def log_kb_event(action: str, filename: str, chunks_added: int = 0, chunks_delet
         chunks_deleted: Number of old chunks removed
         kb_version: Global KB version counter at time of event
         triggered_by: 'admin', 'watcher', or 'system'
+        tenant_id: Owning tenant (defaults to the canonical tenant)
     """
     try:
         conn = sqlite3.connect(ANALYTICS_DB)
         c = conn.cursor()
         c.execute(
             """INSERT INTO kb_document_versions
-               (action, filename, chunks_added, chunks_deleted, kb_version, triggered_by)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (action, filename, chunks_added, chunks_deleted, kb_version, triggered_by),
+               (tenant_id, action, filename, chunks_added, chunks_deleted, kb_version, triggered_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (_coerce_tenant_id(tenant_id), action, filename, chunks_added, chunks_deleted, kb_version, triggered_by),
         )
         conn.commit()
         conn.close()
@@ -292,18 +349,28 @@ def log_kb_event(action: str, filename: str, chunks_added: int = 0, chunks_delet
         pass  # Analytics must never crash the caller
 
 
-def get_kb_events(limit: int = 100) -> list:
-    """Return recent KB mutation events, newest first."""
+def get_kb_events(limit: int = 100, tenant_id=None) -> list:
+    """Return recent KB mutation events, newest first (optionally per tenant)."""
     try:
         conn = sqlite3.connect(ANALYTICS_DB)
         c = conn.cursor()
-        c.execute(
-            """SELECT id, timestamp, action, filename, chunks_added, chunks_deleted,
-                      kb_version, triggered_by
-               FROM kb_document_versions
-               ORDER BY id DESC LIMIT ?""",
-            (limit,),
-        )
+        if tenant_id is None:
+            c.execute(
+                """SELECT id, timestamp, action, filename, chunks_added, chunks_deleted,
+                          kb_version, triggered_by
+                   FROM kb_document_versions
+                   ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            )
+        else:
+            c.execute(
+                """SELECT id, timestamp, action, filename, chunks_added, chunks_deleted,
+                          kb_version, triggered_by
+                   FROM kb_document_versions
+                   WHERE tenant_id = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (_coerce_tenant_id(tenant_id), limit),
+            )
         rows = c.fetchall()
         conn.close()
         return [
@@ -318,34 +385,41 @@ def get_kb_events(limit: int = 100) -> list:
         return []
 
 
-def get_kb_stats(days: int = 30) -> dict:
+def get_kb_stats(days: int = 30, tenant_id=None) -> dict:
     """Return KB-specific performance metrics for the monitoring dashboard."""
     try:
         conn = sqlite3.connect(ANALYTICS_DB)
         c = conn.cursor()
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
 
+        if tenant_id is None:
+            tclause = ""
+            tparam = ()
+        else:
+            tclause = " AND tenant_id = ?"
+            tparam = (_coerce_tenant_id(tenant_id),)
+
         # Total mutations in window
         c.execute(
-            "SELECT COUNT(*), MAX(timestamp) FROM kb_document_versions WHERE timestamp > ?",
-            (cutoff,)
+            "SELECT COUNT(*), MAX(timestamp) FROM kb_document_versions WHERE timestamp > ?" + tclause,
+            (cutoff, *tparam)
         )
         total_mutations, last_update = c.fetchone() or (0, None)
 
         # Mutations by action type
         c.execute(
             """SELECT action, COUNT(*) as cnt FROM kb_document_versions
-               WHERE timestamp > ? GROUP BY action ORDER BY cnt DESC""",
-            (cutoff,)
+               WHERE timestamp > ?""" + tclause + """ GROUP BY action ORDER BY cnt DESC""",
+            (cutoff, *tparam)
         )
         mutations_by_action = [{"action": r[0], "count": r[1]} for r in c.fetchall()]
 
         # Files changed most often
         c.execute(
             """SELECT filename, COUNT(*) as cnt FROM kb_document_versions
-               WHERE timestamp > ? AND filename != '*'
+               WHERE timestamp > ? AND filename != '*'""" + tclause + """
                GROUP BY filename ORDER BY cnt DESC LIMIT 10""",
-            (cutoff,)
+            (cutoff, *tparam)
         )
         top_files = [{"filename": r[0], "mutations": r[1]} for r in c.fetchall()]
 
@@ -354,8 +428,8 @@ def get_kb_stats(days: int = 30) -> dict:
             """SELECT COUNT(*) as total,
                       SUM(CASE WHEN rag_docs_found > 0 THEN 1 ELSE 0 END) as rag_hits,
                       ROUND(AVG(response_time_ms), 1) as avg_ms
-               FROM usage_stats WHERE timestamp > ?""",
-            (cutoff,)
+               FROM usage_stats WHERE timestamp > ?""" + tclause,
+            (cutoff, *tparam)
         )
         us = c.fetchone() or (0, 0, 0)
         total_q, rag_hits, avg_ms = us
@@ -365,13 +439,20 @@ def get_kb_stats(days: int = 30) -> dict:
         c.execute(
             """SELECT DATE(timestamp) as day, COUNT(*) as cnt
                FROM kb_document_versions
-               WHERE timestamp > datetime('now', '-14 days')
+               WHERE timestamp > datetime('now', '-14 days')""" + tclause + """
                GROUP BY day ORDER BY day""",
+            tparam,
         )
         daily_mutations = [{"day": r[0], "count": r[1]} for r in c.fetchall()]
 
         # Chunks: total added vs deleted (all time)
-        c.execute("SELECT SUM(chunks_added), SUM(chunks_deleted) FROM kb_document_versions")
+        if tenant_id is None:
+            c.execute("SELECT SUM(chunks_added), SUM(chunks_deleted) FROM kb_document_versions")
+        else:
+            c.execute(
+                "SELECT SUM(chunks_added), SUM(chunks_deleted) FROM kb_document_versions WHERE tenant_id = ?",
+                tparam,
+            )
         ca, cd = c.fetchone() or (0, 0)
 
         conn.close()

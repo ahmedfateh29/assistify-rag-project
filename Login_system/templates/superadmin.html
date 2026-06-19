@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <title>Super Admin - Assistify</title>
+    <style>
+        :root { --accent: #10a37f; --bg: #232323; --panel: #2b2b2b; --light: #fff; --muted: #9ca3af; --danger: #c44; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: var(--bg); color: var(--light); margin: 0; padding: 24px; }
+        .container { max-width: 1100px; margin: 0 auto; background: var(--panel); border-radius: 12px; padding: 24px; }
+        h1 { color: var(--accent); margin-top: 0; }
+        h3 { margin: 0 0 8px; color: var(--light); }
+        input, select { background: #171717; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 8px; margin: 4px 0; width: 100%; max-width: 320px; }
+        button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 16px; cursor: pointer; font-weight: 600; margin-top: 8px; }
+        button.secondary { background: #444; }
+        .card { background: #202020; border-radius: 10px; padding: 16px; margin: 12px 0; }
+        .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+        .muted { color: var(--muted); font-size: 0.9em; }
+        .summary-bar { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+        .summary-item { background: #1a1a1a; border-radius: 8px; padding: 12px 16px; min-width: 140px; }
+        .summary-item strong { display: block; font-size: 1.4em; color: var(--accent); }
+        .tenant-header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+        .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 0.8em; font-weight: 600; }
+        .badge.active { background: #1f4d3a; color: #a7f3d0; }
+        .badge.inactive { background: #4d1f1f; color: #fca5a5; }
+        .details-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px 16px; margin: 12px 0; font-size: 0.9em; }
+        .details-grid dt { color: var(--muted); margin: 0; }
+        .details-grid dd { margin: 2px 0 0; }
+        .chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+        .chip { background: #2a2a2a; border: 1px solid #444; border-radius: 6px; padding: 4px 10px; font-size: 0.85em; }
+        .chip.pending { border-color: #b45309; color: #fcd34d; }
+        .chip.approved { border-color: #047857; color: #6ee7b7; }
+        .chip.rejected { border-color: #991b1b; color: #fca5a5; }
+        .chip.revoked { border-color: #6b7280; color: #d1d5db; }
+        .section { margin: 12px 0; border-top: 1px solid #333; padding-top: 10px; }
+        .section-toggle { background: none; border: none; color: var(--accent); padding: 0; margin: 0; font-weight: 600; cursor: pointer; font-size: 0.95em; text-align: left; }
+        .section-toggle:hover { text-decoration: underline; }
+        .user-table { width: 100%; border-collapse: collapse; font-size: 0.88em; margin-top: 8px; }
+        .user-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid #333; }
+        .user-table td { padding: 6px 8px; border-bottom: 1px solid #2a2a2a; }
+        .user-table tr:last-child td { border-bottom: none; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+        .status-dot.on { background: #10a37f; }
+        .status-dot.off { background: #666; }
+        .empty-msg { color: var(--muted); font-size: 0.88em; margin: 6px 0; font-style: italic; }
+        .section-body { margin-top: 6px; }
+        .section-body.collapsed { display: none; }
+    </style>
+    <script src="/static/security.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>Platform Super Admin</h1>
+        <p class="muted">Manage businesses, assign admins, and monitor the platform.</p>
+        <div id="summary" class="summary-bar"></div>
+        <div class="card">
+            <h3>Create Business</h3>
+            <div class="row">
+                <div><label>Name</label><input id="tenantName" placeholder="Acme Corp"></div>
+                <div><label>Slug</label><input id="tenantSlug" placeholder="acme-corp"></div>
+                <div><button onclick="createTenant()">Create</button></div>
+            </div>
+        </div>
+        <div id="tenants"></div>
+        <p><a href="/logout" style="color:var(--accent)">Logout</a></p>
+    </div>
+    <script>
+        let tenantList = [];
+
+        function csrf() {
+            return (window.Security && Security.getCSRFToken()) || '';
+        }
+
+        function apiHeaders(json) {
+            const headers = { 'X-CSRF-Token': csrf() };
+            if (json) headers['Content-Type'] = 'application/json';
+            return headers;
+        }
+
+        function escapeHtml(value) {
+            if (value == null) return '';
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function formatDate(value) {
+            if (!value) return '—';
+            const d = new Date(value);
+            return isNaN(d.getTime()) ? escapeHtml(value) : d.toLocaleString();
+        }
+
+        function activeLabel(active) {
+            return active
+                ? '<span class="status-dot on"></span>Active'
+                : '<span class="status-dot off"></span>Inactive';
+        }
+
+        function renderUserTable(users, emptyText) {
+            if (!users || !users.length) {
+                return `<p class="empty-msg">${escapeHtml(emptyText)}</p>`;
+            }
+            const rows = users.map(u => `
+                <tr>
+                    <td>${escapeHtml(u.username)}</td>
+                    <td>${escapeHtml(u.full_name || '—')}</td>
+                    <td>${escapeHtml(u.email || '—')}</td>
+                    <td>${u.active ? 'Yes' : 'No'}</td>
+                </tr>
+            `).join('');
+            return `<table class="user-table">
+                <thead><tr><th>Username</th><th>Full name</th><th>Email</th><th>Active</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        }
+
+        function renderCustomerTable(customers) {
+            if (!customers || !customers.length) {
+                return '<p class="empty-msg">No approved membership customers yet.</p>';
+            }
+            const rows = customers.map(u => `
+                <tr>
+                    <td>${escapeHtml(u.username)}</td>
+                    <td>${escapeHtml(u.full_name || '—')}</td>
+                    <td>${escapeHtml(u.email || '—')}</td>
+                    <td>${formatDate(u.approved_at)}</td>
+                    <td>${u.active ? 'Yes' : 'No'}</td>
+                </tr>
+            `).join('');
+            return `<table class="user-table">
+                <thead><tr><th>Username</th><th>Full name</th><th>Email</th><th>Approved</th><th>Active</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        }
+
+        function renderSection(tenantId, key, title, count, bodyHtml, expanded) {
+            const bodyId = `section_${tenantId}_${key}`;
+            const collapsed = expanded ? '' : ' collapsed';
+            const arrow = expanded ? '▼' : '▶';
+            return `
+                <div class="section">
+                    <button type="button" class="section-toggle" onclick="toggleSection('${bodyId}', this)">
+                        ${arrow} ${escapeHtml(title)} (${count})
+                    </button>
+                    <div id="${bodyId}" class="section-body${collapsed}">${bodyHtml}</div>
+                </div>
+            `;
+        }
+
+        function toggleSection(bodyId, btn) {
+            const body = document.getElementById(bodyId);
+            if (!body) return;
+            const collapsed = body.classList.toggle('collapsed');
+            const label = btn.textContent.replace(/^[▶▼]\s*/, '');
+            btn.textContent = (collapsed ? '▶ ' : '▼ ') + label;
+        }
+
+        function renderSummary(tenants) {
+            const totalUsers = tenants.reduce((sum, t) => sum + (t.user_count || 0), 0);
+            const pending = tenants.reduce((sum, t) => sum + ((t.membership_stats && t.membership_stats.pending) || 0), 0);
+            document.getElementById('summary').innerHTML = `
+                <div class="summary-item"><span class="muted">Businesses</span><strong>${tenants.length}</strong></div>
+                <div class="summary-item"><span class="muted">Total users</span><strong>${totalUsers}</strong></div>
+                <div class="summary-item"><span class="muted">Pending access requests</span><strong>${pending}</strong></div>
+            `;
+        }
+
+        function renderTenantCard(t) {
+            const stats = t.membership_stats || {};
+            const admins = t.admins || [];
+            const employees = t.employees || [];
+            const customers = t.membership_customers || [];
+            const rc = t.role_counts || {};
+
+            return `
+                <div class="card">
+                    <div class="tenant-header">
+                        <div>
+                            <strong style="font-size:1.15em">${escapeHtml(t.name)}</strong>
+                            <span class="muted"> (${escapeHtml(t.slug)})</span>
+                        </div>
+                        <span class="badge ${t.active ? 'active' : 'inactive'}">${t.active ? 'Active' : 'Inactive'}</span>
+                    </div>
+                    <dl class="details-grid">
+                        <div><dt>Tenant ID</dt><dd>${t.id}</dd></div>
+                        <div><dt>Plan</dt><dd>${escapeHtml(t.plan || 'standard')}</dd></div>
+                        <div><dt>Created</dt><dd>${formatDate(t.created_at)}</dd></div>
+                        <div><dt>Total users</dt><dd>${t.user_count || 0}</dd></div>
+                        <div><dt>Staff breakdown</dt><dd>${rc.admin || 0} admins, ${rc.employee || 0} employees, ${rc.customer || 0} customers</dd></div>
+                        <div><dt>Multiple admins</dt><dd>${t.allow_multiple_admins ? 'Allowed' : 'Single admin'}</dd></div>
+                    </dl>
+                    <div class="chips">
+                        <span class="chip pending">Pending: ${stats.pending || 0}</span>
+                        <span class="chip approved">Approved: ${stats.approved || 0}</span>
+                        <span class="chip rejected">Rejected: ${stats.rejected || 0}</span>
+                        <span class="chip revoked">Revoked: ${stats.revoked || 0}</span>
+                    </div>
+                    ${renderSection(t.id, 'admins', 'Admins', admins.length,
+                        renderUserTable(admins, 'No admins yet — use Add admin below.'), true)}
+                    ${renderSection(t.id, 'employees', 'Employees', employees.length,
+                        renderUserTable(employees, 'No employees for this business.'), false)}
+                    ${renderSection(t.id, 'customers', 'Approved customers', customers.length,
+                        renderCustomerTable(customers), false)}
+                    <label style="display:block;margin-top:12px">
+                        <input type="checkbox" ${t.allow_multiple_admins ? 'checked' : ''} onchange="toggleMultiAdmin(${t.id}, this.checked)">
+                        Allow multiple admins
+                    </label>
+                    <div class="row" style="margin-top:12px">
+                        <input id="adminUser_${t.id}" placeholder="Admin username">
+                        <input id="adminPass_${t.id}" type="password" placeholder="Password">
+                        <button onclick="createManager(${t.id})">Add admin</button>
+                        <button class="secondary" onclick="toggleTenant(${t.id}, ${t.active ? 'false' : 'true'})">${t.active ? 'Deactivate' : 'Activate'}</button>
+                    </div>
+                    <p class="muted" style="margin:8px 0 0">KB: log in as this business's admin to manage knowledge.</p>
+                </div>
+            `;
+        }
+
+        async function loadTenants() {
+            try {
+                const res = await fetch('/api/tenants', { credentials: 'same-origin' });
+                if (!res.ok) {
+                    alert(await Security.parseApiError(res));
+                    return;
+                }
+                tenantList = await res.json();
+                renderSummary(tenantList);
+                document.getElementById('tenants').innerHTML = tenantList.map(renderTenantCard).join('');
+            } catch (err) {
+                alert('Could not load businesses: ' + (err.message || err));
+            }
+        }
+
+        async function createTenant() {
+            const name = document.getElementById('tenantName').value.trim();
+            const slug = document.getElementById('tenantSlug').value.trim().toLowerCase();
+            if (!name || !slug) {
+                alert('Name and slug are required.');
+                return;
+            }
+            if (tenantList.some(t => t.slug === slug)) {
+                alert(`Business with slug "${slug}" already exists.`);
+                return;
+            }
+            try {
+                const res = await fetch('/api/tenants/create', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: apiHeaders(true),
+                    body: JSON.stringify({ name, slug })
+                });
+                if (!res.ok) {
+                    alert(await Security.parseApiError(res));
+                    return;
+                }
+                document.getElementById('tenantName').value = '';
+                document.getElementById('tenantSlug').value = '';
+                alert('Business created');
+                loadTenants();
+            } catch (err) {
+                alert('Create failed: ' + (err.message || err));
+            }
+        }
+
+        async function createManager(tenantId) {
+            const username = document.getElementById('adminUser_' + tenantId).value.trim();
+            const password = document.getElementById('adminPass_' + tenantId).value;
+            if (!username || !password) {
+                alert('Username and password are required.');
+                return;
+            }
+            try {
+                const res = await fetch('/api/tenants/' + tenantId + '/managers', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: apiHeaders(true),
+                    body: JSON.stringify({ username, password })
+                });
+                if (!res.ok) {
+                    alert(await Security.parseApiError(res));
+                    return;
+                }
+                alert('Admin created');
+                document.getElementById('adminUser_' + tenantId).value = '';
+                document.getElementById('adminPass_' + tenantId).value = '';
+                loadTenants();
+            } catch (err) {
+                alert('Add admin failed: ' + (err.message || err));
+            }
+        }
+
+        async function toggleTenant(tenantId, activate) {
+            const path = activate === 'true' ? 'activate' : 'deactivate';
+            try {
+                const res = await fetch('/api/tenants/' + tenantId + '/' + path, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: apiHeaders(false)
+                });
+                if (!res.ok) {
+                    alert(await Security.parseApiError(res));
+                    return;
+                }
+                loadTenants();
+            } catch (err) {
+                alert('Update failed: ' + (err.message || err));
+            }
+        }
+
+        async function toggleMultiAdmin(tenantId, enabled) {
+            try {
+                const res = await fetch('/api/tenants/' + tenantId + '/settings', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: apiHeaders(true),
+                    body: JSON.stringify({ allow_multiple_admins: enabled })
+                });
+                if (!res.ok) {
+                    alert(await Security.parseApiError(res));
+                    loadTenants();
+                }
+            } catch (err) {
+                alert('Settings update failed: ' + (err.message || err));
+                loadTenants();
+            }
+        }
+
+        loadTenants();
+    </script>
+</body>
+</html>

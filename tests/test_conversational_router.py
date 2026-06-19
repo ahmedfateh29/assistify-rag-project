@@ -15,7 +15,9 @@ from backend.config_head import (
     RAG_NO_MATCH_RESPONSE,
 )
 from backend.assistify_rag_server import (
+    _apply_customer_support_tone,
     _assistant_meta_direct_answer,
+    _build_grounded_explanations_for_items,
     _classify_assistant_meta_intent,
     _finalize_user_visible_answer,
     _is_support_procedural_query,
@@ -74,6 +76,62 @@ def test_finalize_cs_tone_for_document_miss() -> None:
     assert out != RAG_NO_MATCH_RESPONSE
     assert out == CS_NO_MATCH_RESPONSE_EN
     assert "Not found in the document." not in out
+    assert "your document" not in out.lower()
+    assert "our help materials" in out.lower()
+
+
+def test_cs_no_match_response_is_kb_generic() -> None:
+    lowered = CS_NO_MATCH_RESPONSE_EN.lower()
+    assert "our help materials" in lowered
+    assert "your document" not in lowered
+    assert "orders" not in lowered
+    assert "returns" not in lowered
+
+
+def test_apply_customer_support_tone_list_intro() -> None:
+    answer = "- Set objectives\n- Analyze alternatives\n- Select course of action"
+    out = _apply_customer_support_tone(
+        "What are the steps in the planning process?",
+        answer,
+    )
+    assert "Here are the steps from our help materials:" in out
+    assert "- Set objectives" in out
+
+
+def test_apply_customer_support_tone_maps_not_found() -> None:
+    out = _apply_customer_support_tone(
+        "What is the capital of France?",
+        RAG_NO_MATCH_RESPONSE,
+    )
+    assert out == CS_NO_MATCH_RESPONSE_EN
+
+
+def test_grounded_explanations_undirected_explain_more_not_repetitive() -> None:
+    items = [
+        "Set objectives",
+        "boundaries",
+        "evaluated",
+        "Analyze alternatives",
+        "very important",
+    ]
+    context_docs = [
+        {
+            "page_content": (
+                "The planning process includes the following steps: "
+                "1) Set objectives 2) Analyze alternatives 3) Select course of action."
+            ),
+        }
+    ]
+    out = _build_grounded_explanations_for_items(
+        "What are the steps in the planning process?",
+        items,
+        context_docs,
+        user_text="explain more",
+        targeted_item=None,
+    )
+    assert out
+    assert "which in the document is associated" not in out.lower()
+    assert out.count("Regarding") <= 1
 
 
 def test_finalize_maps_sentinel_for_behavior_complaint() -> None:
@@ -94,6 +152,8 @@ def test_support_procedural_voice_phrasing() -> None:
     assert _is_support_procedural_query("So tell me how to reset the password")
     assert _is_support_procedural_query("tell me how to reset my password")
     assert _is_support_procedural_query("Tell me how can I change my password?")
+    assert not _is_support_procedural_query("What are the steps in the planning process?")
+    assert not _is_support_procedural_query("What are the six Ms of management?")
 
 
 def test_support_procedural_rescue_from_docs() -> None:
@@ -146,6 +206,10 @@ if __name__ == "__main__":
     test_finalize_maps_sentinel_for_conversational()
     test_finalize_maps_sentinel_for_getting_me()
     test_finalize_cs_tone_for_document_miss()
+    test_cs_no_match_response_is_kb_generic()
+    test_apply_customer_support_tone_list_intro()
+    test_apply_customer_support_tone_maps_not_found()
+    test_grounded_explanations_undirected_explain_more_not_repetitive()
     test_finalize_maps_sentinel_for_behavior_complaint()
     test_conversational_redirect_constant()
     test_support_procedural_voice_phrasing()
