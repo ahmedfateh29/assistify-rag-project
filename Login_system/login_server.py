@@ -4491,6 +4491,14 @@ async def websocket_proxy(websocket: WebSocket):
                                 break
                     except Exception:
                         try:
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": "Voice connection lost.",
+                                "voice_recoverable": True,
+                            })
+                        except Exception:
+                            pass
+                        try:
                             await backend_ws.close()
                         except Exception:
                             pass
@@ -4507,6 +4515,14 @@ async def websocket_proxy(websocket: WebSocket):
                                 break
                     except Exception:
                         try:
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": "Voice connection lost.",
+                                "voice_recoverable": True,
+                            })
+                        except Exception:
+                            pass
+                        try:
                             await websocket.close(code=1000)
                         except Exception:
                             pass
@@ -4518,6 +4534,14 @@ async def websocket_proxy(websocket: WebSocket):
                 )
     except Exception as e:
         logger.error(f"Websocket proxy error: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Voice connection lost.",
+                "voice_recoverable": True,
+            })
+        except Exception:
+            pass
         try:
             await websocket.close(code=1011)
         except Exception:

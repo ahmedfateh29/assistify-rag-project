@@ -19,10 +19,26 @@
         {
           "role": "assistant",
           "text": "Hello! Thank you for contacting support. How can I help you today?"
+        },
+        {
+          "role": "user",
+          "text": "Hello, Cemandi! So back here. Hi, how are you doing? Are you getting me?"
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, I'm here with you and I received your message. How can I help you today?"
+        },
+        {
+          "role": "user",
+          "text": "Moutre."
+        },
+        {
+          "role": "assistant",
+          "text": "I don't have that specific detail in our help materials yet. I can help with questions covered in our knowledge base-what would you like to know?"
         }
       ],
       "created_at": "2026-06-18T21:52:26.924618+00:00",
-      "updated_at": "2026-06-19T19:24:05.060646+00:00",
+      "updated_at": "2026-06-19T20:53:23.419688+00:00",
       "tenant_id": 1,
       "owner": "admin"
     },

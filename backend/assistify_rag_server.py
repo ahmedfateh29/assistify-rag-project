@@ -43430,8 +43430,8 @@ async def rag_ws_endpoint(websocket: WebSocket):  # pyright: ignore
     # STABILIZATION Part 6: Silence detection tuned via benchmark.
     # STT is ultra-fast (32ms on CPU) so we can afford to wait a bit longer
     # for true silence to avoid splitting multi-word phrases.
-    # 10 chunks × ~50ms each = ~500ms — bridges natural inter-word pauses.
-    silence_chunks_needed = 10           # ~500ms true silence before transcription fires
+    # 14 chunks × ~50ms each = ~700ms — bridges natural inter-word pauses.
+    silence_chunks_needed = 14           # ~700ms true silence before transcription fires
     silence_threshold_energy = 0.008    # Strict: only truly quiet audio counts as silence
     # Per-connection language setting (can be updated by set_language control message)
     session_language = "en"

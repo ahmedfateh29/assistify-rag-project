@@ -1008,6 +1008,7 @@
       <div class="voice-controls">
         <button type="button" id="voiceMicBtn" class="voice-btn-mic">🎤 Tap to speak</button>
         <button type="button" id="voiceStopBtn" class="voice-btn-stop" disabled>⏹ Stop</button>
+        <button type="button" id="voiceRetryBtn" class="voice-btn-stop" hidden style="background:#2563eb">↻ Retry</button>
       </div>
     </div>
   </div>
@@ -1682,6 +1683,22 @@
     function _isWsAudioActive() {
       return _wsAudioState === 'playing' || _wsAudioState === 'buffering';
     }
+
+    function _isAssistantAudioActive() {
+      if (_isWsAudioActive()) return true;
+      if (typeof isTTSPlaying !== 'undefined' && isTTSPlaying) return true;
+      try {
+        if (_currentTTSAudio && !_currentTTSAudio.paused && !_currentTTSAudio.ended) return true;
+        if (audioPlayer && audioPlayer.src && !audioPlayer.paused && !audioPlayer.ended) return true;
+        if (window.speechSynthesis && window.speechSynthesis.speaking) return true;
+        if (typeof _getTTSAudioContext === 'function' && typeof _wsScheduledTime !== 'undefined') {
+          const ctx = _getTTSAudioContext();
+          if (_ttsSources && _ttsSources.length > 0) return true;
+          if (_wsScheduledTime > ctx.currentTime + 0.05) return true;
+        }
+      } catch (_) {}
+      return false;
+    }
     let _wsScheduledTime = 0;
     let _wsPendingChunks = []; // Float32Array chunks before playback starts
     let _wsPendingDuration = 0;
@@ -1859,8 +1876,9 @@
         return;
       }
       const force = isForceVoiceRecoveryReason(reason);
-      const wsAudioActive = _isWsAudioActive();
-      const ttsStillActive = (typeof isTTSPlaying !== 'undefined' && isTTSPlaying) || wsAudioActive;
+      const ttsStillActive = typeof _isAssistantAudioActive === 'function'
+        ? _isAssistantAudioActive()
+        : ((typeof isTTSPlaying !== 'undefined' && isTTSPlaying) || _isWsAudioActive());
       if (force && ttsStillActive) {
         if (isVoiceOverlayOpen() && window.voiceMode && window.voiceMode.armPendingTtsWatchdog) {
           window.voiceMode.armPendingTtsWatchdog();
@@ -1896,6 +1914,14 @@
 
     function resumeLiveCallListening(reason = 'assistant_audio_complete') {
       if (!_liveCallMode) return false;
+      if (typeof _isAssistantAudioActive === 'function' && _isAssistantAudioActive()) {
+        try {
+          if (isVoiceOverlayOpen() && window.voiceMode && window.voiceMode.armPendingTtsWatchdog) {
+            window.voiceMode.armPendingTtsWatchdog();
+          }
+        } catch (_) {}
+        return false;
+      }
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'control', action: 'clear_audio_buffer' }));
       }
@@ -1920,20 +1946,36 @@
           appendMsg('system', 'Connected to Assistify RAG system.');
         }
         reconnectAttempts = 0;
+        try {
+          if (window.voiceMode && window.voiceMode.showRetry) window.voiceMode.showRetry(false);
+          if (isVoiceOverlayOpen() && window.voiceMode &&
+              window.voiceMode.currentState && window.voiceMode.currentState() === 'error') {
+            window.voiceMode.notify('listening');
+          }
+        } catch (e) {}
       };
 
       ws.onclose = () => {
         const hadPendingRequest = textRequestInFlight || wsResponseActive;
+        const voiceOpen = isVoiceOverlayOpen();
         wsResponseActive = false;
         wsResponseFinalized = true;
         setTextSubmitLock(false);
         hideThinking();
-        appendMsg(
-          'system',
-          hadPendingRequest
-            ? '[Connection interrupted while waiting for the answer. Please try again.]'
-            : '[Connection lost - attempting to reconnect...]'
-        );
+        if (voiceOpen && window.voiceMode) {
+          const msg = hadPendingRequest
+            ? 'Connection lost during voice turn. Tap Retry to reconnect.'
+            : 'Reconnecting voice connection...';
+          try { window.voiceMode.notify('error', msg); } catch (e) {}
+          try { window.voiceMode.showRetry && window.voiceMode.showRetry(true); } catch (e) {}
+        } else {
+          appendMsg(
+            'system',
+            hadPendingRequest
+              ? '[Connection interrupted while waiting for the answer. Please try again.]'
+              : '[Connection lost - attempting to reconnect...]'
+          );
+        }
         if(isRecording) {
           stopRecording();
         }
@@ -2153,8 +2195,16 @@
         } else if(data.type === 'error') {
           setTextSubmitLock(false);
           hideThinking();
-          appendMsg('system', '[Error] ' + (data.message || 'Connection error'));
-          try { window.voiceMode && window.voiceMode.notify && window.voiceMode.notify('error', data.message); } catch(e){}
+          const voiceRecoverable = !!data.voice_recoverable;
+          if (isVoiceOverlayOpen() && voiceRecoverable) {
+            try {
+              window.voiceMode.notify('error', data.message || 'Connection error');
+              if (window.voiceMode.showRetry) window.voiceMode.showRetry(true);
+            } catch (e) {}
+          } else {
+            appendMsg('system', '[Error] ' + (data.message || 'Connection error'));
+            try { window.voiceMode && window.voiceMode.notify && window.voiceMode.notify('error', data.message); } catch(e){}
+          }
         } else if(data.type === 'info') {
           appendMsg('system', data.message);
         } else if(data.type === 'conversation') {
@@ -2746,6 +2796,10 @@
       } catch (e) {}
     }
     function hideAISpeaking() {
+      if (typeof _isAssistantAudioActive === 'function' && _isAssistantAudioActive()) {
+        setTimeout(hideAISpeaking, 200);
+        return;
+      }
       const el = document.getElementById('aiSpeakingGlow');
       if (el) el.classList.remove('active');
       if (isVoiceOverlayOpen()) {
@@ -3097,6 +3151,9 @@
       }
 
       isTTSPlaying = true;
+      if (_liveCallMode && isRecording) {
+        pauseAudioSending = true;
+      }
       showAISpeaking();
       const item = ttsQueue.shift();
       const sentence = getTTSQueueText(item);
@@ -3458,6 +3515,7 @@
       const closeBtn     = document.getElementById('voiceCloseBtn');
       const micBtn       = document.getElementById('voiceMicBtn');
       const stopBtn      = document.getElementById('voiceStopBtn');
+      const retryBtn     = document.getElementById('voiceRetryBtn');
       const statusEl     = document.getElementById('voiceStatusText');
       const circleWrap   = document.getElementById('voiceCircleWrap');
       const userBubble   = document.getElementById('voiceUserBubble');
@@ -3493,17 +3551,17 @@
 
       // ---- Phase 7C: silence-driven auto-stop while listening ----
       const SILENCE_RMS_THRESHOLD = 0.015;   // below = silence
-      const SILENCE_AUTO_STOP_MS  = 1000;    // sustained silence to auto-stop
-      const MIN_LISTEN_MS         = 1500;    // ignore silence before this
+      const SILENCE_AUTO_STOP_MS  = 1600;    // sustained silence to auto-stop
+      const MIN_LISTEN_MS         = 1800;    // ignore silence before this
       let listeningStartTime = 0;
       let lastVoiceTime      = 0;
       let autoStopTriggered  = false;
       let voiceStopSent      = false;        // true after stop_recording sent this turn
 
       // ---- Phase 7C: dedicated low-power analyser for speaking-state interrupt ----
-      const INTERRUPT_RMS_THRESHOLD = 0.07;
-      const INTERRUPT_FRAMES_NEEDED = 6;     // ~100ms of sustained voice
-      const INTERRUPT_GRACE_MS = 650;        // ignore TTS bleed right after playback starts
+      const INTERRUPT_RMS_THRESHOLD = 0.09;
+      const INTERRUPT_FRAMES_NEEDED = 10;    // ~170ms of sustained voice
+      const INTERRUPT_GRACE_MS = 1200;       // ignore TTS bleed right after playback starts
       let interruptStream   = null;
       let interruptCtx      = null;
       let interruptAnalyser = null;
@@ -3559,6 +3617,9 @@
       }
 
       function _ttsPlaybackStillActive() {
+        if (typeof _isAssistantAudioActive === 'function') {
+          return _isAssistantAudioActive();
+        }
         const wsActive = (typeof _wsAudioState !== 'undefined' &&
           (_wsAudioState === 'playing' || _wsAudioState === 'buffering'));
         return wsActive || (typeof isTTSPlaying !== 'undefined' && isTTSPlaying);
@@ -3897,9 +3958,8 @@
               interruptFrame = requestAnimationFrame(tick);
               return;
             }
-            // Suppress auto barge-in while server TTS is still playing (speaker bleed).
-            if (typeof _wsAudioState !== 'undefined' &&
-                (_wsAudioState === 'playing' || _wsAudioState === 'buffering')) {
+            // Suppress auto barge-in while any assistant audio is still playing (speaker bleed).
+            if (typeof _isAssistantAudioActive === 'function' && _isAssistantAudioActive()) {
               interruptVoiceFrames = 0;
               interruptFrame = requestAnimationFrame(tick);
               return;
@@ -4167,6 +4227,13 @@
       }
       function resumeAfterAssistant(reason = 'assistant_audio_complete') {
         if (!isOpen || voicePaused) return false;
+        if (typeof _isAssistantAudioActive === 'function' && _isAssistantAudioActive()) {
+          setVoiceState('assistant_speaking');
+          armPendingTtsWatchdog();
+          armVoiceTurnWatchdog();
+          console.log('[VOICE FLOW] assistant_audio_still_active=' + reason);
+          return true;
+        }
         clearVoiceTurnWatchdog();
         clearPendingTtsWatchdog();
         if (typeof pauseAudioSending !== 'undefined') pauseAudioSending = false;
@@ -4311,7 +4378,7 @@
                 resumeAfterAssistant('speaking_end');
                 console.log('[VOICE FLOW] returned_to_listening_after_speaking');
               }
-            }, 300);
+            }, 500);
             break;
           case 'barge_in':
             voicePaused = false;
@@ -4356,6 +4423,31 @@
         armVoiceTurnWatchdog();
       }
 
+      function showRetry(visible) {
+        if (!retryBtn) return;
+        retryBtn.hidden = !visible;
+      }
+
+      function reconnectVoiceWebSocket() {
+        showRetry(false);
+        updateVoiceStatus(isArabic() ? 'جاري إعادة الاتصال...' : 'Reconnecting...');
+        try {
+          if (ws) {
+            ws.onclose = null;
+            ws.close();
+          }
+        } catch (_) {}
+        connectWebSocket();
+        setTimeout(() => {
+          if (!isOpen) return;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            setVoiceState('idle');
+            updateVoiceStatus(statusFor('idle'));
+            resumeVoiceListening();
+          }
+        }, 1500);
+      }
+
       // ---- Wire up DOM events ----
       if (openBtn) openBtn.addEventListener('click', openVoiceMode);
       if (chatVoiceBtn) {
@@ -4379,6 +4471,9 @@
         }
       });
       stopBtn.addEventListener('click', () => stopVoicePlayback('manual_stop_button'));
+      if (retryBtn) {
+        retryBtn.addEventListener('click', reconnectVoiceWebSocket);
+      }
       document.addEventListener('keydown', (e) => {
         if (isOpen && e.key === 'Escape') { closeVoiceMode(); }
       });
@@ -4418,6 +4513,8 @@
         isOpen: () => isOpen,
         isPaused: () => voicePaused,
         currentState: () => currentState,
+        showRetry,
+        reconnectVoiceWebSocket,
       };
     })();
   </script>

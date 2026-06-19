@@ -121,25 +121,6 @@ function getCSRFToken() {
 }
 
 /**
- * Parse a failed fetch Response into a human-readable error string.
- * Handles FastAPI detail (string or array), global handler "error", and message.
- */
-async function parseApiError(response) {
-    try {
-        const body = await response.json();
-        if (typeof body.detail === 'string') return body.detail;
-        if (Array.isArray(body.detail)) {
-            return body.detail.map(e => e.msg || JSON.stringify(e)).join('; ');
-        }
-        if (body.error) return String(body.error);
-        if (body.message) return String(body.message);
-    } catch (_) {
-        /* response body is not JSON */
-    }
-    return response.statusText || `Request failed (${response.status})`;
-}
-
-/**
  * Secure fetch wrapper with CSRF protection
  */
 async function secureFetch(url, options = {}) {
@@ -406,7 +387,6 @@ window.Security = {
     escapeHTML,
     sanitizeInput,
     getCSRFToken,
-    parseApiError,
     secureFetch,
     secureFormSubmit,
     isValidEmail,

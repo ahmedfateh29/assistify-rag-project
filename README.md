@@ -166,13 +166,35 @@ python scripts\preflight_check.py
 python start_main_servers.py
 ```
 
-This starts services **in order**: Ollama → Piper TTS → LLM shim → RAG → Login. It also sets `KMP_DUPLICATE_LIB_OK=TRUE` and frees occupied ports.
+**Default on Windows:** a **coordinator** window scans ports, prints a process inventory table, then opens **one terminal per service**:
 
-**Wait until you see** `[OLLAMA]`, `[PIPER]`, `[LLM]`, `[RAG]`, and `[LOGIN]` each report **Ready** (first RAG start can take several minutes while faster-whisper loads). Leave this window open; press **Ctrl+C** to stop all services.
+| Window title | Service | Port |
+|--------------|---------|------|
+| Assistify Ollama | Ollama | 11434 |
+| Assistify Piper | Piper TTS | 5002 |
+| Assistify LLM | LLM shim | 8010 |
+| Assistify RAG | RAG server | 7000 |
+| Assistify Login | Login UI | 7001 |
+
+Services already listening are skipped. The coordinator waits until each reports **Ready**, then prints http://127.0.0.1:7001/login. **Close each `Assistify *` window** to stop that service; Ctrl+C in the coordinator only exits the coordinator.
+
+**List running processes without starting anything:**
+
+```powershell
+python start_main_servers.py --status
+```
+
+**Previous single-window behavior** (merged `[RAG]` / `[LOGIN]` logs in one console — useful for CI or SSH):
+
+```powershell
+python start_main_servers.py --single-console
+```
+
+This sets `KMP_DUPLICATE_LIB_OK=TRUE` and frees occupied ports (`--kill-ports`) by default. First RAG start can take several minutes while faster-whisper loads.
 
 Then open **http://127.0.0.1:7001/login** (`admin` / `admin` or `superadmin` / `superadmin123`).
 
-Per-service logs are written under `logs\` (`piper.log`, `llm.log`, `rag.log`, `login.log`).
+Per-service logs (single-console mode) are written under `logs\` (`piper.log`, `llm.log`, `rag.log`, `login.log`).
 
 **Advanced / manual equivalent** (if you prefer explicit conda activation):
 
@@ -185,6 +207,8 @@ python scripts\project_start_server.py --kill-ports --llm-port 8010
 
 | Flag | When to use |
 |------|-------------|
+| **`--status`** | Print port/PID inventory only; do not start services |
+| **`--single-console`** | One window with merged logs (old launcher) |
 | **`--kill-ports`** | Frees `5002`, `7000`, `7001`, `8010` if a previous run left listeners behind |
 | **`--llm-port 8010`** | Use when port **8000** fails with “permission denied” on Windows; set `LLM_SERVER_URL=http://127.0.0.1:8010` in `.env` to match |
 
