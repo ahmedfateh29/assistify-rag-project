@@ -10,8 +10,8 @@ Assistify is an enterprise-grade AI-powered help desk system that provides real-
 
 ### Core Capabilities
 - **Voice-to-Voice Interaction**: Users speak questions, receive spoken AI responses
-- **Real-time ASR**: Automatic Speech Recognition using Vosk (CPU-based)
-- **GPU-Accelerated LLM**: Qwen2.5-7B-Instruct model running on NVIDIA GPU
+- **Real-time ASR**: Automatic Speech Recognition using faster-whisper (CPU)
+- **GPU-Accelerated LLM**: Qwen2.5:3b via Ollama on NVIDIA GPU
 - **RAG System**: Context retrieval from knowledge base documents
 - **Multi-user Authentication**: Role-based access control (Admin/Employee/Customer)
 - **Admin Dashboard**: Complete management interface for users, analytics, and knowledge base
@@ -47,45 +47,53 @@ Assistify is an enterprise-grade AI-powered help desk system that provides real-
 │  - RAG Retrieval│
 │  - Analytics    │
 └────────┬────────┘
-         │ HTTP REST API
+         │ HTTP (Ollama API)
          ▼
 ┌─────────────────┐
-│   LLM Server    │ (Port 8000 - FastAPI)
-│  - GPU Inference│
-│  - Qwen2.5-7B   │
+│     Ollama      │ (Port 11434)
+│  - qwen2.5:3b   │
+│  - GPU inference│
+└─────────────────┘
+         ▲
+         │ HTTP (optional proxy)
+┌─────────────────┐
+│  Piper TTS      │ (Port 5002 - FastAPI microservice)
+│  - CPU synthesis│
 └─────────────────┘
 ```
 
 ### Technology Stack
 
 #### Backend
-- **FastAPI**: Async web framework for all three servers
+- **FastAPI**: Async web framework for login, RAG, and Piper TTS services
 - **Python 3.11**: Primary programming language
-- **llama-cpp-python (CUDA)**: GPU-accelerated LLM inference
-- **Vosk**: CPU-based automatic speech recognition
+- **Ollama**: Local LLM runtime (OpenAI-compatible API, `qwen2.5:3b` on GPU)
+- **faster-whisper**: CPU-based automatic speech recognition
+- **Piper TTS**: CPU-based neural text-to-speech microservice (port 5002)
 - **ChromaDB**: Vector database for RAG embeddings
 - **Sentence-Transformers**: Text embedding model (all-MiniLM-L6-v2)
 - **SQLite**: User database and analytics storage
 - **aiohttp**: Async HTTP client for inter-service communication
-- **Passlib**: Password hashing (pbkdf2_sha256)
+- **Passlib**: Password hashing (bcrypt_sha256)
 - **itsdangerous**: Cryptographic signing for sessions
 
 #### Frontend
 - **Vanilla JavaScript**: No frameworks, pure ES6+
 - **WebSocket API**: Real-time bidirectional communication
 - **Web Audio API**: Audio capture and processing
-- **Speech Synthesis API**: Text-to-speech output
+- **Piper TTS (server-side)**: Spoken responses streamed from RAG server
 - **Chart.js**: Analytics visualization
 
 #### ML/AI
-- **Qwen2.5-7B-Instruct-Q4_K_M**: Quantized LLM (4.36 GiB VRAM)
+- **qwen2.5:3b (Ollama)**: Local LLM for chat and RAG answers
 - **all-MiniLM-L6-v2**: Embedding model for semantic search
-- **Vosk-model-en-us-0.22-lgraph**: Speech recognition acoustic model
+- **faster-whisper-tiny.en**: Speech recognition model (CPU, int8)
+- **Piper ONNX voices**: English and Arabic TTS voices
 
 #### GPU
-- **CUDA 12.4**: GPU acceleration framework
-- **NVIDIA RTX 3070 Laptop**: 8GB VRAM, compute capability 8.6
-- **llama.cpp CUDA backend**: Direct GPU kernel execution
+- **CUDA 12.x**: GPU acceleration for Ollama and RAG embeddings
+- **NVIDIA RTX 3070 Laptop**: 8GB VRAM (typical dev target)
+- **Ollama ggml-cuda backend**: LLM layer offloading managed by Ollama
 
 ---
 
@@ -104,7 +112,8 @@ Assistify is an enterprise-grade AI-powered help desk system that provides real-
 **project_start_server.py**
 - Entry point for launching all three servers
 - Command-line arguments: `--enforce-gpu`, `--n-gpu-layers`
-- Spawns Login Server (7001), RAG Server (7000), LLM Server (8000)
+- Spawns Login Server (7001), RAG Server (7000), Piper TTS (5002)
+- Requires Ollama running separately (`ollama serve`, model `qwen2.5:3b` pulled)
 - Monitors server health and handles graceful shutdown
 - Purpose: Single-command deployment of entire stack
 
@@ -112,7 +121,8 @@ Assistify is an enterprise-grade AI-powered help desk system that provides real-
 - SESSION_SECRET: Cryptographic key for session cookies
 - SESSION_COOKIE: Cookie name ("session")
 - RAG_SERVER_URL: "http://127.0.0.1:7000"
-- LLM_SERVER_URL: "http://0.0.0.0:8000"
+- LLM_URL: "http://127.0.0.1:11434/api/chat" (Ollama native chat API)
+- OLLAMA_MODEL: "qwen2.5:3b"
 - LOGIN_SERVER_URL: "http://127.0.0.1:7001"
 - Prevents hardcoded URLs across multiple files
 
@@ -120,8 +130,7 @@ Assistify is an enterprise-grade AI-powered help desk system that provides real-
 ```
 fastapi
 uvicorn
-llama-cpp-python  # Must be CUDA-enabled build
-vosk
+faster-whisper
 chromadb
 sentence-transformers
 aiohttp
@@ -130,20 +139,21 @@ itsdangerous
 PyPDF2
 pynvml  # GPU monitoring
 ```
+(Ollama is installed separately; Piper runs via `tts_service/piper_server.py`.)
 
 ### Backend Directory (`backend/`)
 ```
 backend/
 ├── __init__.py                   # Package marker
-├── main_llm_server.py           # LLM inference server (GPU-only)
+├── main_llm_server.py           # Optional Ollama proxy (port 8000; RAG calls Ollama directly)
 ├── assistify_rag_server.py      # Voice processing + RAG orchestration
+├── voice_audio/                 # STT/TTS/WebSocket audio package
 ├── knowledge_base.py            # ChromaDB operations
 ├── load_documents.py            # Document ingestion script
 ├── database.py                  # SQLite schema and operations
 ├── analytics.py                 # Usage tracking and metrics
-├── Models/                      # AI model storage
-│   ├── Qwen2.5-7B-LLM/         # LLM GGUF files (2 shards)
-│   └── vosk-model-en-us-0.22-lgraph/  # ASR acoustic model
+├── Models/                      # Local model storage
+│   └── faster-whisper-tiny.en/  # ASR model (CPU)
 ├── assets/                      # Knowledge base documents
 │   ├── sample_kb.txt
 │   └── e2e_test.txt
@@ -155,41 +165,37 @@ backend/
     └── admin_users.html
 ```
 
-**main_llm_server.py** (Port 8000)
-- **Purpose**: GPU-only LLM inference service
+**main_llm_server.py** (Port 8000, optional)
+- **Purpose**: Thin FastAPI wrapper around Ollama's OpenAI-compatible API
+- **Note**: RAG server calls Ollama directly at `http://127.0.0.1:11434/api/chat`; this server is not required for normal operation
 - **Key Functions**:
-  - `load_llm_model()`: Loads Qwen2.5-7B with 40 GPU layers, n_ctx=4096
-  - `POST /generate`: Accepts prompt, returns completion
-  - `on_startup()`: Validates GPU availability, raises RuntimeError if missing
-- **GPU Enforcement**: No CPU fallback, strict CUDA requirement
-- **Memory Management**: KV cache reset via `llm.reset()` before each request
-- **Error Handling**: Returns `{"error": "..."}` JSON on failures
-- **Dependencies**: llama-cpp-python (CUDA), torch, pynvml
+  - Health check against local Ollama model list
+  - `POST /v1/chat/completions`: Forwards chat requests to Ollama (`qwen2.5:3b`)
+- **Dependencies**: aiohttp, FastAPI (no llama-cpp-python)
 
 **assistify_rag_server.py** (Port 7000)
 - **Purpose**: Voice processing orchestrator and RAG query handler
 - **Key Components**:
-  - Vosk ASR initialization (mandatory, raises FileNotFoundError if missing)
+  - faster-whisper ASR initialization (CPU, mandatory)
+  - Piper TTS client (HTTP to port 5002)
   - WebSocket handler for real-time audio streaming
   - RAG retrieval using ChromaDB similarity search
-  - LLM query proxy to main_llm_server
+  - LLM queries via Ollama native chat API
   - Analytics tracking integration
 - **Key Functions**:
   - `websocket_endpoint()`: Main WebSocket handler for voice chat
-  - `handle_audio_frame()`: PCM16 audio processing with Vosk
+  - Voice audio delegated to `backend/voice_audio/` (STT, TTS, WS lifecycle)
   - `retrieve_relevant_context()`: Semantic search in knowledge base
-  - `query_llm()`: HTTP POST to LLM server with RAG context
-  - `handle_control_message()`: Clears audio buffers on recording stop
+  - `query_llm()`: HTTP POST to Ollama with RAG context
 - **Audio Processing**:
   - Format: PCM16, 16kHz, mono
-  - Buffering: Accumulates audio chunks until silence or stop
-  - Vosk recognizer with word-level timestamps enabled
+  - Buffering: Accumulates audio until silence or stop, then transcribes with faster-whisper
 - **RAG Flow**:
-  1. User voice → ASR transcription
-  2. Transcription → ChromaDB embedding search (top 3 results)
+  1. User voice → faster-whisper transcription (CPU)
+  2. Transcription → ChromaDB embedding search (top results)
   3. Retrieved docs + query → LLM prompt template
-  4. LLM response → User (text + optional TTS)
-- **Dependencies**: Vosk, ChromaDB, aiohttp, sentence-transformers
+  4. Ollama response → User (text + Piper TTS audio)
+- **Dependencies**: faster-whisper, ChromaDB, aiohttp, sentence-transformers, Ollama
 
 **knowledge_base.py**
 - **Purpose**: ChromaDB vector database operations
@@ -219,10 +225,11 @@ backend/
   - `init_user_db()`: Creates table with default users (admin/employee/customer)
   - `verify_user(username, password)`: Credential validation
   - `create_user(username, password, role)`: New user creation
-- **Default Credentials**:
-  - admin:admin123 (role: admin)
-  - employee:employee123 (role: employee)
-  - customer:customer123 (role: customer)
+- **Default Credentials** (dev only; see `Login_system/dev_users.py`):
+  - superadmin:superadmin (role: superadmin)
+  - admin:admin (role: admin)
+  - employee:employee (role: employee)
+  - customer:customer (role: customer)
 
 **analytics.py**
 - **Purpose**: Usage statistics and error logging
@@ -411,9 +418,8 @@ frontend/
     - `{type: 'response', text: '...'}`: AI response
     - `{type: 'error', message: '...'}`: Error notification
 - **TTS Implementation**:
-  - `speakText(text)`: Strips emojis with regex, uses SpeechSynthesis API
-  - Emoji regex: `[\u{1F300}-\u{1F9FF}\u{1F600}-\u{1F64F}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]`
-  - Prevents "smiley face" being spoken instead of displaying 😊
+  - Server-side Piper TTS via RAG WebSocket (audio chunks streamed from port 5002)
+  - Client plays received PCM/WAV audio; browser Speech Synthesis API is not the primary path
 - **Duplicate Message Fix**:
   - Removed client-side `appendMsg()` on form submit
   - Relies solely on server echo to display messages
@@ -461,12 +467,10 @@ frontend/
 6. RAG server receives audio frames, buffers them
 
 #### Step 5: Speech Recognition (ASR)
-1. RAG server accumulates audio in `audio_buffer`
-2. Feeds chunks to Vosk recognizer
-3. Vosk processes acoustic features, updates decoding state
-4. On partial results, updates frontend with interim text
-5. On final result (silence or stop), completes transcription
-6. Sends `{type: 'transcript', text: 'User's question'}` to frontend
+1. RAG server accumulates audio in buffer
+2. On silence or stop, sends PCM16 audio to faster-whisper (CPU)
+3. faster-whisper transcribes with VAD filtering
+4. Sends `{type: 'transcript', text: 'User's question'}` to frontend
 
 #### Step 6: RAG Retrieval
 1. RAG server receives final transcription
@@ -483,13 +487,10 @@ frontend/
    ```
 
 #### Step 7: LLM Inference
-1. RAG server sends POST to `http://0.0.0.0:8000/generate`
-2. Request body: `{prompt: "...", max_tokens: 256, temperature: 0.7}`
-3. LLM server resets KV cache (`llm.reset()`)
-4. Calls `llm(prompt, max_tokens=256, temperature=0.7, stop=["User:", "\n\n"])`
-5. GPU executes inference (40 layers on RTX 3070)
-6. Streams tokens back to RAG server
-7. Returns `{text: "AI's response"}`
+1. RAG server sends POST to Ollama at `http://127.0.0.1:11434/api/chat`
+2. Request body includes `model: "qwen2.5:3b"`, messages, and context options
+3. Ollama runs inference on GPU (ggml-cuda)
+4. Returns assistant message text to RAG server
 
 #### Step 8: Response Delivery
 1. RAG server receives LLM response
@@ -498,31 +499,29 @@ frontend/
 4. Login server proxies message to browser
 5. Frontend JavaScript receives response
 6. Displays message in chat history
-7. Calls `speakText(response)` for TTS
-8. Speech Synthesis API speaks the answer (emojis filtered)
+7. Piper TTS synthesizes spoken audio (server-side, port 5002)
+8. Audio streamed to browser over WebSocket
 
 #### Step 9: Recording Stop
 1. User clicks "Stop Recording" button
 2. Frontend sends `{type: 'control', action: 'stop_recording'}`
-3. RAG server clears `audio_buffer`
-4. Resets Vosk recognizer to fresh state
+3. RAG server clears audio buffer and STT state
 5. Prevents audio bleed-through on next recording
 
 ### Error Handling Flow
 
-#### LLM Server Failure
-1. LLM server cannot load model or GPU fails
-2. Returns `{error: "GPU initialization failed"}`
-3. RAG server detects error key in response
-4. Logs error to analytics.db
-5. Sends `{type: 'error', message: 'LLM unavailable'}` to frontend
-6. Frontend displays error message to user
+#### LLM / Ollama Failure
+1. Ollama not running or model not pulled
+2. RAG server receives connection error from Ollama API
+3. Logs error to analytics.db
+4. Sends `{type: 'error', message: 'LLM unavailable'}` to frontend
+5. Fix: `ollama serve` and `ollama pull qwen2.5:3b`
 
 #### ASR Failure
-1. Vosk model file missing
-2. RAG server raises FileNotFoundError on startup
-3. Server crashes (intentional fail-fast)
-4. User sees "Cannot connect to server" in frontend
+1. faster-whisper model path missing
+2. RAG server fails STT initialization on startup
+3. User sees transcription errors or empty transcripts
+4. Fix: ensure `backend/Models/faster-whisper-tiny.en/` exists
 
 #### Authentication Failure
 1. Invalid session cookie
@@ -534,21 +533,25 @@ frontend/
 
 ## 5. TECHNOLOGIES & LIBRARIES - DETAILED RATIONALE
 
-### Why llama-cpp-python (CUDA)?
-- **Quantized Model Support**: Runs Q4_K_M GGUF files (4-bit quantization)
-- **Low VRAM**: 4.36 GiB fits in 8GB RTX 3070 Laptop
-- **Fast Inference**: Direct CUDA kernels, no PyTorch overhead
-- **CPU Fallback**: Removed intentionally to enforce GPU-only
-- **Metal/CUDA/OpenCL**: Cross-platform GPU support (using CUDA here)
-- **Alternative Rejected**: Hugging Face Transformers (requires 16GB+ VRAM for 7B FP16)
+### Why Ollama?
+- **Simple deployment**: Pull model once (`ollama pull qwen2.5:3b`), no GGUF shard management
+- **GPU offloading**: Ollama manages layer placement via ggml-cuda
+- **Low VRAM**: 3B model fits comfortably alongside RAG embeddings on 8GB GPUs
+- **OpenAI-compatible API**: Easy integration from RAG server
+- **Alternative rejected**: In-process llama-cpp-python (more fragile builds, larger ops burden)
 
-### Why Vosk for ASR?
-- **CPU-Based**: Offloads ASR from GPU, reserves GPU for LLM
-- **Offline**: No API calls to Google/Azure (data privacy)
-- **Accurate**: Tested by user, correctly transcribes "Talk about Cristiano Ronaldo"
-- **Streaming**: Supports partial results for real-time feedback
-- **Lightweight**: 500MB model vs 3GB+ for Whisper large
-- **Alternative Rejected**: Faster-Whisper small (inaccurate: "So, come out Christiano Ronaldo")
+### Why faster-whisper for ASR?
+- **CPU-based**: Keeps GPU VRAM free for Ollama and sentence-transformers
+- **Offline**: No cloud ASR API calls (data privacy)
+- **Accurate**: Better than legacy Vosk on natural speech
+- **VAD built-in**: Voice activity detection filters silence
+- **Lightweight**: tiny.en model for low-latency dev setups
+
+### Why Piper TTS?
+- **CPU-only**: Does not compete with Ollama for GPU memory
+- **Fast**: ONNX runtime, suitable for real-time reply playback
+- **Self-hosted**: No external TTS API dependency
+- **Microservice**: Isolated on port 5002 (`tts_service/piper_server.py`)
 
 ### Why ChromaDB?
 - **Simplicity**: No server setup, embedded Python library
@@ -586,17 +589,15 @@ frontend/
 ## 6. EXTERNAL DEPENDENCIES & SERVICES
 
 ### Required System Libraries
-- **CUDA Toolkit 12.4**: GPU driver and runtime
-- **cuBLAS, cuDNN**: CUDA math libraries for llama.cpp
-- **PortAudio**: Audio I/O library (for Vosk)
+- **CUDA Toolkit 12.x**: GPU driver and runtime (for Ollama and PyTorch embeddings)
+- **Ollama**: Local LLM runtime (separate install from Python deps)
 - **SQLite3**: Database engine (usually pre-installed)
 
 ### Python Package Dependencies (requirements.txt)
 ```
 fastapi>=0.104.0           # Web framework
 uvicorn[standard]>=0.24.0  # ASGI server
-llama-cpp-python>=0.3.4    # MUST be CUDA build: CMAKE_ARGS="-DLLAMA_CUDA=on"
-vosk>=0.3.45               # Speech recognition
+faster-whisper>=1.0.0      # Speech recognition (CPU)
 chromadb>=0.4.18           # Vector database
 sentence-transformers>=2.2.2  # Embedding model
 aiohttp>=3.9.0             # Async HTTP client
@@ -606,23 +607,26 @@ PyPDF2>=3.0.1              # PDF text extraction
 pynvml>=11.5.0             # GPU monitoring
 jinja2>=3.1.2              # Template engine
 python-multipart>=0.0.6    # File upload support
+piper-tts                  # Piper TTS (also via tts_service microservice)
 ```
 
 ### External APIs & Services
-**None** - System is fully self-hosted and offline-capable
+**None for core inference** — LLM, ASR, TTS, and RAG run locally. Optional: Google OAuth, EmailJS for OTP.
 
 ### AI Models (Downloaded Separately)
-1. **Qwen2.5-7B-Instruct-Q4_K_M** (4.36 GiB)
-   - Source: Hugging Face (bartowski/Qwen2.5-7B-Instruct-GGUF)
-   - Files: 2 shards (00001-of-00002.gguf, 00002-of-00002.gguf)
-   - Location: `backend/Models/Qwen2.5-7B-LLM/`
+1. **qwen2.5:3b (Ollama)**
+   - Install: `ollama pull qwen2.5:3b`
+   - Managed by Ollama under `~/.ollama/models/` (not in repo)
 
-2. **vosk-model-en-us-0.22-lgraph** (500 MB)
-   - Source: alphacephei.com/vosk/models
-   - Contents: Kaldi acoustic model + language graph
-   - Location: `backend/Models/vosk-model-en-us-0.22-lgraph/`
+2. **faster-whisper-tiny.en**
+   - Location: `backend/Models/faster-whisper-tiny.en/`
+   - Device: CPU, compute type int8
 
-3. **all-MiniLM-L6-v2** (Auto-downloaded by sentence-transformers)
+3. **Piper ONNX voices**
+   - Location: configured via `PIPER_*_VOICE_PATH` env vars
+   - Served by `tts_service/piper_server.py` on port 5002
+
+4. **all-MiniLM-L6-v2** (Auto-downloaded by sentence-transformers)
    - Source: Hugging Face (sentence-transformers/all-MiniLM-L6-v2)
    - Size: ~90 MB
    - Cache: `~/.cache/huggingface/`
@@ -634,26 +638,28 @@ python-multipart>=0.0.6    # File upload support
 ### Required Hardware
 - **GPU**: NVIDIA GPU with 6GB+ VRAM (tested on RTX 3070 Laptop 8GB)
 - **RAM**: 8GB+ system RAM
-- **CPU**: 4+ cores recommended for Vosk ASR
+- **CPU**: 4+ cores recommended for faster-whisper ASR and Piper TTS
 - **Storage**: 10GB for models + data
 
 ### GPU Configuration
-- **CUDA Version**: 12.4 (driver 552.44+)
-- **Compute Capability**: 7.0+ (tested on 8.6)
-- **GPU Layers**: 40 (offloads entire Qwen2.5-7B model)
-- **VRAM Usage**: ~4.5 GB (model) + 500 MB (KV cache)
+- **CUDA Version**: 12.x (driver compatible with Ollama)
+- **VRAM**: Ollama (`qwen2.5:3b`) + RAG embeddings share GPU; STT/TTS stay on CPU
 
 ### Environment Variables (Optional)
 ```bash
-USE_WHISPER=0              # Force Vosk (default)
+OLLAMA_MODEL=qwen2.5:3b    # Must match `ollama list`
+WHISPER_MODEL_PATH=...     # faster-whisper model directory
 SESSION_SECRET=<random>    # Override session key
-CUDA_VISIBLE_DEVICES=0     # Select GPU
+CUDA_VISIBLE_DEVICES=0     # Select GPU for Ollama
+IS_PRODUCTION=1            # Disable dev login fallbacks
 ```
 
 ### Port Configuration
 - **7001**: Login/Auth server (external access)
 - **7000**: RAG server (internal only, proxied via 7001)
-- **8000**: LLM server (internal only)
+- **11434**: Ollama API (local LLM)
+- **5002**: Piper TTS microservice (optional, started by launcher)
+- **8000**: Optional Ollama proxy (`main_llm_server.py`; not required)
 
 ### Database Files
 - `users.db`: User accounts (SQLite)
@@ -720,7 +726,7 @@ CUDA_VISIBLE_DEVICES=0     # Select GPU
 5. **Vector Search**: No approximate nearest neighbor (exact search only)
 
 ### Security Concerns
-1. **Default Credentials**: admin:admin123 shipped in production
+1. **Default Credentials**: Dev accounts (`admin/admin`, etc.) defined in `Login_system/dev_users.py` — change before production
 2. **SQL Injection**: Direct SQLite queries without parameterization in some places
 3. **Path Traversal**: File operations rely on path resolution (potential bypass)
 4. **XSS**: User-generated content not sanitized before display
@@ -732,27 +738,27 @@ CUDA_VISIBLE_DEVICES=0     # Select GPU
 
 ### Development Deployment
 ```bash
-# 1. Install CUDA 12.4 and cuDNN
+# 1. Install CUDA drivers and Ollama (https://ollama.com)
+ollama serve
+ollama pull qwen2.5:3b
+
 # 2. Create conda environment
-conda create -n grad python=3.11
-conda activate grad
+conda env create -f environment_main.yml
+conda activate assistify_main
 
-# 3. Install llama-cpp-python with CUDA
-CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --force-reinstall --no-cache-dir
-
-# 4. Install other dependencies
+# 3. Install Python dependencies (if not already in env)
 pip install -r requirements.txt
 
-# 5. Download models
-# - Qwen2.5-7B GGUF → backend/Models/Qwen2.5-7B-LLM/
-# - Vosk model → backend/Models/vosk-model-en-us-0.22-lgraph/
+# 4. Seed dev users
+python Login_system/init_users_db.py
 
-# 6. Initialize databases
-python -m backend.database  # Creates users.db
-python -m backend.load_documents  # Populates ChromaDB
+# 5. Ensure faster-whisper model exists at backend/Models/faster-whisper-tiny.en/
 
-# 7. Launch servers
-python project_start_server.py --enforce-gpu --n-gpu-layers 40
+# 6. Start stack
+python start_main_servers.py
+
+# 7. (Optional) Populate knowledge base
+python -m backend.load_documents
 ```
 
 ### Production Deployment Recommendations
@@ -763,16 +769,16 @@ python project_start_server.py --enforce-gpu --n-gpu-layers 40
 5. **Monitoring**: Add Prometheus + Grafana
 6. **Backups**: Daily SQLite dumps, weekly ChromaDB snapshots
 7. **Rate Limiting**: nginx limit_req or slowapi middleware
-8. **Firewall**: Close ports 7000 and 8000 externally
+8. **Firewall**: Close ports 7000, 11434, and 5002 externally (expose 7001 via reverse proxy only)
 
 ---
 
 ## 10. TESTING & VALIDATION
 
 ### Manual Testing Checklist
-- [ ] User can login with admin/admin123
-- [ ] User can login with employee/employee123
-- [ ] User can login with customer/customer123
+- [ ] User can login with admin/admin
+- [ ] User can login with employee/employee
+- [ ] User can login with customer/customer
 - [ ] Admin redirects to `/admin` dashboard
 - [ ] Employee redirects to `/employee` dashboard
 - [ ] Customer redirects to `/main` dashboard
@@ -780,7 +786,7 @@ python project_start_server.py --enforce-gpu --n-gpu-layers 40
 - [ ] Voice recording captures audio
 - [ ] ASR correctly transcribes speech
 - [ ] LLM generates relevant responses
-- [ ] TTS plays without reading emoji names
+- [ ] Piper TTS audio plays for assistant responses
 - [ ] Admin can create/edit/delete users
 - [ ] Admin can upload/edit/delete KB documents
 - [ ] Employee can view KB documents (read-only)
@@ -839,20 +845,20 @@ python project_start_server.py --enforce-gpu --n-gpu-layers 40
 ### Common Errors
 
 **"CUDA out of memory"**
-- **Cause**: GPU VRAM exhausted (KV cache + model)
-- **Fix**: Reduce `n_ctx` to 2048, or use Q3_K_M quantization
+- **Cause**: GPU VRAM exhausted (Ollama + embeddings)
+- **Fix**: Use smaller Ollama model or reduce concurrent RAG embedding load
 
-**"FileNotFoundError: Vosk model not found"**
+**"faster-whisper model not found"**
 - **Cause**: Missing ASR model directory
-- **Fix**: Download vosk-model-en-us-0.22-lgraph to `backend/Models/`
+- **Fix**: Download or place model at `backend/Models/faster-whisper-tiny.en/`
 
-**"WebSocket connection failed"**
-- **Cause**: RAG server not running or session invalid
-- **Fix**: Check `python project_start_server.py` logs, ensure logged in
+**"Ollama unreachable" / LLM errors**
+- **Cause**: Ollama not running or `qwen2.5:3b` not pulled
+- **Fix**: `ollama serve` and `ollama pull qwen2.5:3b`
 
-**"GPU not detected"**
-- **Cause**: CUDA not installed or llama-cpp-python CPU build
-- **Fix**: Reinstall llama-cpp-python with CMAKE_ARGS="-DLLAMA_CUDA=on"
+**"Piper TTS unavailable"**
+- **Cause**: Piper microservice not running on port 5002
+- **Fix**: Start via launcher or `start_piper_service.bat`
 
 **"ChromaDB corrupted"**
 - **Cause**: chroma.sqlite3 database file damaged
@@ -894,15 +900,14 @@ python project_start_server.py --enforce-gpu --n-gpu-layers 40
 **ASR**: Automatic Speech Recognition - converts speech to text  
 **TTS**: Text-to-Speech - converts text to spoken audio  
 **LLM**: Large Language Model - neural network trained on text  
-**GGUF**: GPT-Generated Unified Format - quantized model file format  
-**Q4_K_M**: 4-bit quantization with K-means, medium quality  
+**Ollama**: Local LLM runtime used for `qwen2.5:3b` inference  
 **CUDA**: Compute Unified Device Architecture - NVIDIA GPU programming  
 **VRAM**: Video RAM - GPU memory  
-**KV Cache**: Key-Value cache for attention mechanism in LLMs  
 **CSRF**: Cross-Site Request Forgery - session security attack  
 **PCM16**: Pulse Code Modulation, 16-bit - raw audio format  
 **ChromaDB**: Embeddings database for vector similarity search  
-**Vosk**: Offline speech recognition toolkit  
+**faster-whisper**: CTranslate2-based Whisper implementation for ASR  
+**Piper**: Lightweight ONNX neural TTS engine  
 **FastAPI**: Modern Python web framework  
 **WebSocket**: Full-duplex communication protocol  
 
@@ -912,17 +917,19 @@ python project_start_server.py --enforce-gpu --n-gpu-layers 40
 
 ### Documentation References
 - FastAPI: https://fastapi.tiangolo.com/
-- llama.cpp: https://github.com/ggerganov/llama.cpp
-- Vosk: https://alphacephei.com/vosk/
+- Ollama: https://ollama.com/
+- faster-whisper: https://github.com/SYSTRAN/faster-whisper
+- Piper: https://github.com/rhasspy/piper
 - ChromaDB: https://docs.trychroma.com/
-- Qwen2.5: https://huggingface.co/Qwen/Qwen2.5-7B-Instruct
+- Qwen2.5: https://ollama.com/library/qwen2.5
 
 ### Project Structure Summary
 ```
 Assistify Voice Help Desk
 ├── Authentication Layer (Login Server - Port 7001)
-├── Voice Processing Layer (RAG Server - Port 7000)
-├── AI Inference Layer (LLM Server - Port 8000)
+├── Voice + RAG Layer (RAG Server - Port 7000)
+├── LLM Runtime (Ollama - Port 11434, qwen2.5:3b)
+├── TTS Microservice (Piper - Port 5002)
 └── Frontend Interface (Browser - WebSocket + HTTP)
 ```
 

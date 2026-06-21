@@ -46,13 +46,24 @@
         .empty-msg { color: var(--muted); font-size: 0.88em; margin: 6px 0; font-style: italic; }
         .section-body { margin-top: 6px; }
         .section-body.collapsed { display: none; }
+        .btn-sm { padding: 4px 10px; font-size: 0.82em; margin-top: 0; margin-right: 6px; }
+        button.danger { background: var(--danger); }
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.open { display: flex; }
+        .modal { background: #2b2b2b; border-radius: 12px; padding: 24px; width: 100%; max-width: 420px; border: 1px solid #444; }
+        .modal h3 { margin-top: 0; }
+        .modal label { display: block; margin-top: 12px; color: var(--muted); font-size: 0.9em; }
+        .modal input[type="text"], .modal input[type="email"], .modal input[type="password"] { max-width: none; }
+        .modal-actions { display: flex; gap: 10px; margin-top: 20px; }
+        .readonly-field { color: var(--muted); padding: 8px 0; }
     </style>
     <script src="/static/security.js"></script>
+    {% include "_nav_shell.html" %}
 </head>
 <body>
     <div class="container">
         <h1>Platform Super Admin</h1>
-        <p class="muted">Manage businesses, assign admins, and monitor the platform.</p>
+        <p class="muted">Manage businesses, assign master admins, and monitor the platform.</p>
         <div id="summary" class="summary-bar"></div>
         <div class="card">
             <h3>Create Business</h3>
@@ -65,8 +76,29 @@
         <div id="tenants"></div>
         <p><a href="/logout" style="color:var(--accent)">Logout</a></p>
     </div>
+    <div id="editAdminModal" class="modal-overlay" onclick="if (event.target === this) closeEditAdminModal()">
+        <div class="modal" role="dialog" aria-labelledby="editAdminTitle">
+            <h3 id="editAdminTitle">Edit admin</h3>
+            <p class="muted" style="margin:0">Username</p>
+            <div id="editAdminUsername" class="readonly-field"></div>
+            <label for="editAdminFullName">Full name</label>
+            <input id="editAdminFullName" type="text" placeholder="Full name">
+            <label for="editAdminEmail">Email</label>
+            <input id="editAdminEmail" type="email" placeholder="Email">
+            <label for="editAdminPassword">New password (leave blank to keep)</label>
+            <input id="editAdminPassword" type="password" placeholder="Optional">
+            <label style="margin-top:14px">
+                <input id="editAdminActive" type="checkbox"> Active
+            </label>
+            <div class="modal-actions">
+                <button type="button" onclick="saveEditAdmin()">Save</button>
+                <button type="button" class="secondary" onclick="closeEditAdminModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
     <script>
         let tenantList = [];
+        let editAdminState = null;
 
         function csrf() {
             return (window.Security && Security.getCSRFToken()) || '';
@@ -76,6 +108,28 @@
             const headers = { 'X-CSRF-Token': csrf() };
             if (json) headers['Content-Type'] = 'application/json';
             return headers;
+        }
+
+        async function superadminRequest(path, options = {}) {
+            const wantsJson = options.json === true;
+            const headers = options.headers || apiHeaders(wantsJson);
+            const fetchOptions = {
+                method: options.method || 'GET',
+                credentials: 'same-origin',
+                headers,
+            };
+            if (options.body !== undefined) {
+                fetchOptions.body = wantsJson ? JSON.stringify(options.body) : options.body;
+            }
+
+            const res = await fetch(path, fetchOptions);
+            if (res.status === 401 || res.status === 403) {
+                const reason = await parseApiErrorMessage(res);
+                alert(`Authentication expired: ${reason}. Please log in again.`);
+                window.location.href = '/login';
+                return null;
+            }
+            return res;
         }
 
         function escapeHtml(value) {
@@ -99,20 +153,29 @@
                 : '<span class="status-dot off"></span>Inactive';
         }
 
-        function renderUserTable(users, emptyText) {
+        function renderUserTable(users, emptyText, tenantId) {
             if (!users || !users.length) {
                 return `<p class="empty-msg">${escapeHtml(emptyText)}</p>`;
             }
-            const rows = users.map(u => `
+            const showActions = tenantId != null;
+            const rows = users.map(u => {
+                const actions = showActions ? `
+                    <td>
+                        <button type="button" class="secondary btn-sm" data-action="edit-admin" data-tenant-id="${tenantId}" data-user-id="${u.id}">Edit</button>
+                        <button type="button" class="danger btn-sm" data-action="delete-admin" data-tenant-id="${tenantId}" data-user-id="${u.id}">Delete</button>
+                    </td>` : '';
+                return `
                 <tr>
                     <td>${escapeHtml(u.username)}</td>
                     <td>${escapeHtml(u.full_name || '—')}</td>
                     <td>${escapeHtml(u.email || '—')}</td>
                     <td>${u.active ? 'Yes' : 'No'}</td>
-                </tr>
-            `).join('');
+                    ${actions}
+                </tr>`;
+            }).join('');
+            const actionHeader = showActions ? '<th>Actions</th>' : '';
             return `<table class="user-table">
-                <thead><tr><th>Username</th><th>Full name</th><th>Email</th><th>Active</th></tr></thead>
+                <thead><tr><th>Username</th><th>Full name</th><th>Email</th><th>Active</th>${actionHeader}</tr></thead>
                 <tbody>${rows}</tbody>
             </table>`;
         }
@@ -170,10 +233,14 @@
 
         function renderTenantCard(t) {
             const stats = t.membership_stats || {};
+            const masterAdmins = t.master_admins || [];
+            const masterCount = masterAdmins.length;
             const admins = t.admins || [];
+            const adminCount = admins.length;
             const employees = t.employees || [];
             const customers = t.membership_customers || [];
             const rc = t.role_counts || {};
+            const hasMaster = masterCount > 0;
 
             return `
                 <div class="card">
@@ -189,8 +256,8 @@
                         <div><dt>Plan</dt><dd>${escapeHtml(t.plan || 'standard')}</dd></div>
                         <div><dt>Created</dt><dd>${formatDate(t.created_at)}</dd></div>
                         <div><dt>Total users</dt><dd>${t.user_count || 0}</dd></div>
-                        <div><dt>Staff breakdown</dt><dd>${rc.admin || 0} admins, ${rc.employee || 0} employees, ${rc.customer || 0} customers</dd></div>
-                        <div><dt>Multiple admins</dt><dd>${t.allow_multiple_admins ? 'Allowed' : 'Single admin'}</dd></div>
+                        <div><dt>Staff breakdown</dt><dd>${rc.master_admin || 0} master admin, ${rc.admin || 0} admins, ${rc.employee || 0} employees, ${rc.customer || 0} customers</dd></div>
+                        <div><dt>Master admin</dt><dd>${hasMaster ? 'Assigned' : 'Not assigned'}</dd></div>
                     </dl>
                     <div class="chips">
                         <span class="chip pending">Pending: ${stats.pending || 0}</span>
@@ -198,32 +265,33 @@
                         <span class="chip rejected">Rejected: ${stats.rejected || 0}</span>
                         <span class="chip revoked">Revoked: ${stats.revoked || 0}</span>
                     </div>
-                    ${renderSection(t.id, 'admins', 'Admins', admins.length,
-                        renderUserTable(admins, 'No admins yet — use Add admin below.'), true)}
+                    ${renderSection(t.id, 'master_admins', 'Master Admin', masterCount,
+                        renderUserTable(masterAdmins, 'No master admin — assign one below.', t.id), true)}
+                    ${renderSection(t.id, 'admins', 'Normal Admins (read-only)', adminCount,
+                        renderUserTable(admins, 'Normal admins are managed by the master admin.', null), false)}
                     ${renderSection(t.id, 'employees', 'Employees', employees.length,
                         renderUserTable(employees, 'No employees for this business.'), false)}
                     ${renderSection(t.id, 'customers', 'Approved customers', customers.length,
                         renderCustomerTable(customers), false)}
-                    <label style="display:block;margin-top:12px">
-                        <input type="checkbox" ${t.allow_multiple_admins ? 'checked' : ''} onchange="toggleMultiAdmin(${t.id}, this.checked)">
-                        Allow multiple admins
-                    </label>
                     <div class="row" style="margin-top:12px">
-                        <input id="adminUser_${t.id}" placeholder="Admin username">
-                        <input id="adminPass_${t.id}" type="password" placeholder="Password">
-                        <button onclick="createManager(${t.id})">Add admin</button>
-                        <button class="secondary" onclick="toggleTenant(${t.id}, ${t.active ? 'false' : 'true'})">${t.active ? 'Deactivate' : 'Activate'}</button>
+                        <input id="adminUser_${t.id}" placeholder="Master admin username" ${hasMaster ? 'disabled' : ''}>
+                        <input id="adminFullName_${t.id}" placeholder="Full name" ${hasMaster ? 'disabled' : ''}>
+                        <input id="adminEmail_${t.id}" type="email" placeholder="Email" ${hasMaster ? 'disabled' : ''}>
+                        <input id="adminPass_${t.id}" type="password" placeholder="Password" ${hasMaster ? 'disabled' : ''}>
+                        <button onclick="createManager(${t.id})" ${hasMaster ? 'disabled' : ''}>Add master admin</button>
+                        <button class="secondary" onclick="toggleTenant(${t.id}, '${t.active ? 'false' : 'true'}')">${t.active ? 'Deactivate' : 'Activate'}</button>
                     </div>
-                    <p class="muted" style="margin:8px 0 0">KB: log in as this business's admin to manage knowledge.</p>
+                    <p class="muted" style="margin:8px 0 0">One master admin per tenant. Normal admins are created by the master admin.</p>
                 </div>
             `;
         }
 
         async function loadTenants() {
             try {
-                const res = await fetch('/api/tenants', { credentials: 'same-origin' });
+                const res = await superadminRequest('/api/tenants');
+                if (!res) return;
                 if (!res.ok) {
-                    alert(await Security.parseApiError(res));
+                    alert(await parseApiErrorMessage(res));
                     return;
                 }
                 tenantList = await res.json();
@@ -246,14 +314,14 @@
                 return;
             }
             try {
-                const res = await fetch('/api/tenants/create', {
+                const res = await superadminRequest('/api/tenants/create', {
                     method: 'POST',
-                    credentials: 'same-origin',
-                    headers: apiHeaders(true),
-                    body: JSON.stringify({ name, slug })
+                    json: true,
+                    body: { name, slug }
                 });
+                if (!res) return;
                 if (!res.ok) {
-                    alert(await Security.parseApiError(res));
+                    alert(await parseApiErrorMessage(res));
                     return;
                 }
                 document.getElementById('tenantName').value = '';
@@ -267,41 +335,52 @@
 
         async function createManager(tenantId) {
             const username = document.getElementById('adminUser_' + tenantId).value.trim();
+            const fullName = document.getElementById('adminFullName_' + tenantId).value.trim();
+            const email = document.getElementById('adminEmail_' + tenantId).value.trim();
             const password = document.getElementById('adminPass_' + tenantId).value;
             if (!username || !password) {
                 alert('Username and password are required.');
                 return;
             }
+            if (email && window.Security && !Security.isValidEmail(email)) {
+                alert('Please enter a valid email address.');
+                return;
+            }
+            const payload = { username, password };
+            if (fullName) payload.full_name = fullName;
+            if (email) payload.email = email;
             try {
-                const res = await fetch('/api/tenants/' + tenantId + '/managers', {
+                const res = await superadminRequest('/api/tenants/' + tenantId + '/managers', {
                     method: 'POST',
-                    credentials: 'same-origin',
-                    headers: apiHeaders(true),
-                    body: JSON.stringify({ username, password })
+                    json: true,
+                    body: payload
                 });
+                if (!res) return;
                 if (!res.ok) {
-                    alert(await Security.parseApiError(res));
+                    alert(await parseApiErrorMessage(res));
                     return;
                 }
-                alert('Admin created');
+                alert('Master admin created');
                 document.getElementById('adminUser_' + tenantId).value = '';
+                document.getElementById('adminFullName_' + tenantId).value = '';
+                document.getElementById('adminEmail_' + tenantId).value = '';
                 document.getElementById('adminPass_' + tenantId).value = '';
                 loadTenants();
             } catch (err) {
-                alert('Add admin failed: ' + (err.message || err));
+                alert('Add master admin failed: ' + (err.message || err));
             }
         }
 
         async function toggleTenant(tenantId, activate) {
-            const path = activate === 'true' ? 'activate' : 'deactivate';
+            const shouldActivate = activate === true || activate === 'true';
+            const path = shouldActivate ? 'activate' : 'deactivate';
             try {
-                const res = await fetch('/api/tenants/' + tenantId + '/' + path, {
-                    method: 'POST',
-                    credentials: 'same-origin',
-                    headers: apiHeaders(false)
+                const res = await superadminRequest('/api/tenants/' + tenantId + '/' + path, {
+                    method: 'POST'
                 });
+                if (!res) return;
                 if (!res.ok) {
-                    alert(await Security.parseApiError(res));
+                    alert(await parseApiErrorMessage(res));
                     return;
                 }
                 loadTenants();
@@ -312,19 +391,138 @@
 
         async function toggleMultiAdmin(tenantId, enabled) {
             try {
-                const res = await fetch('/api/tenants/' + tenantId + '/settings', {
+                const res = await superadminRequest('/api/tenants/' + tenantId + '/settings', {
                     method: 'POST',
-                    credentials: 'same-origin',
-                    headers: apiHeaders(true),
-                    body: JSON.stringify({ allow_multiple_admins: enabled })
+                    json: true,
+                    body: { allow_multiple_admins: enabled }
                 });
+                if (!res) return;
                 if (!res.ok) {
-                    alert(await Security.parseApiError(res));
+                    alert(await parseApiErrorMessage(res));
                     loadTenants();
                 }
             } catch (err) {
                 alert('Settings update failed: ' + (err.message || err));
                 loadTenants();
+            }
+        }
+
+        function findAdminInTenant(tenantId, userId) {
+            const tenant = tenantList.find(t => t.id === tenantId);
+            if (!tenant || !tenant.master_admins) return null;
+            return tenant.master_admins.find(a => a.id === userId) || null;
+        }
+
+        function parseApiErrorMessage(res) {
+            if (window.Security && typeof Security.parseApiError === 'function') {
+                return Security.parseApiError(res);
+            }
+            return res.statusText || `Request failed (${res.status})`;
+        }
+
+        document.getElementById('tenants').addEventListener('click', (event) => {
+            const editBtn = event.target.closest('[data-action="edit-admin"]');
+            if (editBtn) {
+                openEditAdminModal(
+                    Number(editBtn.dataset.tenantId),
+                    Number(editBtn.dataset.userId),
+                );
+                return;
+            }
+            const deleteBtn = event.target.closest('[data-action="delete-admin"]');
+            if (deleteBtn) {
+                deleteAdmin(
+                    Number(deleteBtn.dataset.tenantId),
+                    Number(deleteBtn.dataset.userId),
+                    deleteBtn,
+                );
+            }
+        });
+
+        function openEditAdminModal(tenantId, userId) {
+            const admin = findAdminInTenant(tenantId, userId);
+            if (!admin) {
+                alert('Admin not found. Refresh and try again.');
+                return;
+            }
+            editAdminState = { tenantId, userId };
+            document.getElementById('editAdminUsername').textContent = admin.username;
+            document.getElementById('editAdminFullName').value = admin.full_name || '';
+            document.getElementById('editAdminEmail').value = admin.email || '';
+            document.getElementById('editAdminPassword').value = '';
+            document.getElementById('editAdminActive').checked = !!admin.active;
+            document.getElementById('editAdminModal').classList.add('open');
+        }
+
+        function closeEditAdminModal() {
+            editAdminState = null;
+            document.getElementById('editAdminModal').classList.remove('open');
+        }
+
+        async function saveEditAdmin() {
+            if (!editAdminState) return;
+            const { tenantId, userId } = editAdminState;
+            const fullName = document.getElementById('editAdminFullName').value.trim();
+            const email = document.getElementById('editAdminEmail').value.trim();
+            const password = document.getElementById('editAdminPassword').value;
+            const active = document.getElementById('editAdminActive').checked;
+            if (email && window.Security && !Security.isValidEmail(email)) {
+                alert('Please enter a valid email address.');
+                return;
+            }
+            if (password && password.length < 8) {
+                alert('Password must be at least 8 characters.');
+                return;
+            }
+            const payload = { full_name: fullName || null, email: email || null, active };
+            if (password) payload.password = password;
+            try {
+                const res = await superadminRequest('/api/tenants/' + tenantId + '/managers/' + userId, {
+                    method: 'PATCH',
+                    json: true,
+                    body: payload
+                });
+                if (!res) return;
+                if (!res.ok) {
+                    alert(await parseApiErrorMessage(res));
+                    return;
+                }
+                closeEditAdminModal();
+                loadTenants();
+            } catch (err) {
+                alert('Update failed: ' + (err.message || err));
+            }
+        }
+
+        async function deleteAdmin(tenantId, userId, triggerBtn) {
+            const admin = findAdminInTenant(tenantId, userId);
+            const username = admin ? admin.username : ('user #' + userId);
+            if (!confirm('Permanently delete admin "' + username + '"?')) return;
+
+            const btn = triggerBtn || null;
+            const prevText = btn ? btn.textContent : '';
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Deleting…';
+            }
+
+            try {
+                const res = await superadminRequest('/api/tenants/' + tenantId + '/managers/' + userId, {
+                    method: 'DELETE'
+                });
+                if (!res) return;
+                if (!res.ok) {
+                    alert(await parseApiErrorMessage(res));
+                    return;
+                }
+                await loadTenants();
+            } catch (err) {
+                alert('Delete failed: ' + (err.message || err));
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = prevText;
+                }
             }
         }
 

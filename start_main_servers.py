@@ -88,11 +88,16 @@ def print_startup_banner(*, single_console: bool, status_only: bool) -> None:
     if not status_only and not single_console:
         print()
         print("Open when Ready: http://127.0.0.1:7001/login")
-        print("  Dev login: admin / admin  or  superadmin / superadmin123")
+        print("  Dev login: admin / admin  or  superadmin / superadmin")
         print()
-        print("Coordinator scans ports first, then opens Assistify * windows.")
+        print("If Ollama bind errors: python start_main_servers.py --restart-ollama")
+        print("After startup:           python scripts/verify_stack.py")
+        print()
+        print("Coordinator opens five windows every run: Ollama, Piper, LLM, RAG, Login.")
+        print("Ollama window shows status/models if the tray app already owns port 11434.")
         print("Close each service window to stop that service.")
         print("First RAG boot may take several minutes (Whisper model load).")
+        print("First voice use may download Whisper small.en (~460MB one-time).")
     print("------------------------------------")
 
 

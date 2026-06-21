@@ -17,7 +17,7 @@ The main innovation is **TOON format** (Token-Oriented Object Notation) that red
 
 ### 1.2 Real Architecture (Not Theory)
 
-System have **3 separate servers** running on different ports:
+System have **3 application servers** plus **Ollama** and **Piper TTS**:
 
 ```
 ┌─────────────────────┐
@@ -32,18 +32,21 @@ System have **3 separate servers** running on different ports:
 │   server.py)        │
 └──────────┬──────────┘
            │
-           ↓ HTTP Request
-┌─────────────────────┐
-│  LLM Server         │ ← Pure inference (Port 8000)
-│  (main_llm_         │
-│   server.py)        │
-└─────────────────────┘
+     ┌─────┴─────┐
+     ↓           ↓
+┌──────────┐  ┌──────────┐
+│  Ollama  │  │  Piper   │
+│  :11434  │  │  :5002   │
+│ qwen2.5  │  │  TTS     │
+│   :3b    │  │  (CPU)   │
+└──────────┘  └──────────┘
 ```
 
-**Why 3 servers?**
+**Why this layout?**
 - **Login Server (7001)**: Handle authentication, session, admin panel, file upload. Act as WebSocket proxy to connect frontend to RAG server.
-- **RAG Server (7000)**: Process voice input using faster-whisper, search documents in ChromaDB, format context using TOON, send to LLM.
-- **LLM Server (8000)**: Only do inference using Qwen model on GPU. No other task. Keep it simple for performance.
+- **RAG Server (7000)**: Process voice input using faster-whisper (CPU), search documents in ChromaDB, format context using TOON, call Ollama for generation, stream Piper TTS audio.
+- **Ollama (11434)**: Local LLM runtime for `qwen2.5:3b` on GPU. RAG server calls `/api/chat` directly.
+- **Piper TTS (5002)**: CPU neural TTS microservice (`tts_service/piper_server.py`).
 
 ### 1.3 Technologies Actually Used (From Code)
 
@@ -53,21 +56,24 @@ System have **3 separate servers** running on different ports:
 - SQLite3 for database (conversations, users, analytics, sessions)
 
 **AI Models:**
-- **LLM**: Qwen2.5-7B-Instruct Q4_K_M (quantized, split in 2 GGUF files)
-  - Location: `backend/Models/Qwen2.5-7B-LLM/`
-  - Size: 4.36 GB total
-  - Inference library: llama-cpp-python with CUDA support
-- **Voice Recognition**: faster-whisper medium.en
-  - Location: `backend/Models/models--Systran--faster-whisper-medium.en/`
-  - Run on CUDA GPU with float16
-  - Have VAD (Voice Activity Detection) built-in
+- **LLM**: `qwen2.5:3b` via Ollama (local service on port 11434)
+  - Pull: `ollama pull qwen2.5:3b`
+  - Config: `OLLAMA_MODEL` in `config.py`
+  - GPU offloading managed by Ollama (ggml-cuda)
+- **Voice Recognition**: faster-whisper (default `tiny.en`)
+  - Location: `backend/Models/faster-whisper-tiny.en/`
+  - Runs on **CPU** (`WHISPER_DEVICE=cpu`, int8) so GPU stays free for Ollama + embeddings
+  - Built-in VAD (Voice Activity Detection)
+- **Text-to-Speech**: Piper ONNX voices
+  - Microservice: `tts_service/piper_server.py` on port 5002
+  - CPU-only synthesis
 - **Embeddings**: all-MiniLM-L6-v2 (sentence-transformers)
-  - Used for convert text to vector for ChromaDB
+  - Used to convert text to vectors for ChromaDB
 
 **GPU Requirements:**
 - NVIDIA GPU with CUDA support (tested on RTX 3070 8GB)
-- CUDA Toolkit installed
-- llama-cpp-python built with CUBLAS flag
+- GPU used by Ollama (LLM) and RAG embeddings/reranker when `RAG_USE_GPU=1`
+- Voice STT and TTS intentionally stay on CPU
 
 **Vector Database:**
 - ChromaDB (persistent storage)
@@ -84,99 +90,51 @@ System have **3 separate servers** running on different ports:
 
 ## 2. How Each Server Works (Based on Actual Code)
 
-### 2.1 LLM Server (main_llm_server.py)
+### 2.1 LLM Inference (Ollama)
 
-**Purpose:** Only run Qwen model inference. Nothing else.
+**Purpose:** Run local chat completions with `qwen2.5:3b`. The RAG server calls Ollama directly; `main_llm_server.py` is an optional thin proxy on port 8000.
 
-**Startup Process (from code line 119-210):**
-1. Check if nvidia-smi available (verify GPU exists)
-2. Check if llama-cpp-python built with CUDA support
-3. Load Qwen model from `backend/Models/Qwen2.5-7B-LLM/`
-4. Offload 10 layers to GPU (configurable in config.py: N_GPU_LAYERS=10)
-5. Set context window to 512 tokens (N_CTX=512)
-6. Set batch size to 2 (N_BATCH=2)
-7. Start FastAPI on port 8000
+**Startup (operator):**
+1. Install Ollama and start `ollama serve`
+2. Pull model: `ollama pull qwen2.5:3b`
+3. Verify: `ollama list` shows `qwen2.5:3b`
 
-**GPU Configuration (from config.py):**
+**Configuration (from `config.py`):**
 ```python
-N_GPU_LAYERS = 10        # How many layers on GPU (0-32)
-N_CTX = 512              # Context window size
-N_BATCH = 2              # Batch size for processing
-ENFORCE_GPU = True       # Server will crash if GPU not available
+OLLAMA_MODEL = "qwen2.5:3b"
+LLM_URL = "http://127.0.0.1:11434/api/chat"
+OLLAMA_HOST = "127.0.0.1"
+OLLAMA_PORT = 11434
 ```
 
-**API Endpoints (from code line 220-382):**
+**RAG server call pattern:**
+- POST to `LLM_URL` with `model`, `messages`, and Ollama options (`num_ctx`, `num_gpu`, etc.)
+- Response parsed from Ollama native chat JSON (`message.content`)
 
-1. **GET /health**
-   - Check if LLM ready
-   - Return GPU info (memory usage, layers loaded)
-   - Response example:
-     ```json
-     {
-       "status": "ready",
-       "model": "qwen2.5-7b-instruct",
-       "gpu_layers": 10,
-       "context_size": 512
-     }
-     ```
-
-2. **POST /v1/chat/completions**
-   - Main inference endpoint
-   - Accept messages in OpenAI format:
-     ```json
-     {
-       "model": "qwen2.5-7b-instruct",
-       "messages": [
-         {"role": "system", "content": "You are assistant"},
-         {"role": "user", "content": "Hello"}
-       ],
-       "max_tokens": 80,
-       "temperature": 0.7
-     }
-     ```
-   - Process:
-     1. Reset KV cache (llm.reset() - prevent memory buildup)
-     2. Generate response using llama-cpp
-     3. Return in OpenAI format
-   - Performance: ~24 seconds for greeting with RAG context
-
-**Important Code Logic (line 238-250):**
-```python
-# Before each request, reset KV cache
-llm.reset()
-
-# Cap max_tokens to prevent GPU OOM
-max_tokens = min(request_max_tokens, 300)
-
-# Generate
-response = llm.create_chat_completion(
-    messages=messages,
-    max_tokens=max_tokens,
-    temperature=temperature,
-    stop=stop
-)
-```
+**Optional proxy (`main_llm_server.py`, port 8000):**
+- Health-checks Ollama model list on startup
+- Exposes OpenAI-compatible `POST /v1/chat/completions` forwarding to Ollama
+- Not required for normal operation
 
 ### 2.2 RAG Server (assistify_rag_server.py)
 
 **Purpose:** Handle voice input, search knowledge base, format context with TOON, call LLM.
 
-**Startup Process (from code line 121-192):**
+**Startup Process:**
 1. Initialize SQLite databases (conversations, sessions, analytics)
-2. Create aiohttp session for LLM requests (with connection pooling)
-3. Check CUDA available
-4. Load faster-whisper model to GPU
-5. Initialize ChromaDB collection "support_docs"
+2. Create aiohttp session for Ollama requests (with connection pooling)
+3. Load faster-whisper model on **CPU** (via `backend/voice_audio/`)
+4. Probe Piper TTS health on port 5002
+5. Initialize ChromaDB collection
 6. Start FastAPI on port 7000
 
-**faster-whisper Configuration (from code line 149-191):**
+**faster-whisper Configuration (from `config.py`):**
 ```python
-whisper_model = WhisperModel(
-    str(WHISPER_MODEL_PATH),
-    device="cuda",              # Use GPU
-    compute_type="float16",     # Fast GPU inference
-    download_root=None          # Use local model only
-)
+WHISPER_MODEL_PATH = "backend/Models/faster-whisper-tiny.en"
+WHISPER_DEVICE = "cpu"
+WHISPER_COMPUTE_TYPE = "int8"
+WHISPER_BEAM_SIZE = 1
+WHISPER_VAD_FILTER = True
 ```
 
 **Key Features Implemented:**
@@ -273,26 +231,18 @@ whisper_model = WhisperModel(
    messages.append({"role": "user", "content": text.strip()})
    ```
 
-6. **Call LLM server** via HTTP POST:
+6. **Call Ollama** via HTTP POST to `LLM_URL`:
    ```python
    payload = {
-       "model": "qwen2.5-7b-instruct",
+       "model": "qwen2.5:3b",
        "messages": messages,
-       "max_tokens": 80,      # Short answers for speed
-       "temperature": 0.7,
-       "stop": None
+       "stream": False,
+       "options": {"num_ctx": 512, "temperature": 0.7}
    }
    async with llm_session.post(LLM_URL, json=payload) as resp:
        result = await resp.json()
+   ai_text = result["message"]["content"]
    ```
-
-7. **Extract response and save**:
-   ```python
-   ai_text = result["choices"][0]["message"]["content"]
-   save_conversation(connection_id, text, ai_text, relevant_docs)
-   ```
-
-8. **Return response + document count**
 
 **Performance Optimization Done:**
 - Greeting detection: Skip RAG for simple greetings (save 20 seconds)
@@ -340,6 +290,14 @@ Admin can upload document to knowledge base:
 6. Return success message
 
 **Note:** PDF parsing can fail if PyPDF2 not installed. Will return error message but not crash.
+
+#### E. Piper TTS (port 5002)
+
+Voice replies are synthesized server-side:
+- RAG server calls `tts_service/piper_server.py` over HTTP
+- Piper runs on CPU (ONNX voices via `PIPER_*_VOICE_PATH`)
+- Audio is streamed to the browser over WebSocket after LLM text is ready
+- Implementation lives in `backend/voice_audio/tts/`
 
 ### 2.3 Login Server (login_server.py)
 
@@ -1084,62 +1042,38 @@ def log_security_event(event_type: str, details: dict, severity: str = "INFO"):
 
 ## 6. API Endpoints Reference
 
-### 6.1 LLM Server (Port 8000)
+### 6.1 Ollama LLM (Port 11434)
 
-#### GET /health
-Check if LLM ready.
+RAG server uses Ollama's native chat API directly. Optional proxy: `main_llm_server.py` on port 8000.
 
-**Response:**
+#### Ollama POST /api/chat (used by RAG)
+**Request (simplified):**
 ```json
 {
-  "status": "ready",
-  "model": "qwen2.5-7b-instruct",
-  "gpu_layers": 10,
-  "context_size": 512
-}
-```
-
-#### POST /v1/chat/completions
-Generate response from LLM.
-
-**Request:**
-```json
-{
-  "model": "qwen2.5-7b-instruct",
+  "model": "qwen2.5:3b",
   "messages": [
     {"role": "system", "content": "You are helpful assistant"},
     {"role": "user", "content": "What is RAG?"}
   ],
-  "max_tokens": 80,
-  "temperature": 0.7,
-  "stop": null
+  "stream": false,
+  "options": {"num_ctx": 512, "temperature": 0.7}
 }
 ```
 
-**Response:**
+**Response (simplified):**
 ```json
 {
-  "id": "chatcmpl-abc123",
-  "object": "chat.completion",
-  "created": 1700000000,
-  "model": "qwen2.5-7b-instruct",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "RAG stands for Retrieval-Augmented Generation..."
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 25,
-    "completion_tokens": 45,
-    "total_tokens": 70
-  }
+  "model": "qwen2.5:3b",
+  "message": {
+    "role": "assistant",
+    "content": "RAG stands for Retrieval-Augmented Generation..."
+  },
+  "done": true
 }
 ```
+
+#### Optional proxy GET /health (port 8000)
+Returns Ollama reachability and model list when using `main_llm_server.py`.
 
 ### 6.2 RAG Server (Port 7000)
 
@@ -1376,14 +1310,15 @@ Just forward all message to RAG server WebSocket.
 
 2. **Install Python dependencies**
    ```powershell
-   cd "Graduation Project"
+   conda env create -f environment_main.yml
+   conda activate assistify_main
    pip install -r requirements.txt
    ```
 
-3. **Install llama-cpp-python with CUDA**
+3. **Install and start Ollama**
    ```powershell
-   $env:CMAKE_ARGS="-DLLAMA_CUBLAS=ON"
-   pip install llama-cpp-python --force-reinstall --no-cache-dir
+   ollama serve
+   ollama pull qwen2.5:3b
    ```
 
 4. **Create `.env` file**
@@ -1402,14 +1337,12 @@ Just forward all message to RAG server WebSocket.
    EMAILJS_TEMPLATE_ID=your_emailjs_template_id
    ```
 
-5. **Download model** (if not exist)
-   
-   Model already in `backend/Models/Qwen2.5-7B-LLM/`, check it exist:
+5. **Verify models**
    ```powershell
-   ls backend\Models\Qwen2.5-7B-LLM\
+   ollama list
+   ls backend\Models\faster-whisper-tiny.en\
+   python Login_system\init_users_db.py
    ```
-
-   Should see 2 GGUF files (total ~4.3GB)
 
 6. **Initialize knowledge base** (optional)
    ```powershell
@@ -1421,26 +1354,24 @@ Just forward all message to RAG server WebSocket.
 **Option 1: Use batch script (recommended)**
 
 ```powershell
-.\scripts\start_all_servers.bat
+python start_main_servers.py
 ```
 
-This will:
-1. Kill existing process on port 8000, 7000, 7001
-2. Start LLM server (wait 15s)
-3. Start RAG server (wait 20s)
-4. Start Login server (wait 5s)
-5. Total wait: ~45 seconds
+This starts Login (7001), RAG (7000), and Piper TTS (5002). Ollama must already be running on 11434.
 
 **Option 2: Manual start (for debugging)**
 
-Terminal 1 - LLM Server:
+Terminal 1 - Ollama (if not a system service):
 ```powershell
-cd backend
-python main_llm_server.py
-# Wait until see "✓ Model loaded successfully" (~18 seconds)
+ollama serve
 ```
 
-Terminal 2 - RAG Server:
+Terminal 2 - Piper TTS:
+```powershell
+python -m uvicorn tts_service.piper_server:app --host 127.0.0.1 --port 5002
+```
+
+Terminal 3 - RAG Server:
 ```powershell
 cd backend
 python assistify_rag_server.py
@@ -1598,7 +1529,7 @@ python login_server.py
 These feature in documentation but not in code:
 
 1. **Multi-language support** - Only English work
-2. **Voice output customization** - Use browser TTS, no control
+2. **Voice output customization** - Piper voices configurable via env; limited per-user control
 3. **Conversation export** - Cannot download chat history
 4. **User profile page** - Can only change password
 5. **Real-time typing indicator** - Not implemented
@@ -1687,7 +1618,8 @@ BCRYPT_ROUNDS=12
 
 # URLs
 BASE_URL=https://yourdomain.com
-LLM_SERVER_URL=http://localhost:8000
+LLM_URL=http://127.0.0.1:11434/api/chat
+OLLAMA_MODEL=qwen2.5:3b
 RAG_SERVER_URL=http://localhost:7000
 ```
 
@@ -1726,32 +1658,23 @@ server {
 
 ### 11.3 Process Manager (systemd)
 
-Create `/etc/systemd/system/assistify-llm.service`:
+Run Ollama as a system service (see Ollama docs), then create Assistify app units.
 
+Example `/etc/systemd/system/assistify-rag.service`:
 ```ini
-[Unit]
-Description=Assistify LLM Server
-After=network.target
-
 [Service]
-Type=simple
-User=assistify
-WorkingDirectory=/opt/assistify/backend
-Environment="PATH=/opt/assistify/venv/bin"
-ExecStart=/opt/assistify/venv/bin/python main_llm_server.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
+ExecStart=/opt/assistify/venv/bin/python backend/assistify_rag_server.py
 ```
 
-Repeat for RAG and Login server.
-
-Start:
-```bash
-sudo systemctl enable assistify-llm assistify-rag assistify-login
-sudo systemctl start assistify-llm assistify-rag assistify-login
+Example `/etc/systemd/system/assistify-piper.service`:
+```ini
+[Service]
+ExecStart=/opt/assistify/venv/bin/python -m uvicorn tts_service.piper_server:app --host 127.0.0.1 --port 5002
 ```
+
+`main_llm_server.py` on port 8000 is optional; production RAG calls Ollama on 11434 directly.
+
+Repeat similar units for Login server (`login_server.py`). Enable Ollama separately via its own service.
 
 ---
 
@@ -1761,7 +1684,8 @@ This documentation describe actual implementation of Assistify system based on r
 
 **Main achievement:**
 - 3-tier architecture with separate concern
-- Voice input using faster-whisper on GPU
+- Voice input using faster-whisper on CPU; Piper TTS for spoken replies
+- LLM via Ollama (`qwen2.5:3b`) on GPU
 - RAG system with ChromaDB and semantic search
 - TOON format innovation (40-60% token savings)
 - Complete authentication with OAuth and OTP

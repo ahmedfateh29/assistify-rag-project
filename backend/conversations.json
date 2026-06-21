@@ -1,205 +1,93 @@
 {
   "conversations": [
     {
-      "id": "4236c5b3-6f75-4c89-a6cf-c4cc4b5bd125",
-      "title": "How do you get into me?",
-      "messages": [
-        {
-          "role": "user",
-          "text": "How do you get into me?"
-        },
-        {
-          "role": "assistant",
-          "text": "Not found in the document."
-        },
-        {
-          "role": "user",
-          "text": "Hi!"
-        },
-        {
-          "role": "assistant",
-          "text": "Hello! Thank you for contacting support. How can I help you today?"
-        },
-        {
-          "role": "user",
-          "text": "Hello, Cemandi! So back here. Hi, how are you doing? Are you getting me?"
-        },
-        {
-          "role": "assistant",
-          "text": "Yes, I'm here with you and I received your message. How can I help you today?"
-        },
-        {
-          "role": "user",
-          "text": "Moutre."
-        },
-        {
-          "role": "assistant",
-          "text": "I don't have that specific detail in our help materials yet. I can help with questions covered in our knowledge base-what would you like to know?"
-        }
-      ],
-      "created_at": "2026-06-18T21:52:26.924618+00:00",
-      "updated_at": "2026-06-19T20:53:23.419688+00:00",
-      "tenant_id": 1,
-      "owner": "admin"
-    },
-    {
-      "id": "5f8a20e0-5b3b-4bf2-8e2f-6d5546de1096",
+      "id": "aa49780d-d772-48ba-8371-e0a29d621a62",
       "title": "New chat",
       "messages": [],
-      "created_at": "2026-06-18T21:50:20.954803+00:00",
-      "updated_at": "2026-06-18T21:50:20.954803+00:00"
+      "tenant_id": 1,
+      "owner": "admin",
+      "created_at": "2026-06-21T02:06:21.539184+00:00",
+      "updated_at": "2026-06-21T02:06:21.539184+00:00"
     },
     {
-      "id": "0e397a5c-0b55-43b3-89e2-887327dc1d05",
-      "title": "hi",
+      "id": "cca887ec-9dc8-4780-963e-651b3ba652da",
+      "title": "New chat",
+      "messages": [],
+      "tenant_id": 1,
+      "owner": "admin",
+      "created_at": "2026-06-21T02:06:21.518994+00:00",
+      "updated_at": "2026-06-21T02:06:21.518994+00:00"
+    },
+    {
+      "id": "d2b075c0-3291-441f-962e-b2f8fc7d897a",
+      "title": "According to the IBM HR Attrition CRISP-DM report,...",
       "messages": [
         {
           "role": "user",
-          "text": "hi"
+          "text": "According to the IBM HR Attrition CRISP-DM report, what is the exact attrition rate, and which department has the highest attrition percentage?"
         },
         {
           "role": "assistant",
-          "text": "Hello! Thank you for contacting support. How can I help you today?"
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
         },
         {
           "role": "user",
-          "text": "What is scientific management?"
+          "text": "According to the IBM HR Attrition CRISP-DM report, what is the exact attrition rate, and which department has the highest attrition percentage?"
         },
         {
           "role": "assistant",
-          "text": "Scientific Management is the art of knowing exactly what you want your men to do and then making sure they do it in the best and cheapest way."
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
         },
         {
           "role": "user",
-          "text": "What are the six Ms of management?"
+          "text": "According to the IBM HR Attrition CRISP-DM report, what is the exact attrition rate, and which department has the highest attrition percentage?"
         },
         {
           "role": "assistant",
-          "text": "- People\n- Money\n- Machines\n- Materials\n- Methods\n- Markets"
+          "text": "The exact attrition rate is 16.12%. Sales has the highest attrition percentage at 20.63%."
         },
         {
           "role": "user",
-          "text": "Who was Peter Drucker and what is MBO?"
+          "text": "What was the ROC-AUC score of the Logistic Regression baseline model at the default 0.50 threshold?"
         },
         {
           "role": "assistant",
-          "text": "Peter Drucker presented Management by Objectives (MBO) in his 1954 book \"The Practice of Management.\" MBO focuses on setting objectives collaboratively between managers and subordinates. The goals are clearly defined so that every member within the or ganization understands their expectations and how they should work towards achieving organizational goals. This concept aims to create value for both employees and organizations by aligning individual efforts with collective success."
+          "text": "The ROC-AUCscore of the Logistic Regression baseline model at the default 0.50 threshold is 0.7272."
         },
         {
           "role": "user",
-          "text": "What are the steps in the planning process?"
+          "text": "What are the three parts of the soul according to Plato, and how did he define the 'rational' part?"
         },
         {
           "role": "assistant",
-          "text": "- Development of planning premises\n- boundaries\n- very important\n- Identification of different alternatives\n- Evaluation and selection of best alternative\n- evaluated"
+          "text": "Sorry, request timed out. Please tryagain."
         },
         {
           "role": "user",
-          "text": "explain more (follow-up)"
-        },
-        {
-          "role": "assistant",
-          "text": "Development of planning premises: After the for mulation of the objectives, the next step to be followed is developing of planning premises. Planning premises are the assumptions, boundaries, limits under which plan can be successfully implemented or can be executed Objective of the whole or ganisation Principles of Business Management 56 smoothly. It is a very important step because if there is a flaw in setting up premises then the whole planning process will go waste. The above diagram s hows that if each department's objective is fulfilled then it will lead to the achievement of the objective of the whole or ganization. It is important for the planner to take note of future opportunities and thre at along with internal strength and weakness of the or ganization while formulating its objectives. This refers to Identification of different alternatives, which in the document is associated with the steps in the planning process in the same list as Internal premises are controllable and e, Development of planning premises, and boundaries. This refers to Evaluation and selection of best alternative, which in the document is associated with the steps in the planning process in the same list as Internal premises are controllable and e, Development of planning premises, and boundaries. This refers to evaluated, which in the document is associated with the steps in the planning process in the same list as Development of planning premises, boundaries, and very important. (The document mentions this concept but does not provide a detailed explanation.)"
+          "text": "What are the three parts of the soul according to Plato, and how did he define the 'rational' part?"
         },
         {
           "role": "user",
-          "text": "What is the capital of France? (negative test)"
+          "text": "What are the three parts of the soul according to Plato, and how did he define the 'rational' part?"
         },
         {
           "role": "assistant",
-          "text": "Not found in the document."
-        },
-        {
-          "role": "user",
-          "text": "What is the capital of France?"
-        },
-        {
-          "role": "assistant",
-          "text": "Not found in the document."
+          "text": "Sorry, request timed out. Please tryagain."
         }
       ],
-      "created_at": "2026-06-18T20:24:38.843321+00:00",
-      "updated_at": "2026-06-18T20:27:21.596391+00:00"
+      "tenant_id": 1,
+      "owner": "ahmed_fateh22",
+      "created_at": "2026-06-20T22:17:40.451881+00:00",
+      "updated_at": "2026-06-21T09:44:13.994680+00:00"
     },
     {
-      "id": "3c6fafb0-7f3a-4350-bad3-7c3f0f59b390",
-      "title": "What is scientific management?",
-      "messages": [
-        {
-          "role": "user",
-          "text": "What is scientific management?"
-        },
-        {
-          "role": "assistant",
-          "text": "Scientific Management is the art of knowing exactly what you want your men to do and then making sure they do it in the best and cheapest way."
-        },
-        {
-          "role": "user",
-          "text": "explain more (follow-up)"
-        },
-        {
-          "role": "assistant",
-          "text": "Scientific Management, as described in the previous answer, focuses on understanding precisely what needs to be done by employees and then implementing methods to ensure these tasks are carried out efficiently and cost-effectively. This approach emphasizes precise planning and execution, aligning closely with the principles of management that involve optimizing resource usage across various disciplines for maximum output or results."
-        }
-      ],
-      "created_at": "2026-06-18T20:01:14.208654+00:00",
-      "updated_at": "2026-06-18T20:01:28.888018+00:00"
-    },
-    {
-      "id": "d22904ae-7fed-47f8-a8f2-c36db2f1031e",
-      "title": "hi",
-      "messages": [
-        {
-          "role": "user",
-          "text": "hi"
-        },
-        {
-          "role": "assistant",
-          "text": "Hello! Thank you for contacting support. How can I help you today?"
-        },
-        {
-          "role": "user",
-          "text": "What is scientific management?"
-        },
-        {
-          "role": "assistant",
-          "text": "Scientific Management is the art of knowing exactly what you want your men to do and then making sure they do it in the best and cheapest way."
-        },
-        {
-          "role": "user",
-          "text": "What are the six Ms of management?"
-        },
-        {
-          "role": "assistant",
-          "text": "- People\n- Money\n- Machines\n- Materials\n- Methods\n- Markets"
-        },
-        {
-          "role": "user",
-          "text": "Who was Peter Drucker and what is MBO?"
-        },
-        {
-          "role": "assistant",
-          "text": "Peter Drucker presented Management by Objectives (MBO) in his 1954 book \"The Practice of Management.\" MBO focuses on setting objectives collaboratively between managers and subordinates. The goals are clearly defined so that every member within the or ganization understands their expectations and how they should work towards achieving organizational goals. This concept aims to create value for both employees and organizations by aligning individual efforts with collective success."
-        },
-        {
-          "role": "user",
-          "text": "What are the steps in the planning process?"
-        },
-        {
-          "role": "assistant",
-          "text": "I don't have that specific detail in our help docs yet, but I can help with account access, orders, or returns. What would you like to know?"
-        },
-        {
-          "role": "user",
-          "text": "What is the capital of France?"
-        },
-        {
-          "role": "assistant",
-          "text": "Not found in the document."
-        }
-      ],
-      "created_at": "2026-06-18T19:52:42.482820+00:00",
-      "updated_at": "2026-06-18T20:02:59.626954+00:00"
+      "id": "2c52938b-cb02-46b9-ae6e-50ba738acf3c",
+      "title": "New chat",
+      "messages": [],
+      "tenant_id": 1,
+      "owner": "admin",
+      "created_at": "2026-06-20T14:01:03.068359+00:00",
+      "updated_at": "2026-06-20T14:01:03.068359+00:00"
     }
   ]
 }

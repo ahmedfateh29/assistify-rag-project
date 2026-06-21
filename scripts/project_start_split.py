@@ -24,11 +24,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.service_inventory import (  # noqa: E402
+    LEGACY_PORTS,
     PORT_OLLAMA,
     PORT_PIPER,
     default_service_specs,
+    find_pids_on_port_windows,
     kill_listeners_on_ports,
     print_inventory_table,
+    print_ollama_conflict_warnings,
     scan_services,
 )
 from scripts.project_start_server import (  # noqa: E402
@@ -42,9 +45,15 @@ from scripts.project_start_server import (  # noqa: E402
     parse_args,
     wait_for_port,
 )
+from scripts.ollama_bootstrap import (  # noqa: E402
+    ensure_ollama_model,
+    ensure_ollama_running,
+    ollama_port_ready,
+    print_ollama_failure_hints,
+    resolve_ollama_exe,
+)
 from scripts.launch_windows.write_launch_scripts import (  # noqa: E402
     LAUNCH_DIR,
-    resolve_ollama_exe,
     write_service_bats,
 )
 
@@ -179,9 +188,10 @@ async def start_service_sequential(
     specs,
     *,
     failure_hint: Optional[str] = None,
+    force_spawn: bool = False,
 ) -> bool:
     row = status_by_name.get(name)
-    if row and row.listening:
+    if not force_spawn and row and row.listening:
         print(f"[{name}] Already running on port {row.port} — skipping new window")
         return True
 
@@ -211,29 +221,57 @@ async def run_split_launcher(args) -> int:
     )
     inventory = scan_services(specs)
     print_inventory_table(inventory, title="Assistify Process Inventory (before start)")
+    print_ollama_conflict_warnings()
+
+    legacy_still_up = [p for p in LEGACY_PORTS if find_pids_on_port_windows(p)]
 
     if args.kill_ports:
-        ports = [SERVICES[0]["port"], SERVICES[1]["port"], SERVICES[2]["port"]]
+        ports = list(LEGACY_PORTS) + [SERVICES[0]["port"], SERVICES[1]["port"], SERVICES[2]["port"]]
         if not args.no_piper:
             ports.append(PORT_PIPER)
         killed = kill_listeners_on_ports(ports, exclude_ollama=True)
+        legacy_killed = [port for port, _ in killed if port in LEGACY_PORTS]
+        if legacy_killed:
+            print(
+                f"[COORDINATOR] Freed legacy ports {legacy_killed} "
+                "(old FastAPI RAG/LLM/Login/Voice layout)"
+            )
         for port, pids in killed:
             print(f"[COORDINATOR] Freed port {port} (PIDs: {pids})")
         inventory = scan_services(specs)
         print_inventory_table(inventory, title="Assistify Process Inventory (after --kill-ports)")
+        legacy_still_up = [p for p in LEGACY_PORTS if find_pids_on_port_windows(p)]
+
+    if legacy_still_up:
+        print(
+            f"[WARN] Legacy services may still run on port(s) {legacy_still_up} — "
+            "close old 'FastAPI *' cmd windows manually."
+        )
 
     status_by_name = {row.name: row for row in inventory}
     bats = generate_launch_bats(args, python_exe)
 
     all_ok = True
     failures: list[str] = []
+    ollama_ok = args.no_ollama or ollama_port_ready()
 
     if not args.no_ollama:
-        if status_by_name["Ollama"].listening:
-            print(f"[OLLAMA] Already running on 127.0.0.1:{PORT_OLLAMA}")
+        if args.restart_ollama:
+            print("[COORDINATOR] --restart-ollama: freeing port 11434...")
+            killed = kill_listeners_on_ports([PORT_OLLAMA], exclude_ollama=False)
+            for port, pids in killed:
+                print(f"[COORDINATOR] Freed port {port} (PIDs: {pids})")
+            await asyncio.sleep(1.0)
+            inventory = scan_services(specs)
+            status_by_name = {row.name: row for row in inventory}
+
+        ollama_exe = resolve_ollama_exe()
+        print(f"[COORDINATOR] Ollama binary: {ollama_exe}")
+        if args.ollama_silent:
+            print("[COORDINATOR] Starting Ollama silently (--ollama-silent)...")
+            await ensure_ollama_running(skip=False)
+            ollama_ok = ollama_port_ready()
         else:
-            ollama_exe = resolve_ollama_exe()
-            print(f"[COORDINATOR] Ollama binary: {ollama_exe}")
             ok = await start_service_sequential(
                 "Ollama",
                 bats["Ollama"],
@@ -244,13 +282,32 @@ async def run_split_launcher(args) -> int:
                 args,
                 status_by_name,
                 specs,
-                failure_hint="Start the Ollama tray app, install the CLI, or re-run with --no-ollama",
+                force_spawn=True,
+                failure_hint="Install Ollama or use --no-ollama if managed externally",
             )
-            all_ok = all_ok and ok
-            if not ok:
+            ollama_ok = ok and ollama_port_ready()
+            if not ollama_ok:
+                print("[COORDINATOR] Ollama window failed — trying Python bootstrap fallback...")
+                await ensure_ollama_running(skip=False)
+                ollama_ok = ollama_port_ready()
+        if not ollama_ok:
                 failures.append("Ollama")
+                print_ollama_failure_hints()
+                all_ok = False
+
+        if ollama_ok:
+            model_ok = await ensure_ollama_model(skip_pull=args.skip_model_pull)
+            if not model_ok:
+                print("[OLLAMA] Model bootstrap failed — chat may not work until model is pulled.")
+                ollama_ok = False
+                all_ok = False
+                if "Ollama" not in failures:
+                    failures.append("Ollama (model)")
+        else:
+            all_ok = False
     else:
         print("[SKIPPED] Ollama (--no-ollama)")
+        ollama_ok = True
 
     startup_plan = [
         ("Piper", "Piper", "127.0.0.1", PORT_PIPER, "/health", args.no_piper, None),
@@ -291,6 +348,11 @@ async def run_split_launcher(args) -> int:
         if skipped:
             print(f"[SKIPPED] {display}")
             continue
+        if display == "RAG" and not ollama_ok and not args.continue_without_ollama:
+            print("[SKIPPED] RAG — Ollama is not ready (use --continue-without-ollama to force)")
+            failures.append("RAG (blocked: Ollama)")
+            all_ok = False
+            continue
         ok = await start_service_sequential(
             key,
             bats[key],
@@ -317,7 +379,23 @@ async def run_split_launcher(args) -> int:
         print("  Check the matching Assistify * windows for error output.")
     print("=" * 72)
     print(f"  Open: http://127.0.0.1:{SERVICES[2]['port']}/login")
-    print("  Dev login: admin / admin  or  superadmin / superadmin123")
+    print("  Dev login: admin / admin  or  superadmin / superadmin")
+    if all_ok:
+        print()
+        print("  Running stack verification...")
+        try:
+            from scripts.verify_stack import run_checks
+
+            stack_ok, _ = run_checks(require_piper=not args.no_piper)
+            if not stack_ok:
+                print("  Stack verification reported issues — see messages above.")
+                all_ok = False
+        except Exception as e:
+            print(f"  Stack verification skipped: {e}")
+    else:
+        print()
+        print("  If Ollama failed: python start_main_servers.py --restart-ollama")
+        print("  After services are up: python scripts/verify_stack.py")
     print()
     print("  Each service runs in its own window titled 'Assistify ...'.")
     print("  Close those windows to stop individual services.")

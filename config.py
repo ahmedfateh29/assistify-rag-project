@@ -51,7 +51,8 @@ RATE_LIMIT_OTP = int(os.getenv("RATE_LIMIT_OTP", "3"))
 
 # Service URLs (configurable for deployment)
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:7001")
-LLM_SERVER_URL = os.getenv("LLM_SERVER_URL", "http://127.0.0.1:8000")
+LLM_SERVER_URL = os.getenv("LLM_SERVER_URL", "http://127.0.0.1:8010")
+LLM_SERVER_PORT = int(os.getenv("LLM_SERVER_PORT", "8010"))
 RAG_SERVER_URL = os.getenv("RAG_SERVER_URL", "http://127.0.0.1:7000")
 
 # Request timeouts
@@ -59,6 +60,12 @@ LLM_REQUEST_TIMEOUT = int(os.getenv("LLM_REQUEST_TIMEOUT", "30"))  # seconds
 
 # Password hashing cost (bcrypt rounds)
 BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
+
+# Explicit opt-in for username==password dev logins (never enabled in production).
+ALLOW_DEV_LOGIN_FALLBACK = (
+    not IS_PRODUCTION
+    and os.getenv("ALLOW_DEV_LOGIN_FALLBACK", "false").lower() in {"1", "true", "yes", "on"}
+)
 
 # Development fallbacks (ONLY for local development)
 if not IS_PRODUCTION:
@@ -115,7 +122,7 @@ if IS_PRODUCTION:
     
     if missing_secrets:
         print("\n" + "="*70)
-        print("🚨 FATAL: Missing required environment variables for production:")
+        print("FATAL: Missing required environment variables for production:")
         for secret in missing_secrets:
             print(f"  - {secret}")
         print("\nSet these in your environment before starting the server.")
@@ -154,8 +161,8 @@ RAG_USE_GPU = os.getenv("RAG_USE_GPU", "1").lower() not in {"0", "false", "no"}
 
 # Speech Recognition - faster-whisper (replaces Vosk)
 # Voice STT is CPU-only so VRAM stays available for Ollama + RAG embeddings.
-WHISPER_MODEL_PATH = Path(os.getenv("WHISPER_MODEL_PATH", str(ROOT / "backend" / "Models" / "faster-whisper-tiny.en")))
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny.en")
+WHISPER_MODEL_PATH = Path(os.getenv("WHISPER_MODEL_PATH", str(ROOT / "backend" / "Models" / "faster-whisper-small")))
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small.en")
 _requested_whisper_device = os.getenv("WHISPER_DEVICE", "cpu").strip().lower()
 if _requested_whisper_device != "cpu":
     import warnings
@@ -173,7 +180,7 @@ WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"  
 VOSK_MODEL_PATH = Path(os.getenv("VOSK_MODEL_PATH", str(ROOT / "backend" / "Models" / "vosk-model-en-us-0.22-lgraph")))
 
 # Persistence paths
-CHROMA_DB_PATH = Path(os.getenv("CHROMA_DB_PATH", str(ROOT / "backend" / "chroma_db")))
+CHROMA_DB_PATH = Path(os.getenv("CHROMA_DB_PATH", str(ROOT / "backend" / "chroma_db_v3")))
 DB_PATH = Path(os.getenv("DB_PATH", str(ROOT / "backend" / "conversations.db")))
 ANALYTICS_DB = Path(os.getenv("ANALYTICS_DB", str(ROOT / "backend" / "analytics.db")))
 
@@ -230,6 +237,19 @@ def tenant_assets_dir(tenant_id) -> Path:
         pass
     return directory
 
+
+def kb_asset_search_dirs(scope_tid: int | None) -> list[Path]:
+    """Asset directories for KB list/delete for a tenant admin scope.
+
+    ``scope_tid`` is the value from ``_kb_admin_scope_tenant``: ``None`` for the
+    default tenant (legacy root + tenant subdir), otherwise the tenant id.
+    Tenant subdir is listed first so callers deduplicating by filename prefer it
+    over legacy root copies.
+    """
+    if scope_tid is None:
+        return [tenant_assets_dir(DEFAULT_TENANT_ID), ASSETS_DIR]
+    return [tenant_assets_dir(scope_tid)]
+
 # Embedding model
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
 
@@ -253,6 +273,16 @@ MODEL_PATH = os.getenv(
         / "Qwen2.5-7B-LLM"
     ),
 )
+
+
+def assert_production_config() -> None:
+    """Fail fast when production is misconfigured. Call from server startup."""
+    if not IS_PRODUCTION:
+        return
+    if not SESSION_SECRET or len(SESSION_SECRET) < 64:
+        raise RuntimeError(
+            "SESSION_SECRET must be set to 64+ bytes when ENVIRONMENT=production"
+        )
 
 
 __all__ = [
@@ -283,4 +313,7 @@ __all__ = [
     "OLLAMA_HOST",
     "OLLAMA_PORT",
     "OLLAMA_CLI",
+    "ALLOW_DEV_LOGIN_FALLBACK",
+    "LLM_SERVER_PORT",
+    "assert_production_config",
 ]

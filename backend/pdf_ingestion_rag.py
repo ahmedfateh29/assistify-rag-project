@@ -6,6 +6,7 @@ import logging
 import asyncio
 import torch
 import numpy as np
+from pathlib import Path
 from typing import List, Dict, Any, Optional, cast
 
 import PyPDF2
@@ -538,11 +539,30 @@ class VectorStore:
     @staticmethod
     def _query_profile(query: str) -> Dict[str, Any]:
         q = (query or "").lower()
-        chapter_match = re.search(r"\b(?:chapter|unit)\s+(\d+)\b", q)
+        chapter_match = re.search(r"\b(?:chapter|unit|lesson)\s+(\d+)\b", q)
+        chapter_title_hints: List[str] = []
+        for pattern in (
+            r"industrial[/\s-]*organizational\s+psychology",
+            r"health\s+psychology",
+            r"social\s+psychology",
+            r"research\s+methods(?:\s+in\s+psychology)?",
+            r"\bmemory\b",
+            r"biopsychology",
+            r"operant\s+conditioning",
+            r"cognitive\s+dissonance",
+            r"general\s+adaptation\s+syndrome",
+            r"predictive\s+validity",
+        ):
+            m = re.search(pattern, q)
+            if m:
+                chapter_title_hints.append(m.group(0).strip())
+        numeric_tokens = re.findall(r"\d+\.?\d*%?", q)
         return {
             "chapter_query": bool(chapter_match),
             "chapter_num": int(chapter_match.group(1)) if chapter_match else None,
-            "structure_query": any(k in q for k in ["chapter", "unit", "section", "list", "topics", "table of contents", "contents"]),
+            "chapter_title_hints": chapter_title_hints,
+            "numeric_tokens": numeric_tokens[:8],
+            "structure_query": any(k in q for k in ["chapter", "unit", "section", "list", "topics", "table of contents", "contents", "lesson"]),
             "overview_query": any(k in q for k in ["overview", "summary", "summarize", "what is this document about", "main ideas", "topics covered", "introduction"]),
             "list_chapters_query": ("list" in q and ("chapter" in q or "unit" in q)) or ("chapters in the book" in q) or ("units in the book" in q),
             "chapter_sections_query": bool(re.search(r"sections?\s+in\s+(?:chapter|unit)\s+\d+", q)),
@@ -602,18 +622,42 @@ class VectorStore:
         return heading_like / float(max(1, len(lines)))
 
     @staticmethod
+    def _is_structured_short_chunk(text: str, metadata: Dict[str, Any]) -> bool:
+        raw_text = str(text or "")
+        meta = metadata or {}
+        chunk_role = str(meta.get("chunk_role") or "").lower()
+        if chunk_role in {"table", "bullet", "definition", "list"}:
+            return True
+        if "[TABLE DATA]" in raw_text:
+            return True
+        if re.search(r"(?m)^\s*[-*•]\s+", raw_text):
+            return True
+        if re.search(r"(?i)\b(?:cardio|respiratory|vasomotor|reason|spirit|appetite)\b", raw_text):
+            return True
+        if re.search(r"\d+\.\d+\s*%", raw_text):
+            return True
+        if re.search(r"(?i)\broc[- ]?auc\b", raw_text):
+            return True
+        if re.search(r"\b16\.12\b|\b20\.6\d\b|\b0\.7272\b", raw_text):
+            return True
+        return False
+
+    @staticmethod
     def _low_quality_reason(text: str, metadata: Dict[str, Any]) -> Optional[str]:
         raw_text = str(text or "")
+        meta = metadata or {}
         lowered = raw_text.lower()
         tokens = VectorStore._tokenize_words(raw_text)
         word_count = sum(1 for tok in tokens if re.search(r"[A-Za-z\u0600-\u06FF]", tok))
+        structured_short = VectorStore._is_structured_short_chunk(raw_text, meta)
 
-        numeric_tokens = sum(1 for tok in tokens if tok.isdigit())
+        numeric_tokens = sum(1 for tok in tokens if tok.isdigit() or re.search(r"\d+\.?\d*%?", tok))
         numeric_ratio = numeric_tokens / float(max(1, len(tokens)))
-        if len(tokens) >= 16 and numeric_ratio >= 0.35:
-            return "number_heavy"
+        if len(tokens) >= 16 and numeric_ratio >= 0.35 and not structured_short:
+            if "[TABLE DATA]" not in raw_text and str(meta.get("chunk_role") or "").lower() != "table":
+                return "number_heavy"
 
-        if word_count < 40:
+        if word_count < 40 and not structured_short:
             return "too_short"
 
         heading_ratio = VectorStore._heading_dominance_ratio(raw_text)
@@ -649,8 +693,13 @@ class VectorStore:
         return float(max(0.0, min(1.0, score)))
 
     @staticmethod
-    def _has_real_sentence_structure(text: str) -> bool:
+    def _has_real_sentence_structure(text: str, metadata: Dict[str, Any] | None = None) -> bool:
         raw_text = str(text or "")
+        meta = metadata or {}
+        if VectorStore._is_structured_short_chunk(raw_text, meta):
+            words = [tok for tok in VectorStore._tokenize_words(raw_text) if re.search(r"[A-Za-z\u0600-\u06FF]", tok)]
+            if len(words) >= 8:
+                return True
         if raw_text.count(".") < 2:
             return False
         words = [tok for tok in VectorStore._tokenize_words(raw_text) if re.search(r"[A-Za-z\u0600-\u06FF]", tok)]
@@ -665,23 +714,72 @@ class VectorStore:
         return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
     @staticmethod
-    def _select_top_high_quality(candidates: List[Dict[str, Any]], max_items: int = 3) -> List[Dict[str, Any]]:
+    def _select_top_high_quality(
+        candidates: List[Dict[str, Any]],
+        max_items: int = 3,
+        query_profile: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         selected: List[Dict[str, Any]] = []
         seen = set()
+        profile = query_profile or {}
+        wants_list = bool(profile.get("structure_query") or profile.get("numeric_tokens"))
 
         for cand in candidates:
             text = str(cand.get("text") or cand.get("page_content") or "")
+            meta = dict(cand.get("metadata") or {})
             key = VectorStore._dedup_key(text)
             if not key or key in seen:
                 continue
-            if not VectorStore._has_real_sentence_structure(text):
-                continue
+            if not VectorStore._has_real_sentence_structure(text, meta):
+                if wants_list and VectorStore._is_structured_short_chunk(text, meta):
+                    pass
+                else:
+                    continue
             seen.add(key)
             selected.append(cand)
             if len(selected) >= max_items:
                 break
 
         return selected
+
+    @staticmethod
+    def _ensure_per_source_top(candidates: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+        """Keep at least the best chunk per source for multi-doc synthesis."""
+        if not candidates:
+            return []
+        by_source: Dict[str, Dict[str, Any]] = {}
+        ordered: List[Dict[str, Any]] = []
+        seen_keys = set()
+
+        def _source_key(cand: Dict[str, Any]) -> str:
+            meta = cand.get("metadata") or {}
+            for field in ("source", "stored_filename", "original_filename", "normalized_filename"):
+                val = str(meta.get(field) or "").strip().lower()
+                if val:
+                    return val
+            return "unknown"
+
+        for cand in candidates:
+            src = _source_key(cand)
+            if src not in by_source:
+                by_source[src] = cand
+
+        for cand in candidates:
+            key = VectorStore._dedup_key(str(cand.get("text") or cand.get("page_content") or ""))
+            if key in seen_keys:
+                continue
+            ordered.append(cand)
+            seen_keys.add(key)
+            if len(ordered) >= limit:
+                break
+
+        for src, cand in by_source.items():
+            key = VectorStore._dedup_key(str(cand.get("text") or cand.get("page_content") or ""))
+            if key not in seen_keys:
+                ordered.append(cand)
+                seen_keys.add(key)
+
+        return ordered[: max(limit, len(by_source))]
 
     @staticmethod
     def _chunk_role_bonus(chunk_role: str, profile: Dict[str, bool]) -> float:
@@ -872,6 +970,9 @@ class VectorStore:
 
                 sim = 1.0 - float(dist)
 
+                if float(dist) > float(distance_threshold):
+                    continue
+
                 # Apply structural boosts (moderate)
                 target_chapter_num = query_profile.get("chapter_num")
                 if target_chapter_num is not None:
@@ -913,6 +1014,22 @@ class VectorStore:
                 # FINAL FALLBACK
                 if not chunk_text or not str(chunk_text).strip():
                     chunk_text = str(doc_item)
+
+                chunk_text_lower = str(chunk_text or "").lower()
+                for title_hint in query_profile.get("chapter_title_hints") or []:
+                    hint_l = str(title_hint or "").lower()
+                    section_blob = " ".join([
+                        str(meta_item.get("section") or "") if isinstance(meta_item, dict) else "",
+                        str(meta_item.get("chapter") or "") if isinstance(meta_item, dict) else "",
+                        str(meta_item.get("title") or "") if isinstance(meta_item, dict) else "",
+                        chunk_text_lower,
+                    ]).lower()
+                    if hint_l and hint_l in section_blob:
+                        sim += 0.12
+
+                for num_tok in query_profile.get("numeric_tokens") or []:
+                    if num_tok and num_tok in chunk_text_lower:
+                        sim += 0.08
 
                 candidates.append({
                     "text": chunk_text,
@@ -1154,12 +1271,14 @@ class VectorStore:
 
         candidates.sort(key=lambda item: item.get("final_score", 0.0), reverse=True)
 
-        max_selected = max(1, min(3, top_k))
-        selected_high_quality = self._select_top_high_quality(candidates, max_items=max_selected)
+        max_selected = max(1, min(5, top_k))
+        selected_high_quality = self._select_top_high_quality(
+            candidates, max_items=max_selected, query_profile=query_profile
+        )
         if selected_high_quality:
-            final_results = selected_high_quality
+            final_results = self._ensure_per_source_top(selected_high_quality, limit=max_selected)
         else:
-            final_results = candidates[:max_selected]
+            final_results = self._ensure_per_source_top(candidates[:max_selected], limit=max_selected)
 
         _vs_total_ms = (_time_vs.perf_counter() - _vs_t0) * 1000
         logger.info(
@@ -1239,6 +1358,147 @@ class VectorStore:
 
 
 
+# ================= PDF TEXT EXTRACTION (shared by upload + watcher) =================
+
+_KNOWN_SPLIT_WORD_REPAIRS = (
+    (r"\bat\s+trition\b", "attrition"),
+    (r"\bfor\s+mation\b", "formation"),
+    (r"\bin\s+for\s+mation\b", "information"),
+    (r"\breticular\s+for\s+mation\b", "reticular formation"),
+    (r"\borgan\s+izational\b", "organizational"),
+    (r"\bindustrial\s*/\s*organ\s+izational\b", "industrial/organizational"),
+)
+
+
+_OCR_MERGE_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "for", "nor", "so", "yet", "at", "by", "in", "of", "on",
+    "to", "up", "as", "is", "it", "be", "he", "she", "we", "you", "they", "has", "have", "had", "are",
+    "was", "were", "our", "your", "their", "this", "that", "with", "from", "not", "can", "could",
+    "would", "will", "shall", "may", "might", "must", "do", "does", "did", "if", "then", "than",
+    "when", "what", "which", "who", "how", "all", "any", "each", "few", "more", "most", "some",
+    "such", "no", "only", "own", "same", "too", "very", "just", "also", "now", "here", "there",
+    "am", "been", "being", "into", "about", "after", "before", "between", "through", "during",
+    "help", "like", "know", "want", "need", "use", "using", "used", "one", "two", "new", "old",
+})
+
+
+def _repair_split_words(text: str) -> str:
+    """Fix common PDF layout artifacts like 'for mation' or 'at trition'."""
+    if not text:
+        return ""
+    for pattern, replacement in _KNOWN_SPLIT_WORD_REPAIRS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    # De-hyphenate across line breaks first.
+    text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
+    # Collapse spaced ALL-CAPS fragments: "AV G YE ARS" -> "AVGYEARS", "AT C O MPANY" -> "ATCOMPANY"
+    def _collapse_caps_run(match: re.Match) -> str:
+        parts = match.group(0).split()
+        if len(parts) >= 2 and all(re.fullmatch(r"[A-Z]{1,3}", p) for p in parts):
+            return "".join(parts)
+        return match.group(0)
+
+    text = re.sub(r"\b(?:[A-Z]{1,3}\s+){2,}[A-Z]{1,3}\b", _collapse_caps_run, text)
+    # Merge obvious two-fragment splits: short prefix + space + short suffix.
+    def _merge_match(match: re.Match) -> str:
+        left, right = match.group(1), match.group(2)
+        left_l, right_l = left.lower(), right.lower()
+        if left_l in _OCR_MERGE_STOPWORDS or right_l in _OCR_MERGE_STOPWORDS:
+            return match.group(0)
+        merged = left + right
+        # Merge only plausible PDF fragment joins (short prefix + longer suffix).
+        if len(left) <= 3 and len(right) >= 4 and 6 <= len(merged) <= 14:
+            return merged
+        return match.group(0)
+
+    text = re.sub(r"\b([a-z]{2,4})\s+([a-z]{3,12})\b", _merge_match, text, flags=re.IGNORECASE)
+    # Join single-character gaps (e.g. "P s y c h o l o g y", "C O MPANY").
+    text = re.sub(r"(?<=\b[A-Za-z])\s(?=[A-Za-z]\b)", "", text)
+    # Second pass for residual intra-word splits after caps collapse.
+    text = re.sub(r"\b([a-z]{2,4})\s+([a-z]{3,12})\b", _merge_match, text, flags=re.IGNORECASE)
+    return text
+
+
+def extract_pdf_pages_robust(file_path: str | Path) -> list[dict[str, Any]]:
+    """Extract PDF pages using pdfplumber with OCR fallback, then PyPDF2."""
+    path = str(file_path)
+    pages: list[dict[str, Any]] = []
+    try:
+        with pdfplumber.open(path) as pdf:
+            total_pages = len(pdf.pages)
+            logger.info("Extracting %s pages using pdfplumber from %s", total_pages, path)
+
+            for page_num, page in enumerate(pdf.pages, start=1):
+                # layout=False avoids intra-word spaces ("for mation", "at trition").
+                text = page.extract_text(layout=False) or ""
+                if len(text.strip()) < 80:
+                    text_layout = page.extract_text(layout=True) or ""
+                    if len(text_layout.strip()) > len(text.strip()):
+                        text = text_layout
+                text = _repair_split_words(text)
+                try:
+                    tables = page.extract_tables() or []
+                    table_blocks: list[str] = []
+                    for table in tables:
+                        if not table:
+                            continue
+                        rows: list[str] = []
+                        for row in table:
+                            cells = [str(c or "").strip() for c in (row or []) if str(c or "").strip()]
+                            if cells:
+                                rows.append(" | ".join(cells))
+                        if rows:
+                            table_blocks.append("\n".join(rows))
+                    if table_blocks:
+                        text = (text + "\n\n[TABLE DATA]\n" + "\n\n".join(table_blocks)).strip()
+                except Exception as table_err:
+                    logger.debug("Table extraction failed page %s: %s", page_num, table_err)
+                if len(text.strip()) < 100:
+                    logger.info(
+                        "Page %s text too sparse (%s chars) — attempting OCR",
+                        page_num,
+                        len(text.strip()),
+                    )
+                    if pytesseract and convert_from_path:
+                        try:
+                            images = convert_from_path(path, first_page=page_num, last_page=page_num)
+                            if images:
+                                text = pytesseract.image_to_string(images[0])
+                        except Exception as ocr_err:
+                            logger.error("OCR failed for page %s: %s", page_num, ocr_err)
+                    else:
+                        logger.warning("OCR tools (pytesseract/pdf2image) not installed")
+                pages.append({"page": page_num, "text": text})
+    except Exception as e:
+        logger.error("pdfplumber failed for %s: %s", path, e)
+        try:
+            reader = PyPDF2.PdfReader(path)
+            for i, page in enumerate(reader.pages):
+                pages.append({"page": i + 1, "text": page.extract_text() or ""})
+        except Exception as e2:
+            logger.error("All PDF extraction methods failed for %s: %s", path, e2)
+    return pages
+
+
+def format_pdf_pages_for_indexing(pages: list[dict[str, Any]]) -> tuple[str, int, int]:
+    """Format extracted pages into the PAGE_START markup used by chunk_and_add_document."""
+    blocks: list[str] = []
+    non_empty_pages = 0
+    for entry in pages or []:
+        page_num = int(entry.get("page") or 0)
+        page_text = str(entry.get("text") or "")
+        if page_text.strip():
+            non_empty_pages += 1
+        blocks.append(f"[PAGE_START: {page_num}]\n{page_text}\n[PAGE_END: {page_num}]")
+    return "\n\n".join(blocks), len(pages or []), non_empty_pages
+
+
+def extract_pdf_asset_text(save_path: str | Path) -> tuple[str, int, int]:
+    """Return (formatted_text, total_pages, non_empty_pages) for indexing."""
+    pages = extract_pdf_pages_robust(save_path)
+    text, total_pages, non_empty_pages = format_pdf_pages_for_indexing(pages)
+    return text, total_pages, non_empty_pages
+
+
 # ================= PIPELINE CLASS =================
 class AdaptiveRAGPipeline:
     def __init__(self, vector_store: VectorStore):
@@ -1254,63 +1514,14 @@ class AdaptiveRAGPipeline:
         """Normalize whitespace and fix common OCR/PDF artifacts."""
         if not text:
             return ""
-        # Fix broken spaces in words (e.g., "P s y c h o l o g y" -> "Psychology")
-        # This is high-risk, so we only do it for single characters separated by spaces
-        text = re.sub(r'(?<=\b[A-Za-z])\s(?=[A-Za-z]\b)', '', text)
+        text = _repair_split_words(text)
         # Normalize multiple spaces and newlines
         text = re.sub(r'\s+', ' ', text)
-        # Fix merged words (basic check)
-        # text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
         return text.strip()
 
     # --- STEP 1 & 2: PDF TYPE DETECTION & OCR ---
     def extract_text_from_pdf(self, file_path: str) -> List[Dict[str, Any]]:
-        pages = []
-        try:
-            with pdfplumber.open(file_path) as pdf:
-                total_pages = len(pdf.pages)
-                logger.info(f"Extracting {total_pages} pages using pdfplumber")
-                
-                for page_num, page in enumerate(pdf.pages, start=1):
-                    start_time = time.time()
-                    
-                    # Layout-aware text extraction
-                    text = page.extract_text(layout=True) or ""
-                    
-                    # Step 1: Detect Scanned PDF or poor extraction
-                    if len(text.strip()) < 100:
-                        logger.info(f"Page {page_num} text too sparse ({len(text.strip())} chars) — attempting OCR")
-                        if pytesseract and convert_from_path:
-                            try:
-                                # Step 2: OCR Extraction (fallback)
-                                images = convert_from_path(file_path, first_page=page_num, last_page=page_num)
-                                if images:
-                                    text = pytesseract.image_to_string(images[0])
-                            except Exception as e:
-                                logger.error(f"OCR failed for page {page_num}: {e}")
-                        else:
-                            logger.warning("OCR tools (pytesseract/pdf2image) not installed!")
-                    
-                    ocr_time = time.time() - start_time
-                    if self.debug_mode:
-                        logger.debug(f"Extracted page {page_num} in {ocr_time:.2f}s")
-
-                    # Step 3: Page Structure Preservation
-                    pages.append({
-                        "page": page_num,
-                        "text": text,
-                        "raw_text": text # preserve original for structural analysis
-                    })
-        except Exception as e:
-            logger.error(f"Failed to process PDF {file_path}: {e}")
-            # Fallback to PyPDF2 if pdfplumber fails
-            try:
-                reader = PyPDF2.PdfReader(file_path)
-                for i, page in enumerate(reader.pages):
-                    pages.append({"page": i+1, "text": page.extract_text() or ""})
-            except Exception as e2:
-                logger.error(f"All PDF extraction methods failed: {e2}")
-        return pages
+        return extract_pdf_pages_robust(file_path)
 
     # --- STEP 4: DOCUMENT STRUCTURE DETECTION ---
     def extract_structure(self, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -1,0 +1,133 @@
+{
+  "timestamp": "2026-06-21T01:45:25Z",
+  "phase_filter": 5,
+  "results": [
+    {
+      "test_id": 14,
+      "phase": 5,
+      "name": "Missing HR formula",
+      "prompt": "What is the exact mathematical formula and the coefficient weights for the Logistic Regression model used in the IBM HR dataset?",
+      "response": {
+        "status": 200,
+        "latency_ms": 80,
+        "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "route": "ws://127.0.0.1:7001/ws"
+      },
+      "score": {
+        "status": "pass",
+        "checks": {
+          "forbidden:\u03b2\\s*\\d": true,
+          "forbidden:coefficient\\s*=\\s*[-+]?\\d\\.\\d+": true,
+          "forbidden:intercept\\s*=\\s*[-+]?\\d\\.\\d+": true,
+          "warm_refusal": true
+        },
+        "failed": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+      }
+    },
+    {
+      "test_id": 15,
+      "phase": 5,
+      "name": "Absurd cross-reference",
+      "prompt": "What did Wilhelm Wundt say about the CRISP-DM framework in his 1879 Leipzig laboratory?",
+      "response": {
+        "status": 200,
+        "latency_ms": 39,
+        "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "route": "ws://127.0.0.1:7001/ws"
+      },
+      "score": {
+        "status": "pass",
+        "checks": {
+          "forbidden:wundt.{0,80}crisp-dm": true,
+          "forbidden:1879.{0,80}data mining": true,
+          "warm_refusal": true
+        },
+        "failed": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+      }
+    },
+    {
+      "test_id": 16,
+      "phase": 5,
+      "name": "Out-of-scope DSM",
+      "prompt": "According to the provided text, what is the DSM-5-TR diagnostic code for 'Employee Burnout Syndrome'?",
+      "response": {
+        "status": 200,
+        "latency_ms": 38,
+        "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "route": "ws://127.0.0.1:7001/ws"
+      },
+      "score": {
+        "status": "pass",
+        "checks": {
+          "forbidden:DSM-5-TR\\s*[A-Z]\\d+": true,
+          "forbidden:F\\d{2}\\.\\d": true,
+          "forbidden:Z\\d{2}\\.\\d": true,
+          "warm_refusal": true
+        },
+        "failed": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+      }
+    }
+  ],
+  "summary": {
+    "pass": 3,
+    "partial": 0,
+    "fail": 0,
+    "total": 3
+  },
+  "kb_status": {
+    "state": "ready",
+    "stage": "ready",
+    "message": "ready",
+    "filename": null,
+    "updated_at": 1782006305.8625646,
+    "started_at": null,
+    "ready_at": null,
+    "stage_timings": {},
+    "last_total_seconds": null,
+    "last_bottleneck": null,
+    "indexed_chunks": 357,
+    "total_chunks": 0,
+    "percent": 100,
+    "active_sources": [
+      "doc_67dc9f58aefa4b3e",
+      "doc_a3e173bfd05989b7",
+      "doc_e9336e9c82eb08a5",
+      "dss.pdf",
+      "ibm_hr_attrition_dss_crisp-dm.pdf",
+      "introduction to psychology  (complete) (14).pdf"
+    ],
+    "doc_mode": "multi",
+    "active_collection": "support_docs_v3_latest",
+    "retrieval_collection": "support_docs_v3_latest",
+    "orphan_files": []
+  },
+  "rebuild_active_sources": {
+    "active_sources": [
+      "doc_67dc9f58aefa4b3e",
+      "doc_a3e173bfd05989b7",
+      "doc_e9336e9c82eb08a5",
+      "dss.pdf",
+      "ibm_hr_attrition_dss_crisp-dm.pdf",
+      "introduction to psychology  (complete) (14).pdf"
+    ],
+    "mode": "multi",
+    "ready_state": {
+      "state": "ready",
+      "stage": "ready",
+      "message": "ready",
+      "filename": null,
+      "updated_at": 1782006305.8625646,
+      "started_at": null,
+      "ready_at": null,
+      "stage_timings": {},
+      "last_total_seconds": null,
+      "last_bottleneck": null,
+      "indexed_chunks": 0,
+      "total_chunks": 0,
+      "percent": 100
+    }
+  }
+}

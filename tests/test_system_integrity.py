@@ -193,9 +193,10 @@ def test_validation_integration():
     print("\nTEST 5: Validation Integration")
     
     try:
-        # Check import works
-        from backend.assistify_rag_server import validate_response
-        print(f"  ✅ PASS: validate_response imported in RAG server")
+        from backend.response_validator import validate_response
+        from backend.config_head import validate_response as validate_response_reexport
+        assert validate_response is validate_response_reexport
+        print(f"  ✅ PASS: validate_response imported via config_head")
         return True
     except ImportError as e:
         print(f"  ❌ FAIL: validate_response not imported: {e}")

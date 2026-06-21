@@ -9,9 +9,9 @@ dependencies:
   - pip
 
   # PyTorch with CUDA 12.1 (RTX 3070 compatible, driver >= 525)
-  - pytorch::pytorch
-  - pytorch::torchvision
-  - pytorch::torchaudio
+  - pytorch::pytorch=2.2.*
+  - pytorch::torchvision=0.17.*
+  - pytorch::torchaudio=2.2.*
   - pytorch::pytorch-cuda=12.1
 
   - pip:

@@ -4,8 +4,14 @@
 from __future__ import annotations
 
 import os
-import shutil
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.ollama_bootstrap import resolve_ollama_exe  # noqa: E402
 
 LAUNCH_DIR = Path(__file__).resolve().parent
 
@@ -24,19 +30,6 @@ _ENV_KEYS = (
     "WHISPER_MODEL",
     "WHISPER_CHUNK_MS",
 )
-
-
-def resolve_ollama_exe() -> str:
-    env_cli = os.environ.get("OLLAMA_CLI", "").strip()
-    if env_cli and Path(env_cli).exists():
-        return env_cli
-    found = shutil.which("ollama")
-    if found:
-        return found
-    local = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
-    if local.exists():
-        return str(local)
-    return "ollama"
 
 
 def _bat_set(key: str, value: str) -> str:
@@ -130,16 +123,39 @@ def write_service_bats(
         "\r\n".join(
             _bat_header("Assistify Ollama")
             + [
-                'where "%OLLAMA_EXE%" >nul 2>&1',
-                "if not errorlevel 1 goto :run_ollama",
+                "echo Ollama binary: %OLLAMA_EXE%",
+                "powershell -NoProfile -Command \"if ((Test-NetConnection -ComputerName 127.0.0.1 -Port 11434 -WarningAction SilentlyContinue).TcpTestSucceeded) { exit 0 } else { exit 1 }\" >nul 2>&1",
+                "if not errorlevel 1 goto :already_running",
                 'if exist "%OLLAMA_EXE%" goto :run_ollama',
+                'where ollama >nul 2>&1',
+                "if not errorlevel 1 (",
+                "  set \"OLLAMA_EXE=ollama\"",
+                "  goto :run_ollama",
+                ")",
                 'echo [ERROR] Ollama not found at "%OLLAMA_EXE%"',
-                "echo Start the Ollama tray app, install the CLI, or re-run with --no-ollama",
+                "echo Install from https://ollama.com/download or open the Ollama tray app",
+                "echo Re-run launcher with --no-ollama if Ollama is already managed externally",
                 "pause",
                 "exit /b 1",
+                ":already_running",
+                "echo [OLLAMA] Already running on port 11434",
+                "echo.",
+                "echo Installed models:",
+                'if exist "%OLLAMA_EXE%" ("%OLLAMA_EXE%" list) else (ollama list)',
+                "echo.",
+                "echo Do NOT run 'ollama serve' while port 11434 is in use.",
+                "echo For a clean restart: python start_main_servers.py --restart-ollama",
+                "pause",
+                "exit /b 0",
                 ":run_ollama",
                 "echo Starting Ollama on port 11434...",
                 '"%OLLAMA_EXE%" serve',
+                "if errorlevel 1 (",
+                "  echo.",
+                "  echo [ERROR] ollama serve failed — port 11434 may already be in use.",
+                "  echo Quit Ollama from the system tray, then run:",
+                "  echo   python start_main_servers.py --restart-ollama",
+                ")",
                 "pause",
             ]
         )

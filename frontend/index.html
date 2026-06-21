@@ -34,6 +34,22 @@
     .menu-btn:hover {
       background: #0d8658;
     }
+    .exit-chat-btn {
+      background: #10a37f;
+      border: none;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #fff;
+      cursor: pointer;
+      padding: 8px 14px;
+      border-radius: 8px;
+      transition: background 0.3s;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .exit-chat-btn:hover {
+      background: #0d8658;
+    }
     .header-title {
       flex: 1;
       text-align: center;
@@ -130,6 +146,9 @@
     .conversation-sidebar-header {
       padding: 12px;
       border-bottom: 1px solid #343541;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
     }
     .new-chat-btn {
       width: 100%;
@@ -148,6 +167,30 @@
     .new-chat-btn:hover {
       background: #343641;
       border-color: #10a37f;
+    }
+    .clear-all-chats-btn {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: transparent;
+      border: 1px solid #5c3030;
+      color: #fca5a5;
+      border-radius: 6px;
+      padding: 9px 12px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .clear-all-chats-btn:hover:not(:disabled) {
+      background: #3b1f1f;
+      border-color: #ef4444;
+      color: #fecaca;
+    }
+    .clear-all-chats-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
     .conversation-list {
       flex: 1;
@@ -740,6 +783,9 @@
     .voice-state-transcribing .voice-circle {
       animation: voicePulseSoft 1.6s ease-in-out infinite;
     }
+    .voice-state-processing .voice-circle {
+      animation: voicePulseSoft 1.4s ease-in-out infinite;
+    }
     .voice-state-thinking .voice-circle {
       animation: voiceGlowSlow 2.4s ease-in-out infinite;
     }
@@ -903,7 +949,7 @@
     </div>
     <ul class="nav-links">
       <li>
-        <a href="/main" class="nav-link">
+        <a href="/main" class="nav-link" id="navHomeLink">
           <svg fill="currentColor" viewBox="0 0 20 20"><path d="M10.707 2.293a1 1 0 00-1.414 0l-7 7a1 1 0 001.414 1.414L4 10.414V17a1 1 0 001 1h2a1 1 0 001-1v-2a1 1 0 011-1h2a1 1 0 011 1v2a1 1 0 001 1h2a1 1 0 001-1v-6.586l.293.293a1 1 0 001.414-1.414l-7-7z"/></svg>
           Home
         </a>
@@ -926,7 +972,7 @@
   <header>
     <button class="menu-btn" onclick="openNav()">☰</button>
     <h1 class="header-title">Assistify RAG Chat</h1>
-    <div class="header-spacer"></div>
+    <button type="button" id="exitChatBtn" class="exit-chat-btn" aria-label="Exit chat and return to dashboard">← Exit Chat</button>
   </header>
   <!-- KB update notification banner (shown when backend broadcasts kb_updated) -->
   <div id="kb-update-banner">
@@ -938,6 +984,7 @@
     <aside class="conversation-sidebar" aria-label="Chat history">
       <div class="conversation-sidebar-header">
         <button type="button" class="new-chat-btn" id="newChatBtn"><span>+</span><span>New Chat</span></button>
+        <button type="button" class="clear-all-chats-btn" id="clearAllChatsBtn" disabled aria-label="Clear all chats">Clear all chats</button>
       </div>
       <div class="conversation-list" id="conversationList"></div>
     </aside>
@@ -1048,6 +1095,43 @@
       document.querySelector('.nav-overlay').classList.remove('show');
     }
 
+    const HOME_BY_ROLE = {
+      superadmin: '/superadmin',
+      master_admin: '/master_admin',
+      admin: '/admin',
+      employee: '/employee',
+      customer: '/main',
+    };
+
+    function dashboardUrlForRole(role) {
+      return HOME_BY_ROLE[String(role || '').trim()] || '/main';
+    }
+
+    async function initExitChatButton() {
+      const exitBtn = document.getElementById('exitChatBtn');
+      const homeLink = document.getElementById('navHomeLink');
+      let exitUrl = '/main';
+      try {
+        const resp = await fetch('/api/my-profile', { credentials: 'include' });
+        if (resp.ok) {
+          const data = await resp.json();
+          exitUrl = dashboardUrlForRole(data.role);
+        }
+      } catch (e) {
+        console.warn('[NAV] could not resolve role for exit', e);
+      }
+      if (exitBtn) {
+        exitBtn.addEventListener('click', () => {
+          window.location.href = exitUrl;
+        });
+      }
+      if (homeLink) {
+        homeLink.href = exitUrl;
+      }
+    }
+
+    initExitChatButton();
+
     // Connect to same-origin WebSocket (login server proxies to RAG server)
     const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsUrl = `${wsScheme}://${window.location.host}/ws`;
@@ -1057,6 +1141,7 @@
     const chatInput = document.getElementById('chatInput');
     const conversationListEl = document.getElementById('conversationList');
     const newChatBtn = document.getElementById('newChatBtn');
+    const clearAllChatsBtn = document.getElementById('clearAllChatsBtn');
     const sendBtn = chatForm ? chatForm.querySelector('button[type="submit"]') : null;
     const btnStart = document.getElementById('btnStart');
     const btnMute = document.getElementById('btnMute');
@@ -1113,9 +1198,27 @@
       if (sendBtn) {
         sendBtn.disabled = textRequestInFlight;
       }
+      updateClearAllChatsButton();
+    }
+
+    function updateClearAllChatsButton() {
+      if (!clearAllChatsBtn) return;
+      const hasChats = Array.isArray(conversations) && conversations.length > 0;
+      clearAllChatsBtn.disabled = textRequestInFlight || !hasChats;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text == null ? '' : String(text);
+      return div.innerHTML;
+    }
+
+    function safeSetText(el, text) {
+      if (el) el.textContent = text == null ? '' : String(text);
     }
 
     function renderConversationList() {
+      updateClearAllChatsButton();
       if (!conversationListEl) return;
       conversationListEl.innerHTML = '';
       if (!conversations.length) {
@@ -1134,7 +1237,7 @@
         item.title = conv.title || 'New chat';
         const title = document.createElement('span');
         title.className = 'conversation-title';
-        title.textContent = conv.title || 'New chat';
+        safeSetText(title, conv.title || 'New chat');
         const actions = document.createElement('span');
         actions.className = 'conversation-actions';
         const renameBtn = document.createElement('button');
@@ -1337,6 +1440,30 @@
       }
     }
 
+    async function clearAllConversations() {
+      if (textRequestInFlight) return;
+      if (!conversations.length) {
+        updateClearAllChatsButton();
+        return;
+      }
+      if (!confirm('Delete all chats? This cannot be undone.')) return;
+      const resp = await fetch('/conversations', {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+      if (!resp.ok) {
+        appendMsg('system', '[Error] Could not clear chat history.');
+        return;
+      }
+      activeConversationId = null;
+      loadedConversationId = null;
+      lastWsConversationIdSent = null;
+      conversations = [];
+      resetChatSurface();
+      await fetchConversations();
+      await createNewConversation();
+    }
+
     async function refreshConversationsQuietly() {
       try {
         await fetchConversations();
@@ -1376,6 +1503,9 @@
 
     if (newChatBtn) {
       newChatBtn.addEventListener('click', createNewConversation);
+    }
+    if (clearAllChatsBtn) {
+      clearAllChatsBtn.addEventListener('click', clearAllConversations);
     }
 
     // ===== LANGUAGE MANAGEMENT =====
@@ -2162,6 +2292,19 @@
           setTextSubmitLock(false);
           refreshConversationsQuietly();
 
+        } else if(data.type === 'system_busy') {
+          appendMsg('system', data.message || 'Assistant is busy. Your request is queued.');
+        } else if(data.type === 'stt_failed') {
+          hideThinking();
+          if (isVoiceOverlayOpen()) {
+            try {
+              window.voiceMode.clearSttPendingWatchdog && window.voiceMode.clearSttPendingWatchdog();
+              window.voiceMode.notify('stt_failed', data.message);
+            } catch (e) {}
+          } else {
+            appendMsg('system', data.message || "Couldn't understand speech. Please try again.");
+            hideThinking();
+          }
         } else if(data.type === 'transcript') {
           if(data.final && data.text && data.text.trim() && data.text !== lastTranscript) {
             lastTranscript = data.text;
@@ -2424,7 +2567,7 @@
       const label = role === 'assistant'
         ? (arabic ? 'المساعد:' : 'Assistant:')
         : (role === 'user' ? (arabic ? 'أنت:' : 'You:') : '');
-      msg.textContent = `${label} ${text}`;
+      msg.textContent = `${label} ${text == null ? '' : String(text)}`;
       chatLog.appendChild(msg);
       chatLog.scrollTop = chatLog.scrollHeight;
       return msg;  // caller may hold reference for later in-place correction
@@ -3360,6 +3503,9 @@
       try {
         console.log("[DEBUG] Requesting audio stream...");
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
         // Echo cancellation + noise suppression to prevent Whisper from capturing AI voice
         mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -3539,7 +3685,7 @@
         chatVoiceBtn.title = open ? (ar ? 'إغلاق الصوت' : 'Close voice') : (ar ? 'إدخال صوتي' : 'Voice input');
       }
 
-      const STATES = ['idle', 'listening', 'transcribing', 'assistant_speaking', 'interrupted', 'error'];
+      const STATES = ['idle', 'listening', 'processing', 'transcribing', 'assistant_speaking', 'interrupted', 'error'];
       let currentState = 'idle';
       let isOpen = false;
       let voicePaused = false;
@@ -3576,6 +3722,8 @@
       // Safety net when TTS completion signals are lost
       let voiceTurnWatchdog = null;
       const VOICE_TURN_WATCHDOG_MS = 9000;
+      let sttPendingWatchdog = null;
+      const STT_PENDING_WATCHDOG_MS = 3000;
       let pendingTtsWatchdog = null;
       const PENDING_TTS_WATCHDOG_MS = 6000;
       let openerWatchdog = null;
@@ -3658,7 +3806,7 @@
         voiceTurnWatchdog = setTimeout(() => {
           voiceTurnWatchdog = null;
           if (!isOpen || voicePaused) return;
-          const stuck = (currentState === 'transcribing' || currentState === 'assistant_speaking');
+          const stuck = (currentState === 'processing' || currentState === 'transcribing' || currentState === 'assistant_speaking');
           if (!stuck) return;
           if (currentState === 'assistant_speaking' && _ttsPlaybackStillActive()) {
             console.log('[VOICE WATCHDOG] voice_turn_tts_active — re-arming');
@@ -3673,6 +3821,32 @@
             resumeAfterAssistant('voice_turn_watchdog');
           }
         }, VOICE_TURN_WATCHDOG_MS);
+      }
+
+      function clearSttPendingWatchdog() {
+        if (sttPendingWatchdog) {
+          clearTimeout(sttPendingWatchdog);
+          sttPendingWatchdog = null;
+        }
+      }
+
+      function armSttPendingWatchdog() {
+        clearSttPendingWatchdog();
+        sttPendingWatchdog = setTimeout(() => {
+          sttPendingWatchdog = null;
+          if (!isOpen || voicePaused) return;
+          if (currentState !== 'processing') return;
+          console.warn('[VOICE WATCHDOG] stt_pending_timeout — no transcript');
+          const msg = isArabic()
+            ? 'لم أسمعك بوضوح — حاول مرة أخرى'
+            : "Didn't catch that — try again";
+          updateVoiceStatus(msg);
+          clearVoiceTurnWatchdog();
+          setTimeout(() => {
+            if (!isOpen || voicePaused) return;
+            resumeAfterAssistant('stt_pending_timeout');
+          }, 800);
+        }, STT_PENDING_WATCHDOG_MS);
       }
 
       function clearVoiceTurnWatchdog() {
@@ -3699,6 +3873,7 @@
         switch (state) {
           case 'idle':         return ar ? 'جاهز — تحدث عندما تريد' : 'Ready — speak when you want';
           case 'listening':    return ar ? 'الاستماع...' : 'Listening...';
+          case 'processing':   return ar ? 'جاري معالجة الصوت...' : 'Processing speech...';
           case 'transcribing': return ar ? 'جاري التفكير...' : 'Thinking...';
           case 'assistant_speaking': return ar ? 'يتحدث...' : 'Speaking...';
           case 'interrupted':  return ar ? 'تمت المقاطعة...' : 'Interrupted...';
@@ -3757,7 +3932,7 @@
         if (!isOpen || voicePaused) return false;
         if (currentState === 'assistant_speaking') return false;
         if (voiceAssistantHasText()) return false;
-        return true;
+        return currentState === 'processing' || currentState === 'transcribing' || currentState === 'listening';
       }
 
       function resolveVoiceStateAfterAnswer(reason, payload) {
@@ -4197,8 +4372,9 @@
             }
           }
         } catch (e) { console.warn('[VOICE MODE] stopRecording failed', e); }
-        // Phase 7C: instant UX feedback — never leave the user staring at silence.
-        setVoiceState('transcribing');
+        setVoiceState('processing');
+        updateVoiceStatus(statusFor('processing'));
+        armSttPendingWatchdog();
       }
       function pauseVoiceListening() {
         voicePaused = true;
@@ -4395,6 +4571,18 @@
               setTimeout(() => { if (isOpen && !voicePaused) startVoiceListening('barge_in'); }, 120);
             }
             break;
+          case 'stt_failed':
+            clearSttPendingWatchdog();
+            clearVoiceTurnWatchdog();
+            if (voicePaused) break;
+            updateVoiceStatus(payload || (isArabic()
+              ? 'لم أسمعك بوضوح — حاول مرة أخرى'
+              : "Didn't catch that — try again"));
+            setTimeout(() => {
+              if (!isOpen || voicePaused) return;
+              resumeAfterAssistant('stt_failed');
+            }, 900);
+            break;
           case 'error':
             setVoiceState('error');
             updateVoiceStatus(payload || statusFor('error'));
@@ -4404,6 +4592,7 @@
 
       function onTranscript(text) {
         if (!isOpen) return;
+        clearSttPendingWatchdog();
         const safe = String(text || '').trim();
         const lang = isArabic() ? 'ar' : 'en';
         console.log('[VOICE MODE] transcript=' + JSON.stringify(safe) + ' lang=' + lang);
@@ -4419,7 +4608,7 @@
         updateVoiceUserText(safe);
         updateVoiceAssistantText('');
         setVoiceState('transcribing');
-        updateVoiceStatus(isArabic() ? 'جاري التفكير...' : 'Thinking...');
+        updateVoiceStatus(statusFor('transcribing'));
         armVoiceTurnWatchdog();
       }
 
@@ -4506,6 +4695,8 @@
         resolveVoiceStateAfterAnswer,
         armVoiceTurnWatchdog,
         clearVoiceTurnWatchdog,
+        armSttPendingWatchdog,
+        clearSttPendingWatchdog,
         armPendingTtsWatchdog,
         clearPendingTtsWatchdog,
         armOpenerWatchdog,

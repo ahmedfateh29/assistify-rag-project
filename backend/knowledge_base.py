@@ -37,8 +37,8 @@ except Exception:
     CHROMA_DB_PATH = Path(__file__).resolve().parent / "chroma_db_v3"
     EMBEDDING_MODEL = 'intfloat/multilingual-e5-base'
 
-# Wait, if config is imported, CHROMA_DB_PATH might still be the old one. We should override it for now.
-CHROMA_DB_PATH = Path(__file__).resolve().parent / "chroma_db_v3"
+# Single source of truth: config.CHROMA_DB_PATH (default backend/chroma_db_v3).
+CHROMA_DB_PATH = Path(CHROMA_DB_PATH)
 
 import logging
 
@@ -104,11 +104,79 @@ _SAFE_METADATA_SOURCE_FIELDS = (
 
 def normalize_uploaded_filename(name: str) -> str:
     """Return the canonical filename key used for source identity matching."""
+    from urllib.parse import unquote
+
     raw = Path(str(name or "").strip()).name
     if not raw:
         return ""
+    raw = unquote(raw)
     raw = _STORED_FILENAME_PREFIX_RE.sub("", raw)
     return raw.lower()
+
+
+def metadata_source_keys(metadata: dict | None) -> set[str]:
+    """Canonical source keys stored on chunk metadata (for orphan / filter matching)."""
+    md = metadata or {}
+    candidates = {
+        str(md.get("source_doc_id") or "").strip(),
+        str(md.get("source_name") or "").strip(),
+        str(md.get("original_filename") or "").strip(),
+        str(md.get("stored_filename") or "").strip(),
+        str(md.get("normalized_filename") or "").strip(),
+        str(md.get("source") or "").strip(),
+        str(md.get("filename") or "").strip(),
+        str(md.get("source_filename") or "").strip(),
+        str(md.get("file") or "").strip(),
+        str(md.get("doc_id") or "").strip(),
+        str(md.get("document_id") or "").strip(),
+        str(md.get("base_doc_id") or "").strip(),
+    }
+    keys: set[str] = set()
+    for candidate in candidates:
+        normalized = normalize_uploaded_filename(candidate)
+        if normalized:
+            keys.add(normalized)
+    return keys
+
+
+def indexed_source_keys_for_collection(collection=None, tenant_id=None) -> set[str]:
+    """Return all normalized source keys present in a Chroma collection."""
+    col = collection
+    if col is None:
+        if tenant_id is not None:
+            col = resolve_tenant_active_collection(tenant_id)
+        else:
+            col = get_or_create_collection(allow_empty=True)
+    if not col or col.count() == 0:
+        return set()
+    try:
+        raw = col.get(include=["metadatas"]) or {}
+        keys: set[str] = set()
+        for md in raw.get("metadatas") or []:
+            if isinstance(md, dict):
+                keys.update(metadata_source_keys(md))
+        return keys
+    except Exception as exc:
+        logger.warning("indexed_source_keys_for_collection failed: %s", exc)
+        return set()
+
+
+def find_orphan_asset_files(assets_dir: Path, tenant_id=None) -> list[str]:
+    """Return asset filenames on disk that have no matching chunks in the active collection."""
+    assets_dir = Path(assets_dir)
+    if not assets_dir.is_dir():
+        return []
+    indexed = indexed_source_keys_for_collection(tenant_id=tenant_id)
+    orphans: list[str] = []
+    for path in assets_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() not in {".pdf", ".txt", ".md"}:
+            continue
+        stored_key = normalize_uploaded_filename(path.name)
+        original_key = normalize_uploaded_filename(original_filename_from_stored(path.name))
+        if stored_key in indexed or original_key in indexed:
+            continue
+        orphans.append(path.name)
+    return sorted(orphans)
 
 
 def original_filename_from_stored(stored_filename: str) -> str:
@@ -590,6 +658,18 @@ def chunk_and_add_document(
     TARGET_WORDS = 300
     OVERLAP_WORDS = 50
 
+    total_doc_words = sum(len(str(block[1] or "").split()) for block in page_blocks)
+    if total_doc_words <= 8000:
+        TARGET_MIN_WORDS = 80
+        TARGET_MAX_WORDS = 160
+        TARGET_WORDS = 120
+        OVERLAP_WORDS = 25
+        logger.info(
+            "chunk_and_add_document: short/dense document (%s words) — using smaller chunks (target=%s)",
+            total_doc_words,
+            TARGET_WORDS,
+        )
+
     unit_pattern = _re.compile(r'\bunit\s*(\d+)\b', _re.IGNORECASE)
     section_pattern = _re.compile(r'(?im)^\s*((?:unit|chapter|section|lesson)\s+[0-9A-Za-z.-]+[^\n]{0,120})\s*$')
     heading_hint_pattern = _re.compile(r'(?i)^(?:unit|chapter|section|lesson)\s+[0-9A-Za-z.-]+\b')
@@ -746,11 +826,20 @@ def chunk_and_add_document(
 
     for page_num, page_text in page_blocks:
         raw_paragraphs = _re.split(r'\n{2,}', page_text)
+        if total_doc_words <= 8000 and len(raw_paragraphs) <= 3:
+            line_splits = [ln.strip() for ln in _re.split(r'\n+', page_text) if ln.strip()]
+            if len(line_splits) > len(raw_paragraphs):
+                raw_paragraphs = line_splits
         page_hint_chapter = page_chapter_hints.get(page_num) if page_num is not None else ""
         page_is_toc = bool(page_toc_flags.get(page_num, False)) if page_num is not None else False
         for raw_para in raw_paragraphs:
             para = _normalize_para(raw_para)
-            if len(para) < 20:
+            if len(para) < 12 and total_doc_words <= 8000:
+                if _re.search(r'\d', para):
+                    pass
+                else:
+                    continue
+            elif len(para) < 20:
                 continue
             if _is_noise_chunk(para):
                 continue
@@ -1238,11 +1327,12 @@ def search_documents(query: str, top_k: int = 3, distance_threshold: float = 1.2
     Args:
         query: User's question
         top_k: Maximum number of results to consider
-        distance_threshold: Maximum L2 distance to accept (lower = stricter).
-                            Typical values for all-MiniLM-L6-v2:
-                              < 0.5  → very high relevance
-                              0.5–1.0 → good relevance
-                              > 1.0  → likely unrelated (filtered out)
+        distance_threshold: Maximum distance to accept (lower = stricter).
+                            Collections use cosine space; typical values for
+                            multilingual-e5-base cosine distance:
+                              < 0.35 → very high relevance
+                              0.35–1.0 → good relevance
+                              > 1.2  → likely unrelated (filtered out)
         tenant_id:          When provided (and not the default tenant), bind
                             strictly to that tenant's collection so results can
                             never come from another business's knowledge base.

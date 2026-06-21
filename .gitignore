@@ -163,3 +163,29 @@ archived_pdfs/
 *.wav
 *.bak
 tools/testing/*.last.json
+
+# =========================
+
+# Scan / cleanup artifacts
+
+# =========================
+
+*.pre_mt_backup
+temp_launchers/
+temp_phase*.py
+._*
+rag_verification_report.json
+docs/UNNECESSARY_FILES_REPORT.md
+docs/unnecessary_files.json
+
+# >>> cleanup_repo.py
+# Repo cleanup / archive
+_archived_cleanup/
+**/final_rag_report*.json
+backend/conversations.json
+scripts/tmp_*.py
+backend/tmp_*.py
+tools/testing/_legacy_xtts/
+start_xtts_service.bat.disabled
+non_functional/old_python/
+# <<< cleanup_repo.py

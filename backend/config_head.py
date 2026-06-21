@@ -102,7 +102,7 @@ try:
         ANALYTICS_DB, DEVELOPMENT,
         OLLAMA_HOST, OLLAMA_PORT, OLLAMA_MODEL,
         DEFAULT_TENANT_ID, tenant_collection_base, tenant_collection_name,
-        tenant_assets_dir,
+        tenant_assets_dir, kb_asset_search_dirs, CHROMA_DB_PATH,
     )
 except Exception:
     # Fallbacks if config isn't importable
@@ -118,6 +118,7 @@ except Exception:
     SESSION_SECRET = "X!3p7#9v@Yqe*rQ6CwZ8l&FbM%tUJdfPsoH1XEaN"
     SESSION_COOKIE = "session"
     ANALYTICS_DB = _P(__file__).resolve().parent / "analytics.db"
+    CHROMA_DB_PATH = _P(__file__).resolve().parent / "chroma_db_v3"
     DEVELOPMENT = True
     OLLAMA_HOST = "127.0.0.1"
     OLLAMA_PORT = 11434
@@ -152,27 +153,48 @@ except Exception:
             pass
         return directory
 
+    def kb_asset_search_dirs(scope_tid):
+        if scope_tid is None:
+            return [tenant_assets_dir(DEFAULT_TENANT_ID), ASSETS_DIR]
+        return [tenant_assets_dir(scope_tid)]
+
 from backend.knowledge_base import search_documents, add_document, chunk_and_add_document, delete_document, delete_documents_with_prefix, delete_documents_by_filename, update_document, find_base_doc_id_by_filename, list_uploaded_files, count_documents
 from backend.database import init_database, save_conversation, start_session, end_session, get_stats
 from backend.analytics import init_analytics_db, log_usage, log_kb_event, get_kb_stats, get_kb_events
 from backend.response_validator import validate_response
 
-RAG_STRICT_DISTANCE_THRESHOLD = float(os.getenv("RAG_STRICT_DISTANCE_THRESHOLD", "0.70"))
+# Voice runtime state (after ML stack imports above)
+from backend.voice_audio.state import (
+    voice_semaphore,
+    interrupt_events,
+    ws_write_locks,
+    SAMPLE_RATE,
+)
+from backend.voice_audio import memory_guard
+
+_ws_write_locks = ws_write_locks
+_active_voice_task = memory_guard.active_voice_task
+
+RAG_STRICT_DISTANCE_THRESHOLD = float(os.getenv("RAG_STRICT_DISTANCE_THRESHOLD", "1.0"))
 RAG_NO_MATCH_RESPONSE = "Not found in the document."
 CS_NO_MATCH_RESPONSE_EN = (
-    "I don't have that specific detail in our help materials yet. "
-    "I can help with questions covered in our knowledge base—what would you like to know?"
+    "Thanks for your question. I don't have that specific detail in our help materials yet, "
+    "but I'm here to help with anything covered in your knowledge base. What would you like to know?"
 )
 CS_NO_MATCH_RESPONSE_AR = (
-    "ليس لدي هذا التفصيل المحدد في مواد المساعدة لدينا بعد. "
-    "يمكنني المساعدة في الأسئلة المشمولة في قاعدة المعرفة لدينا—بماذا تود المساعدة؟"
+    "شكراً لسؤالك. ليس لدي هذا التفصيل المحدد في مواد المساعدة لدينا بعد، "
+    "لكنني هنا للمساعدة في أي موضوع مشمول في قاعدة المعرفة. بماذا تود المساعدة؟"
 )
 CUSTOMER_SUPPORT_AGENT_SYSTEM_PROMPT = (
     "You are Assistify, a friendly customer support agent for this business.\n"
     "Answer using ONLY the provided context from our help materials.\n"
     "Use clear, professional, conversational language.\n"
-    "If the answer is not in the context, respond with exactly:\n"
-    "Not found in the document."
+    "If the answer is not in the context, say warmly that the detail is not in the uploaded materials.\n"
+    "Never invent formulas, coefficient weights, diagnostic codes, quotes, or historical links not present in context.\n"
+)
+RAG_GROUNDING_REFUSAL_RULE = (
+    "If the retrieved documents do not contain the requested formula, coefficient weights, "
+    "diagnostic code, or historical connection, say so clearly and do not invent one."
 )
 CONVERSATIONAL_REDIRECT_EN = (
     "Thank you for reaching out. I'm here and ready to help with your support questions "
@@ -242,20 +264,6 @@ ASSISTANT_META_NOT_FOUND_BEHAVIOR_AR = (
 RAG_GUARD_MODE_VERSION = "two-stage-mild-v3"
 RAG_OLD_STRICT_07_ACTIVE = False
 
-# ========== CONFIGURATION ==========
-SAMPLE_RATE = 16000
-
 # Ollama direct URL â€” all LLM calls go here, main_llm_server.py is NOT used
 OLLAMA_API_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/chat"
 
-# Track interrupt events per connection for barge-in support
-interrupt_events = {}
-# Per-connection WebSocket write lock â€” prevents concurrent send() calls from
-# call_llm_streaming and _tts_arabic_response background tasks crashing the socket.
-_ws_write_locks: dict[str, asyncio.Lock] = {}
-
-# ========== STABILIZATION: Concurrency + Resource Guards ==========
-# Semaphore(1) = only ONE voice pipeline at a time (Part 2)
-voice_semaphore = asyncio.Semaphore(1)
-# Track the currently-active voice task so we can cancel it on new session
-_active_voice_task: asyncio.Task | None = None

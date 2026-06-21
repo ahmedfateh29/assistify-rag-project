@@ -10,9 +10,11 @@ from typing import Iterable, List, Optional, Tuple
 
 PORT_OLLAMA = 11434
 PORT_PIPER = 5002
-PORT_LLM = 8000
+PORT_LLM = 8010
 PORT_RAG = 7000
 PORT_LOGIN = 7001
+# Legacy ports from older Assistify launchers (RAG/LLM/Login/Voice on 8000–8002)
+LEGACY_PORTS = (8000, 8001, 8002)
 
 
 @dataclass
@@ -24,21 +26,66 @@ class ServiceStatus:
     process_names: List[str]
 
 
-def find_pids_on_port_windows(port: int) -> List[int]:
+def find_listeners_on_port_windows(port: int) -> List[Tuple[int, str]]:
+    """Return (pid, local_address) for each LISTENING socket on *port*."""
     try:
         out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
     except Exception:
         return []
-    pids: set[int] = set()
+    listeners: List[Tuple[int, str]] = []
+    seen: set[Tuple[int, str]] = set()
     for line in out.splitlines():
-        if f":{port} " in line or line.rstrip().endswith(f":{port}"):
-            parts = line.split()
-            if len(parts) >= 5 and parts[-2].upper() == "LISTENING":
-                try:
-                    pids.add(int(parts[-1]))
-                except ValueError:
-                    pass
+        if f":{port} " not in line and not line.rstrip().endswith(f":{port}"):
+            continue
+        parts = line.split()
+        if len(parts) < 5 or parts[-2].upper() != "LISTENING":
+            continue
+        try:
+            pid = int(parts[-1])
+        except ValueError:
+            continue
+        addr = parts[1] if len(parts) >= 2 else "?"
+        key = (pid, addr)
+        if key not in seen:
+            seen.add(key)
+            listeners.append(key)
+    return listeners
+
+
+def find_pids_on_port_windows(port: int) -> List[int]:
+    pids = {pid for pid, _ in find_listeners_on_port_windows(port)}
     return sorted(pids)
+
+
+def detect_ollama_conflicts() -> List[str]:
+    """Return human-readable warnings when multiple processes hold port 11434."""
+    listeners = find_listeners_on_port_windows(PORT_OLLAMA)
+    if not listeners:
+        return []
+    pids = sorted({pid for pid, _ in listeners})
+    warnings: List[str] = []
+    if len(pids) > 1:
+        proc_names = ", ".join(_process_name_for_pid(pid) for pid in pids)
+        warnings.append(
+            f"Ollama port conflict: {len(pids)} processes on {PORT_OLLAMA} "
+            f"(PIDs {', '.join(str(p) for p in pids)}: {proc_names})"
+        )
+    addrs = {addr for _, addr in listeners}
+    if len(addrs) > 1:
+        warnings.append(
+            f"Ollama bind addresses on {PORT_OLLAMA}: {', '.join(sorted(addrs))}"
+        )
+    return warnings
+
+
+def print_ollama_conflict_warnings(*, fix_hint: bool = True) -> bool:
+    """Print Ollama conflict warnings. Returns True if any were printed."""
+    warnings = detect_ollama_conflicts()
+    for msg in warnings:
+        print(f"[WARN] {msg}")
+    if warnings and fix_hint:
+        print("[WARN] Fix: python start_main_servers.py --restart-ollama")
+    return bool(warnings)
 
 
 def _process_name_for_pid(pid: int) -> str:

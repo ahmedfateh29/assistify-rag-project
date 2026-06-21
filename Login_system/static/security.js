@@ -121,6 +121,41 @@ function getCSRFToken() {
 }
 
 /**
+ * Extract a human-readable API error message from a fetch Response.
+ */
+async function parseApiError(response) {
+    if (!response) {
+        return 'Request failed: no response received';
+    }
+    try {
+        const data = await response.json();
+        if (data && typeof data.detail === 'string') {
+            return data.detail;
+        }
+        if (data && Array.isArray(data.detail)) {
+            return data.detail.map((item) => item.msg || String(item)).join('; ');
+        }
+        if (data && data.detail) {
+            return String(data.detail);
+        }
+        if (data && data.message) {
+            return String(data.message);
+        }
+    } catch (_) {
+        // fall through to text/status fallback
+    }
+    try {
+        const text = await response.text();
+        if (text && text.trim()) {
+            return text.trim();
+        }
+    } catch (_) {
+        // ignore
+    }
+    return response.statusText || `Request failed (${response.status})`;
+}
+
+/**
  * Secure fetch wrapper with CSRF protection
  */
 async function secureFetch(url, options = {}) {
@@ -387,6 +422,7 @@ window.Security = {
     escapeHTML,
     sanitizeInput,
     getCSRFToken,
+    parseApiError,
     secureFetch,
     secureFormSubmit,
     isValidEmail,

@@ -64,8 +64,38 @@ from config import (
     EMAILJS_PUBLIC_KEY, EMAILJS_PRIVATE_KEY, EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID,
     ENFORCE_HTTPS, ALLOWED_HOSTS, IS_PRODUCTION,
     RATE_LIMIT_LOGIN, RATE_LIMIT_REGISTER, RATE_LIMIT_OTP,
-    BCRYPT_ROUNDS, DEFAULT_TENANT_ID
+    BCRYPT_ROUNDS, DEFAULT_TENANT_ID, kb_asset_search_dirs,
+    ALLOW_DEV_LOGIN_FALLBACK, assert_production_config,
 )
+
+try:
+    from Login_system.persistent_state import (
+        ensure_persistent_state_schema,
+        is_session_invalidated,
+        invalidate_session as persist_invalidate_session,
+        track_user_session,
+        touch_user_session,
+        check_rate_limit as persist_check_rate_limit,
+        check_account_lockout as persist_check_account_lockout,
+        record_failed_login as persist_record_failed_login,
+        set_account_lockout,
+        clear_failed_attempts as persist_clear_failed_attempts,
+        get_failed_attempt_count,
+    )
+except ImportError:
+    from persistent_state import (
+        ensure_persistent_state_schema,
+        is_session_invalidated,
+        invalidate_session as persist_invalidate_session,
+        track_user_session,
+        touch_user_session,
+        check_rate_limit as persist_check_rate_limit,
+        check_account_lockout as persist_check_account_lockout,
+        record_failed_login as persist_record_failed_login,
+        set_account_lockout,
+        clear_failed_attempts as persist_clear_failed_attempts,
+        get_failed_attempt_count,
+    )
 
 try:
     from Login_system.memberships import (
@@ -94,6 +124,25 @@ except ImportError:
         resolve_active_tenant_id,
         customer_has_approved_access,
         backfill_default_tenant_memberships,
+    )
+
+try:
+    from Login_system.rbac import (
+        assert_can_assign_role,
+        assert_can_manage_user,
+        sql_role_filter_for_caller,
+        roles_assignable_by,
+        MASTER_ADMIN_OR_HIGHER,
+        TENANT_STAFF_ROLES,
+    )
+except ImportError:
+    from rbac import (
+        assert_can_assign_role,
+        assert_can_manage_user,
+        sql_role_filter_for_caller,
+        roles_assignable_by,
+        MASTER_ADMIN_OR_HIGHER,
+        TENANT_STAFF_ROLES,
     )
 
 # Password hashing with configurable cost
@@ -330,80 +379,29 @@ SESSION_ABSOLUTE_TIMEOUT = 86400  # 24 hours
 SESSION_IDLE_TIMEOUT = 1800  # 30 minutes
 MAX_CONCURRENT_SESSIONS = 3
 
-# Session tracking (use Redis in production)
-invalidated_sessions = set()  # Track invalidated session tokens
-user_sessions = defaultdict(list)  # user_id -> list of (session_id, created_at, last_activity)
-MAX_INVALIDATED_SESSIONS = 5000  # Prevent memory leak
-
-# Account lockout tracking (use Redis in production)
-failed_login_attempts = {}  # username -> count
-account_lockouts = {}  # username -> lockout_until_timestamp
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_DURATION = 900  # 15 minutes
 
-# Rate limiting storage (in-memory, use Redis in production)
-# NOTE: This is reset on server restart and won't work properly with multiple workers
-# For production, replace with Redis-backed rate limiting
-rate_limit_store = defaultdict(lambda: {"count": 0, "reset_time": time.time()})
-MAX_RATE_LIMIT_ENTRIES = 10000  # Prevent memory leak
-
 def check_rate_limit(identifier: str, limit: int, window_seconds: int = 60) -> bool:
     """Check if request is within rate limit. Returns True if allowed."""
-    now = time.time()
-    key = identifier
-    
-    # Cleanup old entries to prevent memory leak
-    if len(rate_limit_store) > MAX_RATE_LIMIT_ENTRIES:
-        expired_keys = [
-            k for k, v in rate_limit_store.items()
-            if now > v["reset_time"]
-        ]
-        for k in expired_keys[:len(expired_keys)//2]:  # Remove half of expired
-            del rate_limit_store[k]
-    
-    if now > rate_limit_store[key]["reset_time"]:
-        # Reset window
-        rate_limit_store[key] = {"count": 1, "reset_time": now + window_seconds}
-        return True
-    
-    if rate_limit_store[key]["count"] >= limit:
-        return False
-    
-    rate_limit_store[key]["count"] += 1
-    return True
+    return persist_check_rate_limit(identifier, limit, window_seconds)
 
 def check_account_lockout(username: str) -> tuple[bool, int]:
     """Check if account is locked out. Returns (is_locked, remaining_seconds)"""
-    now = time.time()
-    
-    # Clean expired lockouts
-    expired = [u for u, until in account_lockouts.items() if now >= until]
-    for u in expired:
-        del account_lockouts[u]
-        if u in failed_login_attempts:
-            del failed_login_attempts[u]
-    
-    if username in account_lockouts:
-        remaining = int(account_lockouts[username] - now)
-        return True, max(0, remaining)
-    
-    return False, 0
+    return persist_check_account_lockout(username)
 
 def record_failed_login(username: str, ip_address: str):
     """Record failed login attempt and lock account if threshold exceeded"""
-    if username not in failed_login_attempts:
-        failed_login_attempts[username] = 0
-    
-    failed_login_attempts[username] += 1
-    
+    count = persist_record_failed_login(username)
+
     log_security_event("login_failure", {
         "username": username,
         "ip_address": ip_address,
-        "attempt_count": failed_login_attempts[username]
+        "attempt_count": count
     }, severity="WARNING")
-    
-    if failed_login_attempts[username] >= MAX_FAILED_ATTEMPTS:
-        account_lockouts[username] = time.time() + LOCKOUT_DURATION
+
+    if count >= MAX_FAILED_ATTEMPTS:
+        set_account_lockout(username, time.time() + LOCKOUT_DURATION)
         log_security_event("account_lockout", {
             "username": username,
             "ip_address": ip_address,
@@ -412,8 +410,7 @@ def record_failed_login(username: str, ip_address: str):
 
 def clear_failed_attempts(username: str):
     """Clear failed login attempts after successful login"""
-    if username in failed_login_attempts:
-        del failed_login_attempts[username]
+    persist_clear_failed_attempts(username)
 
 def create_session_token(username: str, role: str, auth_provider: str = "local", **extra_data) -> str:
     """Create a new session token with security metadata"""
@@ -487,64 +484,44 @@ def create_session_token(username: str, role: str, auth_provider: str = "local",
 
     if row:
         user_id = row[0]
-        # Track session for concurrent session limits
-        user_sessions[user_id].append({
-            "session_id": session_id,
-            "created_at": now,
-            "last_activity": now
-        })
-        
-        # Enforce concurrent session limit
-        if len(user_sessions[user_id]) > MAX_CONCURRENT_SESSIONS:
-            # Remove oldest session
-            user_sessions[user_id].sort(key=lambda x: x["created_at"])
-            oldest = user_sessions[user_id].pop(0)
-            invalidated_sessions.add(oldest["session_id"])
-            
+        evicted_session = track_user_session(
+            user_id, session_id, now, MAX_CONCURRENT_SESSIONS
+        )
+        if evicted_session:
             log_security_event("concurrent_session_limit", {
                 "username": username,
                 "user_id": user_id,
                 "max_sessions": MAX_CONCURRENT_SESSIONS,
-                "invalidated_session": oldest["session_id"]
+                "invalidated_session": evicted_session
             })
-        
-        # Prevent memory leak in invalidated sessions
-        if len(invalidated_sessions) > MAX_INVALIDATED_SESSIONS:
-            # Keep only recent half
-            temp = list(invalidated_sessions)
-            invalidated_sessions.clear()
-            invalidated_sessions.update(temp[-MAX_INVALIDATED_SESSIONS//2:])
     
     return serializer.dumps(session_data)
 
 def validate_session(session_data: dict) -> tuple[bool, str]:
     """Validate session hasn't expired or been invalidated. Returns (is_valid, error_message)"""
-    # Check if session was explicitly invalidated
     session_id = session_data.get("session_id")
-    if session_id and session_id in invalidated_sessions:
+    if session_id and is_session_invalidated(session_id):
         return False, "Session invalidated"
     
     created_at = session_data.get("created_at", 0)
     last_activity = session_data.get("last_activity", created_at)
     now = time.time()
     
-    # Check absolute timeout (24 hours)
     if now - created_at > SESSION_ABSOLUTE_TIMEOUT:
         return False, "Session expired (absolute timeout)"
     
-    # Check idle timeout (30 minutes)
     if now - last_activity > SESSION_IDLE_TIMEOUT:
         return False, "Session expired (idle timeout)"
     
-    # Update last activity (we'll need to refresh the token)
     session_data["last_activity"] = now
+    if session_id:
+        touch_user_session(session_id, now)
     
     return True, ""
 
 def invalidate_session(session_id: str):
     """Mark a session as invalidated"""
-    if session_id:
-        invalidated_sessions.add(session_id)
+    persist_invalidate_session(session_id)
 
 class WebSocketRateLimiter:
     """Rate limiter for WebSocket messages to prevent flooding"""
@@ -742,8 +719,6 @@ def init_db():
         )
     ensure_membership_schema(c)
     conn.commit()
-    backfill_default_tenant_memberships(conn, DEFAULT_TENANT_ID)
-    conn.commit()
 
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users';")
     if not c.fetchone():
@@ -766,13 +741,18 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Platform owner: not bound to any single tenant's data.
-        create_user("superadmin", "superadmin123", "superadmin", tenant_id=DEFAULT_TENANT_ID)
-        create_user("admin", "admin123", "admin", tenant_id=DEFAULT_TENANT_ID)
-        create_user("employee", "employee123", "employee", tenant_id=DEFAULT_TENANT_ID)
-        create_user("customer", "customer123", "customer", tenant_id=DEFAULT_TENANT_ID)
+        try:
+            from Login_system.dev_users import seed_dev_users
+        except ImportError:
+            from dev_users import seed_dev_users
+
+        seed_dev_users(c, pwd_context, tenant_id=DEFAULT_TENANT_ID)
+        conn.commit()
+        backfill_default_tenant_memberships(conn, DEFAULT_TENANT_ID)
         conn.commit()
     else:
+        backfill_default_tenant_memberships(conn, DEFAULT_TENANT_ID)
+        conn.commit()
         # Check if columns exist, add if not
         c.execute("PRAGMA table_info(users)")
         columns = [col[1] for col in c.fetchall()]
@@ -975,8 +955,12 @@ def init_db():
     conn.close()
 
 
+    ensure_persistent_state_schema()
+
+
 @app.on_event("startup")
 def on_startup():
+    assert_production_config()
     init_db()
 
 
@@ -1000,13 +984,9 @@ def auth_user(username_or_email, password):
         if not is_active:
             return None, None
         
-        # Development fallback: if password_hash empty allow simple passwords
-        try:
-            from config import IS_PRODUCTION
-        except Exception:
-            IS_PRODUCTION = True
-        if not IS_PRODUCTION and (not password_hash or password_hash.strip() == ""):
-            if password == username or password == f"{username}123":
+        # Development fallback: only when explicitly enabled (never in production).
+        if ALLOW_DEV_LOGIN_FALLBACK and (not password_hash or password_hash.strip() == ""):
+            if password == username:
                 return username, role
 
         # Verify password against hash
@@ -1021,16 +1001,9 @@ def auth_user(username_or_email, password):
                     conn.commit()
                     conn.close()
                 return username, role
-        except Exception as e:
-            # Log failed verification but don't expose details
-            # Development fallback: allow simple username==password logins when not in production
-            if not IS_PRODUCTION:
-                try:
-                    if password == username:
-                        return username, role
-                except Exception:
-                    pass
-            pass
+        except Exception:
+            if ALLOW_DEV_LOGIN_FALLBACK and password == username:
+                return username, role
     return None, None
 
 
@@ -1038,6 +1011,8 @@ def _resolve_post_login_redirect(role: str, username: str) -> str:
     role = str(role or "").lower()
     if role == "superadmin":
         return "/superadmin"
+    if role == "master_admin":
+        return "/master_admin"
     if role == "admin":
         return "/admin"
     if role == "employee":
@@ -1060,12 +1035,15 @@ def _assert_target_user_in_caller_tenant(caller: dict, target_user_id: int) -> d
         raise HTTPException(status_code=404, detail="User not found")
     caller_role = str((caller or {}).get("role") or "").lower()
     if caller_role == "superadmin":
-        return {"id": row[0], "username": row[1], "role": row[2], "tenant_id": row[3]}
+        target = {"id": row[0], "username": row[1], "role": row[2], "tenant_id": row[3]}
+        return target
     caller_tid = int((caller or {}).get("tenant_id") or DEFAULT_TENANT_ID)
     target_tid = row[3]
     if target_tid is None or int(target_tid) != caller_tid:
         raise HTTPException(status_code=403, detail="Cannot manage users outside your business")
-    return {"id": row[0], "username": row[1], "role": row[2], "tenant_id": row[3]}
+    target = {"id": row[0], "username": row[1], "role": row[2], "tenant_id": row[3]}
+    assert_can_manage_user(caller, target)
+    return target
 
 
 def _tenant_scope_sql(user) -> tuple[str, list]:
@@ -1353,6 +1331,26 @@ def require_api_role(*allowed_roles):
             )
         return user
     return wrapper
+
+
+def require_master_admin_or_higher():
+    return require_api_role("master_admin", "superadmin")
+
+
+def require_tenant_staff():
+    return require_api_role("admin", "master_admin")
+
+
+def require_normal_admin():
+    return require_role("admin")
+
+
+def require_tenant_staff_page():
+    return require_role("admin", "master_admin")
+
+
+def require_master_admin_page():
+    return require_role("master_admin")
 
 
 @app.get("/register", response_class=HTMLResponse)
@@ -1787,6 +1785,8 @@ async def login(request: Request, username: str = Form(...), password: str = For
         
         if role == "admin":
             redirect_url = "/admin"
+        elif role == "master_admin":
+            redirect_url = "/master_admin"
         elif role == "employee":
             redirect_url = "/employee"
         else:
@@ -1818,13 +1818,14 @@ async def login(request: Request, username: str = Form(...), password: str = For
 
 
 @app.get("/users")
-def list_users(request: Request, user=Depends(require_login("admin"))):
+def list_users(request: Request, user=Depends(require_tenant_staff())):
     conn = get_db()
     c = conn.cursor()
     scope_sql, scope_params = _tenant_scope_sql(user)
+    role_sql, role_params = sql_role_filter_for_caller(user.get("role"))
     c.execute(
-        f"SELECT id, username, role, mfa_enabled FROM users WHERE 1=1{scope_sql}",
-        scope_params,
+        f"SELECT id, username, role, mfa_enabled FROM users WHERE 1=1{scope_sql}{role_sql}",
+        scope_params + role_params,
     )
     rows = c.fetchall()
     conn.close()
@@ -1857,7 +1858,7 @@ class UserCreate(BaseModel):
     @validator('role')
     def validate_role(cls, v):
         """Validate role is one of allowed values"""
-        allowed_roles = ['admin', 'employee', 'customer']
+        allowed_roles = ['employee', 'customer']
         if v not in allowed_roles:
             raise ValueError(f"Role must be one of: {', '.join(allowed_roles)}")
         return v
@@ -1865,8 +1866,9 @@ class UserCreate(BaseModel):
 
 
 @app.post("/users")
-def create_user_api(request: Request, data: UserCreate, admin=Depends(require_login("admin"))):
+def create_user_api(request: Request, data: UserCreate, admin=Depends(require_tenant_staff())):
     verify_csrf(request)
+    assert_can_assign_role(admin.get("role"), data.role)
     tenant_id = int(admin.get("tenant_id") or DEFAULT_TENANT_ID)
     create_user(data.username, data.password, data.role, tenant_id=tenant_id)
     return {"status": "created", "username": data.username}
@@ -1881,7 +1883,7 @@ class UserUpdate(BaseModel):
     def validate_role(cls, v):
         """Validate role if provided"""
         if v is not None:
-            allowed_roles = ['admin', 'employee', 'customer']
+            allowed_roles = ['employee', 'customer']
             if v not in allowed_roles:
                 raise ValueError(f"Role must be one of: {', '.join(allowed_roles)}")
         return v
@@ -1898,8 +1900,11 @@ class UserUpdate(BaseModel):
 
 
 @app.put("/users/{user_id}")
-def update_user(request: Request, user_id: int, data: UserUpdate, admin=Depends(require_login("admin"))):
+def update_user(request: Request, user_id: int, data: UserUpdate, admin=Depends(require_tenant_staff())):
     verify_csrf(request)
+    target = _assert_target_user_in_caller_tenant(admin, user_id)
+    if data.role:
+        assert_can_assign_role(admin.get("role"), data.role)
     conn = get_db()
     c = conn.cursor()
     if data.role:
@@ -1913,8 +1918,9 @@ def update_user(request: Request, user_id: int, data: UserUpdate, admin=Depends(
 
 
 @app.delete("/users/{user_id}")
-def delete_user(request: Request, user_id: int, admin=Depends(require_login("admin"))):
+def delete_user(request: Request, user_id: int, admin=Depends(require_tenant_staff())):
     verify_csrf(request)
+    _assert_target_user_in_caller_tenant(admin, user_id)
     conn = get_db()
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -1925,8 +1931,9 @@ def delete_user(request: Request, user_id: int, admin=Depends(require_login("adm
 
 
 @app.post("/users/{user_id}/mfa-enable")
-def enable_mfa(request: Request, user_id: int, admin=Depends(require_login("admin"))):
+def enable_mfa(request: Request, user_id: int, admin=Depends(require_tenant_staff())):
     verify_csrf(request)
+    _assert_target_user_in_caller_tenant(admin, user_id)
     try:
         import pyotp
     except Exception:
@@ -1945,7 +1952,7 @@ def enable_mfa(request: Request, user_id: int, admin=Depends(require_login("admi
 
 
 @app.get("/admin")
-def admin_dashboard(request: Request, user=Depends(require_login("admin"))):
+def admin_dashboard(request: Request, user=Depends(require_normal_admin())):
     """Admin dashboard - returns HTML for browsers, JSON for API requests"""
     # Check if client wants JSON (API request)
     accept_header = request.headers.get("accept", "")
@@ -1956,7 +1963,7 @@ def admin_dashboard(request: Request, user=Depends(require_login("admin"))):
 
 
 @app.get("/employee")
-def employee_dashboard(request: Request, user=Depends(require_login("employee"))):
+def employee_dashboard(request: Request, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Employee dashboard - returns HTML for browsers, JSON for API requests"""
     # Check if client wants JSON (API request)
     accept_header = request.headers.get("accept", "")
@@ -1964,6 +1971,68 @@ def employee_dashboard(request: Request, user=Depends(require_login("employee"))
         return JSONResponse({"status": "ok", "role": "employee", "username": user.get("username")})
     # Return HTML for browser
     return templates.TemplateResponse("employee.html", {"request": request, "user": user})
+
+
+@app.get("/master_admin")
+def master_admin_dashboard(request: Request, user=Depends(require_master_admin_page())):
+    accept_header = request.headers.get("accept", "")
+    if "application/json" in accept_header:
+        return JSONResponse({"status": "ok", "role": "master_admin", "username": user.get("username")})
+    return templates.TemplateResponse("master_admin.html", {"request": request, "user": user})
+
+
+@app.get("/master_admin/admins", response_class=HTMLResponse)
+def master_admin_admins_page(request: Request, user=Depends(require_master_admin_page())):
+    return templates.TemplateResponse("master_admin_admins.html", {"request": request, "user": user})
+
+
+@app.get("/master_admin/users", response_class=HTMLResponse)
+def master_admin_users_page(request: Request, user=Depends(require_master_admin_page())):
+    return templates.TemplateResponse("admin_users.html", {"request": request, "user": user, "staff_mode": "master_admin"})
+
+
+@app.get("/master_admin/knowledge", response_class=HTMLResponse)
+def master_admin_knowledge_page(request: Request, user=Depends(require_master_admin_page())):
+    return templates.TemplateResponse("admin_knowledge.html", {"request": request, "user": user})
+
+
+@app.get("/master_admin/analytics", response_class=HTMLResponse)
+def master_admin_analytics_page(request: Request, user=Depends(require_master_admin_page())):
+    return templates.TemplateResponse("admin_analytics.html", {"request": request, "user": user})
+
+
+@app.get("/master_admin/access-requests", response_class=HTMLResponse)
+def master_admin_access_requests_page(request: Request, user=Depends(require_master_admin_page())):
+    return templates.TemplateResponse("admin_access_requests.html", {"request": request, "user": user})
+
+
+@app.get("/master_admin/tickets", response_class=HTMLResponse)
+def master_admin_tickets_page(request: Request, user=Depends(require_master_admin_page())):
+    return templates.TemplateResponse("admin_tickets.html", {"request": request, "user": user})
+
+
+@app.get("/master_admin/audit-logs", response_class=HTMLResponse)
+def master_admin_audit_logs_page(request: Request, user=Depends(require_master_admin_page())):
+    conn = get_db()
+    c = conn.cursor()
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    c.execute(
+        """
+        SELECT id, username, action, old_value, new_value, ip_address, performed_by, created_at
+        FROM audit_logs
+        WHERE user_id IN (SELECT id FROM users WHERE tenant_id=?)
+        ORDER BY created_at DESC
+        LIMIT 200
+        """,
+        (tenant_id,),
+    )
+    logs = c.fetchall()
+    conn.close()
+    return templates.TemplateResponse("admin_audit_logs.html", {
+        "request": request,
+        "user": user,
+        "logs": logs,
+    })
 
 
 @app.get("/customer")
@@ -1978,22 +2047,22 @@ def customer_dashboard(request: Request, user=Depends(require_login("customer"))
 
 
 @app.get("/admin/users", response_class=HTMLResponse)
-def admin_users_page(request: Request, user=Depends(require_login("admin"))):
+def admin_users_page(request: Request, user=Depends(require_normal_admin())):
     return templates.TemplateResponse("admin_users.html", {"request": request, "user": user})
 
 
 @app.get("/admin/knowledge", response_class=HTMLResponse)
-def admin_knowledge_page(request: Request, user=Depends(require_login("admin"))):
+def admin_knowledge_page(request: Request, user=Depends(require_normal_admin())):
     return templates.TemplateResponse("admin_knowledge.html", {"request": request, "user": user})
 
 
 @app.get("/admin/analytics", response_class=HTMLResponse)
-def admin_analytics_page(request: Request, user=Depends(require_login("admin"))):
+def admin_analytics_page(request: Request, user=Depends(require_normal_admin())):
     return templates.TemplateResponse("admin_analytics.html", {"request": request, "user": user})
 
 
 @app.get("/admin/audit-logs", response_class=HTMLResponse)
-def admin_audit_logs_page(request: Request, user=Depends(require_login("admin"))):
+def admin_audit_logs_page(request: Request, user=Depends(require_normal_admin())):
     """Display audit logs for admin review."""
     conn = get_db()
     c = conn.cursor()
@@ -2027,14 +2096,15 @@ def admin_audit_logs_page(request: Request, user=Depends(require_login("admin"))
 
 
 @app.get("/api/users")
-def list_users(request: Request, user=Depends(require_api_auth("admin"))):
-    """Admin: Get users for the admin's own business (superadmin: all users)."""
+def list_users_api(request: Request, user=Depends(require_tenant_staff())):
+    """Tenant staff: list users visible to caller's role within their business."""
     conn = get_db()
     c = conn.cursor()
     scope_sql, scope_params = _tenant_scope_sql(user)
+    role_sql, role_params = sql_role_filter_for_caller(user.get("role"))
     c.execute(
-        f"SELECT id, username, role, active, email, full_name FROM users WHERE 1=1{scope_sql} ORDER BY id",
-        scope_params,
+        f"SELECT id, username, role, active, email, full_name FROM users WHERE 1=1{scope_sql}{role_sql} ORDER BY id",
+        scope_params + role_params,
     )
     rows = c.fetchall()
     conn.close()
@@ -2052,7 +2122,7 @@ def list_users(request: Request, user=Depends(require_api_auth("admin"))):
 
 
 @app.get("/api/customers")
-def list_customers(request: Request, user=Depends(require_api_role("admin", "employee"))):
+def list_customers(request: Request, user=Depends(require_api_role("admin", "master_admin", "employee"))):
     """Tenant-scoped customer accounts (approved memberships for this business)."""
     conn = get_db()
     c = conn.cursor()
@@ -2084,7 +2154,7 @@ def list_customers(request: Request, user=Depends(require_api_role("admin", "emp
 
 
 @app.post("/api/users/create")
-async def create_new_user(request: Request, user=Depends(require_login("admin"))):
+async def create_new_user(request: Request, user=Depends(require_tenant_staff())):
     verify_csrf(request)
     data = await request.json()
     username = data.get("username")
@@ -2097,31 +2167,9 @@ async def create_new_user(request: Request, user=Depends(require_login("admin"))
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
     
-    if role not in ["admin", "employee", "customer"]:
-        raise HTTPException(status_code=400, detail="Invalid role")
+    assert_can_assign_role(user.get("role"), role)
     
-    # New users inherit the creating admin's tenant so a domain manager can
-    # only add users into their own tenant.
     tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
-    if role == "admin":
-        conn = get_db()
-        c = conn.cursor()
-        c.execute(
-            "SELECT COALESCE(allow_multiple_admins, 0) FROM tenants WHERE id=?",
-            (tenant_id,),
-        )
-        allow_row = c.fetchone()
-        c.execute(
-            "SELECT COUNT(*) FROM users WHERE tenant_id=? AND role='admin' AND active=1",
-            (tenant_id,),
-        )
-        admin_count = (c.fetchone() or [0])[0]
-        conn.close()
-        if admin_count >= 1 and not (allow_row and allow_row[0]):
-            raise HTTPException(
-                status_code=403,
-                detail="This business allows only one admin. Contact the platform owner to enable multiple admins.",
-            )
     try:
         conn = get_db()
         c = conn.cursor()
@@ -2137,7 +2185,7 @@ async def create_new_user(request: Request, user=Depends(require_login("admin"))
 
 
 @app.post("/api/users/{user_id}/deactivate")
-async def deactivate_user_api(request: Request, user_id: int, user=Depends(require_login("admin"))):
+async def deactivate_user_api(request: Request, user_id: int, user=Depends(require_tenant_staff())):
     verify_csrf(request)
     target = _assert_target_user_in_caller_tenant(user, user_id)
     conn = get_db()
@@ -2156,7 +2204,7 @@ async def deactivate_user_api(request: Request, user_id: int, user=Depends(requi
 
 
 @app.post("/api/users/{user_id}/activate")
-async def activate_user_api(request: Request, user_id: int, user=Depends(require_login("admin"))):
+async def activate_user_api(request: Request, user_id: int, user=Depends(require_tenant_staff())):
     verify_csrf(request)
     target = _assert_target_user_in_caller_tenant(user, user_id)
     conn = get_db()
@@ -2175,21 +2223,147 @@ async def activate_user_api(request: Request, user_id: int, user=Depends(require
 
 
 @app.delete("/api/users/{user_id}/delete")
-def delete_user_api(request: Request, user_id: int, user=Depends(require_login("admin"))):
+def delete_user_api(request: Request, user_id: int, user=Depends(require_tenant_staff())):
     verify_csrf(request)
-    # Prevent deleting yourself
-    if user.get("username"):
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT username FROM users WHERE id=?", (user_id,))
-        row = c.fetchone()
-        if row and row[0] == user.get("username"):
-            conn.close()
-            raise HTTPException(status_code=400, detail="Cannot delete your own account")
-        c.execute("DELETE FROM users WHERE id=?", (user_id,))
+    target = _assert_target_user_in_caller_tenant(user, user_id)
+    if target["username"] == user.get("username"):
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    conn = get_db()
+    c = conn.cursor()
+    _purge_user_dependencies(c, user_id, target["username"])
+    c.execute("DELETE FROM users WHERE id=?", (user_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
+
+
+# ========== MASTER ADMIN: NORMAL ADMIN MANAGEMENT ==========
+
+@app.get("/api/tenant-admins")
+def list_tenant_admins(request: Request, user=Depends(require_master_admin_or_higher())):
+    """Master admin: list normal admins in caller's tenant."""
+    conn = get_db()
+    c = conn.cursor()
+    if user.get("role") == "superadmin":
+        tenant_id = int(request.query_params.get("tenant_id") or DEFAULT_TENANT_ID)
+    else:
+        tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    c.execute(
+        """
+        SELECT id, username, role, active, email, full_name
+        FROM users
+        WHERE tenant_id=? AND role='admin'
+        ORDER BY username
+        """,
+        (tenant_id,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "username": row[1],
+            "role": row[2],
+            "active": bool(row[3]),
+            "email": row[4],
+            "full_name": row[5],
+        }
+        for row in rows
+    ]
+
+
+@app.post("/api/tenant-admins/create")
+async def create_tenant_admin(request: Request, user=Depends(require_master_admin_or_higher())):
+    """Master admin: create a normal admin in their tenant."""
+    verify_csrf(request)
+    data = await request.json()
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    full_name = (data.get("full_name") or "").strip() or None
+    email = (data.get("email") or "").strip() or None
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password required")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    caller_role = user.get("role")
+    assert_can_assign_role(caller_role, "admin")
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute(
+            """
+            INSERT INTO users (username, password_hash, role, active, tenant_id, full_name, email)
+            VALUES (?, ?, 'admin', 1, ?, ?, ?)
+            """,
+            (username, pwd_context.hash(password), tenant_id, full_name, email),
+        )
         conn.commit()
         conn.close()
-    return {"status": "deleted"}
+        return {"status": "created", "username": username}
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+
+@app.patch("/api/tenant-admins/{user_id}")
+async def update_tenant_admin(request: Request, user_id: int, user=Depends(require_master_admin_or_higher())):
+    verify_csrf(request)
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    target = _get_tenant_normal_admin(user_id, tenant_id)
+    assert_can_manage_user(user, target)
+    data = await request.json()
+
+    conn = get_db()
+    c = conn.cursor()
+    updates = []
+    params = []
+
+    if "full_name" in data:
+        updates.append("full_name=?")
+        params.append((data.get("full_name") or "").strip() or None)
+    if "email" in data:
+        updates.append("email=?")
+        params.append((data.get("email") or "").strip() or None)
+    if data.get("password"):
+        if len(data["password"]) < 8:
+            conn.close()
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+        updates.append("password_hash=?")
+        params.append(pwd_context.hash(data["password"]))
+    if "active" in data:
+        updates.append("active=?")
+        params.append(1 if data.get("active") else 0)
+
+    if not updates:
+        conn.close()
+        return {"status": "unchanged"}
+
+    params.append(user_id)
+    c.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=?", tuple(params))
+    conn.commit()
+    conn.close()
+    return {"status": "updated", "username": target["username"]}
+
+
+@app.delete("/api/tenant-admins/{user_id}")
+async def delete_tenant_admin(request: Request, user_id: int, user=Depends(require_master_admin_or_higher())):
+    verify_csrf(request)
+    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+    target = _get_tenant_normal_admin(user_id, tenant_id)
+    assert_can_manage_user(user, target)
+    if target["username"] == user.get("username"):
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    conn = get_db()
+    c = conn.cursor()
+    _purge_user_dependencies(c, user_id, target["username"])
+    c.execute("DELETE FROM users WHERE id=?", (user_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted", "username": target["username"]}
 
 
 # ========== SUPERADMIN: TENANT & DOMAIN-MANAGER MANAGEMENT ==========
@@ -2200,7 +2374,7 @@ def delete_user_api(request: Request, user_id: int, user=Depends(require_login("
 # handling, JSON request bodies).
 
 _MEMBERSHIP_STATUSES = ("pending", "approved", "rejected", "revoked")
-_ROLE_COUNT_ROLES = ("admin", "employee", "customer")
+_ROLE_COUNT_ROLES = ("master_admin", "admin", "employee", "customer")
 
 
 def _empty_membership_stats() -> dict[str, int]:
@@ -2219,6 +2393,7 @@ def build_tenant_details(conn, tenant_ids: list[int]) -> dict[int, dict]:
     details = {
         tid: {
             "role_counts": _empty_role_counts(),
+            "master_admins": [],
             "admins": [],
             "employees": [],
             "membership_customers": [],
@@ -2235,7 +2410,7 @@ def build_tenant_details(conn, tenant_ids: list[int]) -> dict[int, dict]:
         SELECT tenant_id, role, COUNT(*)
         FROM users
         WHERE tenant_id IN ({placeholders})
-          AND role IN ('admin', 'employee', 'customer')
+          AND role IN ('master_admin', 'admin', 'employee', 'customer')
         GROUP BY tenant_id, role
         """,
         tenant_ids,
@@ -2250,7 +2425,7 @@ def build_tenant_details(conn, tenant_ids: list[int]) -> dict[int, dict]:
         SELECT id, username, email, full_name, active, tenant_id, role
         FROM users
         WHERE tenant_id IN ({placeholders})
-          AND role IN ('admin', 'employee')
+          AND role IN ('master_admin', 'admin', 'employee')
         ORDER BY tenant_id, role, username
         """,
         tenant_ids,
@@ -2267,7 +2442,9 @@ def build_tenant_details(conn, tenant_ids: list[int]) -> dict[int, dict]:
             "full_name": row[3],
             "active": bool(row[4]) if row[4] is not None else True,
         }
-        if row[6] == "admin":
+        if row[6] == "master_admin":
+            bucket["master_admins"].append(user)
+        elif row[6] == "admin":
             bucket["admins"].append(user)
         else:
             bucket["employees"].append(user)
@@ -2360,6 +2537,7 @@ def list_tenants(request: Request, user=Depends(require_api_role("superadmin")))
             "plan": row[4],
             "created_at": row[5],
             "allow_multiple_admins": bool(row[6]) if len(row) > 6 else False,
+            "admin_count": int((extra.get("role_counts") or {}).get("admin", 0)),
             "user_count": user_counts.get(tenant_id, 0),
             **extra,
         })
@@ -2417,6 +2595,8 @@ async def create_tenant_manager_api(request: Request, tenant_id: int, user=Depen
         raise HTTPException(status_code=400, detail="Username and password required")
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if email and not validate_email(email):
+        raise HTTPException(status_code=400, detail="Invalid email format")
 
     # The target tenant must exist before we bind a manager to it.
     conn = get_db()
@@ -2426,10 +2606,27 @@ async def create_tenant_manager_api(request: Request, tenant_id: int, user=Depen
         conn.close()
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    if email:
+        c.execute("SELECT id FROM users WHERE email=? AND email IS NOT NULL", (email,))
+        if c.fetchone():
+            conn.close()
+            raise HTTPException(status_code=400, detail="Email already registered")
+
     try:
+        c.execute(
+            "SELECT COUNT(*) FROM users WHERE tenant_id=? AND role='master_admin' AND active=1",
+            (tenant_id,),
+        )
+        if (c.fetchone() or [0])[0] >= 1:
+            conn.close()
+            raise HTTPException(
+                status_code=403,
+                detail="This tenant already has a master admin. Delete or deactivate the existing one first.",
+            )
+
         c.execute("""
             INSERT INTO users (username, password_hash, role, active, tenant_id, auth_provider, full_name, email)
-            VALUES (?, ?, 'admin', 1, ?, 'local', ?, ?)
+            VALUES (?, ?, 'master_admin', 1, ?, 'local', ?, ?)
         """, (username, pwd_context.hash(password), tenant_id, full_name, email))
         conn.commit()
         conn.close()
@@ -2437,6 +2634,218 @@ async def create_tenant_manager_api(request: Request, tenant_id: int, user=Depen
     except sqlite3.IntegrityError:
         conn.close()
         raise HTTPException(status_code=400, detail="Username already exists")
+
+
+def _get_tenant_master_admin(user_id: int, tenant_id: int) -> dict:
+    """Load a tenant-bound master_admin user or raise 404."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, username, role, tenant_id, full_name, email, active
+        FROM users
+        WHERE id=? AND tenant_id=? AND role='master_admin'
+        """,
+        (int(user_id), int(tenant_id)),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Master admin not found for this business")
+    return {
+        "id": row[0],
+        "username": row[1],
+        "role": row[2],
+        "tenant_id": row[3],
+        "full_name": row[4],
+        "email": row[5],
+        "active": bool(row[6]) if row[6] is not None else True,
+    }
+
+
+def _get_tenant_normal_admin(user_id: int, tenant_id: int) -> dict:
+    """Load a tenant-bound normal admin user or raise 404."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, username, role, tenant_id, full_name, email, active
+        FROM users
+        WHERE id=? AND tenant_id=? AND role='admin'
+        """,
+        (int(user_id), int(tenant_id)),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Admin not found for this business")
+    return {
+        "id": row[0],
+        "username": row[1],
+        "role": row[2],
+        "tenant_id": row[3],
+        "full_name": row[4],
+        "email": row[5],
+        "active": bool(row[6]) if row[6] is not None else True,
+    }
+
+
+def _get_tenant_admin(user_id: int, tenant_id: int) -> dict:
+    """Backward-compatible alias for superadmin manager endpoints (master_admin)."""
+    return _get_tenant_master_admin(user_id, tenant_id)
+
+
+def _purge_user_dependencies(cursor, user_id: int, username: str | None = None) -> None:
+    """Remove rows that block deleting a user (support data, memberships)."""
+    uid = int(user_id)
+    uname = (username or "").strip()
+    cursor.execute("SELECT id FROM support_tickets WHERE customer_id=?", (uid,))
+    ticket_ids = [row[0] for row in cursor.fetchall()]
+    if ticket_ids:
+        placeholders = ",".join("?" * len(ticket_ids))
+        cursor.execute(
+            f"DELETE FROM ticket_messages WHERE ticket_id IN ({placeholders})",
+            ticket_ids,
+        )
+        cursor.execute(
+            f"DELETE FROM notifications WHERE related_ticket_id IN ({placeholders})",
+            ticket_ids,
+        )
+        cursor.execute(
+            f"DELETE FROM support_tickets WHERE id IN ({placeholders})",
+            ticket_ids,
+        )
+    cursor.execute("DELETE FROM customer_notes WHERE customer_id=?", (uid,))
+    if uname:
+        cursor.execute("DELETE FROM tenant_memberships WHERE username=?", (uname,))
+        cursor.execute("DELETE FROM notifications WHERE user_username=?", (uname,))
+
+
+@app.patch("/api/tenants/{tenant_id}/managers/{user_id}")
+async def update_tenant_manager_api(
+    request: Request,
+    tenant_id: int,
+    user_id: int,
+    user=Depends(require_api_role("superadmin")),
+):
+    """Superadmin: update a tenant admin profile (full_name, email, password, active)."""
+    verify_csrf(request)
+    data = await request.json()
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM tenants WHERE id=?", (tenant_id,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    target = _get_tenant_master_admin(user_id, tenant_id)
+    updates = []
+    params = []
+    audit_logs = []
+
+    if "full_name" in data:
+        new_name = (data.get("full_name") or "").strip() or None
+        if new_name != target["full_name"]:
+            updates.append("full_name=?")
+            params.append(new_name)
+            audit_logs.append(("FULL_NAME_UPDATE", target["full_name"], new_name))
+
+    if "email" in data:
+        new_email = (data.get("email") or "").strip() or None
+        if new_email and not validate_email(new_email):
+            conn.close()
+            raise HTTPException(status_code=400, detail="Invalid email format")
+        if new_email:
+            c.execute(
+                "SELECT id FROM users WHERE email=? AND email IS NOT NULL AND id<>?",
+                (new_email, user_id),
+            )
+            if c.fetchone():
+                conn.close()
+                raise HTTPException(status_code=400, detail="Email already registered")
+        if new_email != target["email"]:
+            updates.append("email=?")
+            params.append(new_email)
+            audit_logs.append(("EMAIL_UPDATE", target["email"], new_email))
+
+    if "password" in data and data.get("password"):
+        password = data["password"]
+        if len(password) < 8:
+            conn.close()
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+        updates.append("password_hash=?")
+        params.append(pwd_context.hash(password))
+        audit_logs.append(("PASSWORD_UPDATE", None, "(redacted)"))
+
+    if "active" in data:
+        new_active = 1 if data.get("active") else 0
+        if bool(new_active) != target["active"]:
+            updates.append("active=?")
+            params.append(new_active)
+            audit_logs.append(
+                ("ACCOUNT_ACTIVE", str(int(target["active"])), str(new_active))
+            )
+
+    if not updates:
+        conn.close()
+        return {"status": "unchanged", "username": target["username"]}
+
+    params.append(user_id)
+    c.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=?", tuple(params))
+
+    performer = user.get("username") or "superadmin"
+    for action, old_val, new_val in audit_logs:
+        c.execute(
+            """
+            INSERT INTO audit_logs (user_id, username, action, old_value, new_value, ip_address, performed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, target["username"], f"SUPERADMIN_ADMIN_{action}", old_val, new_val, request.client.host, performer),
+        )
+
+    conn.commit()
+    conn.close()
+    return {"status": "updated", "username": target["username"], "tenant_id": tenant_id}
+
+
+@app.delete("/api/tenants/{tenant_id}/managers/{user_id}")
+async def delete_tenant_manager_api(
+    request: Request,
+    tenant_id: int,
+    user_id: int,
+    user=Depends(require_api_role("superadmin")),
+):
+    """Superadmin: permanently delete a tenant admin."""
+    verify_csrf(request)
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM tenants WHERE id=?", (tenant_id,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    target = _get_tenant_master_admin(user_id, tenant_id)
+    try:
+        _purge_user_dependencies(c, user_id, target["username"])
+        c.execute("DELETE FROM users WHERE id=?", (user_id,))
+        c.execute(
+            """
+            INSERT INTO audit_logs (user_id, username, action, old_value, new_value, ip_address, performed_by)
+            VALUES (?, ?, 'SUPERADMIN_ADMIN_DELETE', ?, 'deleted', ?, ?)
+            """,
+            (user_id, target["username"], target["username"], request.client.host, user.get("username") or "superadmin"),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete admin: related records still reference this account",
+        ) from exc
+    conn.close()
+    return {"status": "deleted", "username": target["username"], "tenant_id": tenant_id}
 
 
 @app.post("/api/tenants/{tenant_id}/deactivate")
@@ -2541,7 +2950,7 @@ async def submit_access_request(request: Request, user=Depends(require_api_auth(
 @app.get("/api/access-requests")
 def list_access_requests(
     request: Request,
-    user=Depends(require_api_role("admin")),
+    user=Depends(require_api_role("admin", "master_admin")),
     status: str = "pending",
 ):
     tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
@@ -2555,7 +2964,7 @@ def list_access_requests(
 async def approve_access_request(
     request: Request,
     membership_id: int,
-    user=Depends(require_api_role("admin")),
+    user=Depends(require_api_role("admin", "master_admin")),
 ):
     verify_csrf(request)
     tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
@@ -2584,7 +2993,7 @@ async def approve_access_request(
 async def reject_access_request(
     request: Request,
     membership_id: int,
-    user=Depends(require_api_role("admin")),
+    user=Depends(require_api_role("admin", "master_admin")),
 ):
     verify_csrf(request)
     data = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
@@ -2615,7 +3024,7 @@ async def reject_access_request(
 async def revoke_membership(
     request: Request,
     membership_id: int,
-    user=Depends(require_api_role("admin")),
+    user=Depends(require_api_role("admin", "master_admin")),
 ):
     verify_csrf(request)
     tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
@@ -2689,7 +3098,7 @@ def superadmin_page(request: Request, user=Depends(require_login("superadmin")))
 
 
 @app.get("/admin/access-requests", response_class=HTMLResponse)
-def admin_access_requests_page(request: Request, user=Depends(require_login("admin"))):
+def admin_access_requests_page(request: Request, user=Depends(require_normal_admin())):
     return templates.TemplateResponse(
         "admin_access_requests.html",
         {"request": request, "user": user},
@@ -2718,7 +3127,7 @@ async def update_tenant_settings_api(
 
 # Employee-specific customer activation/deactivation
 @app.post("/api/customers/{customer_id}/deactivate")
-async def deactivate_customer_api(request: Request, customer_id: int, user=Depends(require_role("admin", "employee"))):
+async def deactivate_customer_api(request: Request, customer_id: int, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Employee: Deactivate customer account only"""
     verify_csrf(request)
     conn = get_db()
@@ -2752,7 +3161,7 @@ async def deactivate_customer_api(request: Request, customer_id: int, user=Depen
 
 
 @app.post("/api/customers/{customer_id}/activate")
-async def activate_customer_api(request: Request, customer_id: int, user=Depends(require_role("admin", "employee"))):
+async def activate_customer_api(request: Request, customer_id: int, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Employee: Activate customer account only"""
     verify_csrf(request)
     conn = get_db()
@@ -2788,26 +3197,19 @@ async def activate_customer_api(request: Request, customer_id: int, user=Depends
 # ========== ADMIN: ROLE MANAGEMENT ==========
 
 @app.post("/api/users/{user_id}/change-role")
-async def change_user_role(request: Request, user_id: int, user=Depends(require_login("admin"))):
-    """Admin only: Change user role"""
+async def change_user_role(request: Request, user_id: int, user=Depends(require_tenant_staff())):
+    """Change user role within hierarchy permissions."""
     verify_csrf(request)
     data = await request.json()
     new_role = data.get("role")
-    
-    if new_role not in ["admin", "employee", "customer"]:
-        raise HTTPException(status_code=400, detail="Invalid role")
-    
+    assert_can_assign_role(user.get("role"), new_role)
+
+    target = _assert_target_user_in_caller_tenant(user, user_id)
+    username = target["username"]
+    old_role = target["role"]
+
     conn = get_db()
     c = conn.cursor()
-    
-    # Get old role for audit
-    c.execute("SELECT username, role FROM users WHERE id=?", (user_id,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    username, old_role = row
     
     # Prevent changing your own role
     if username == user.get("username"):
@@ -2842,7 +3244,7 @@ async def change_user_role(request: Request, user_id: int, user=Depends(require_
 
 
 @app.post("/api/users/{user_id}/update-profile")
-async def update_user_profile(request: Request, user_id: int, user=Depends(require_role("admin", "employee"))):
+async def update_user_profile(request: Request, user_id: int, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Admin/Employee: Update customer profile (name, email, etc.)"""
     verify_csrf(request)
     data = await request.json()
@@ -2899,7 +3301,7 @@ async def update_user_profile(request: Request, user_id: int, user=Depends(requi
 # ========== EMPLOYEE: PASSWORD RESET TRIGGER ==========
 
 @app.post("/api/customers/{customer_id}/trigger-password-reset")
-async def trigger_customer_password_reset(request: Request, customer_id: int, user=Depends(require_role("admin", "employee"))):
+async def trigger_customer_password_reset(request: Request, customer_id: int, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Employee: Trigger password reset for customer (sends OTP to customer's email)"""
     verify_csrf(request)
     
@@ -2953,7 +3355,7 @@ async def trigger_customer_password_reset(request: Request, customer_id: int, us
 # ========== EMPLOYEE: CUSTOMER NOTES ==========
 
 @app.get("/api/customers/{customer_id}/notes")
-def get_customer_notes(request: Request, customer_id: int, user=Depends(require_role("admin", "employee"))):
+def get_customer_notes(request: Request, customer_id: int, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Get support notes for a customer"""
     conn = get_db()
     c = conn.cursor()
@@ -2992,7 +3394,7 @@ def get_customer_notes(request: Request, customer_id: int, user=Depends(require_
 
 
 @app.post("/api/customers/{customer_id}/notes")
-async def add_customer_note(request: Request, customer_id: int, user=Depends(require_role("admin", "employee"))):
+async def add_customer_note(request: Request, customer_id: int, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Add a support note to a customer account"""
     verify_csrf(request)
     data = await request.json()
@@ -3032,7 +3434,7 @@ async def add_customer_note(request: Request, customer_id: int, user=Depends(req
 
 
 @app.delete("/api/customers/{customer_id}/notes/{note_id}")
-async def delete_customer_note(request: Request, customer_id: int, note_id: int, user=Depends(require_role("admin", "employee"))):
+async def delete_customer_note(request: Request, customer_id: int, note_id: int, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Delete a customer note"""
     verify_csrf(request)
     
@@ -3063,30 +3465,46 @@ async def delete_customer_note(request: Request, customer_id: int, note_id: int,
 # ========== EMPLOYEE: CUSTOMER ANALYTICS ==========
 
 @app.get("/api/employee/analytics")
-def employee_analytics(request: Request, user=Depends(require_role("admin", "employee"))):
-    """Employee: Get customer-focused analytics only"""
+def employee_analytics(request: Request, user=Depends(require_role("admin", "master_admin", "employee"))):
+    """Employee: Get customer-focused analytics scoped to the caller's tenant."""
     conn = get_db()
     c = conn.cursor()
-    
-    # Total customers
-    c.execute("SELECT COUNT(*) FROM users WHERE role='customer'")
+    scope_sql, scope_params = _tenant_scope_sql(user)
+
+    c.execute(
+        f"SELECT COUNT(*) FROM users WHERE role='customer'{scope_sql}",
+        scope_params,
+    )
     total_customers = c.fetchone()[0]
-    
-    # Active customers
-    c.execute("SELECT COUNT(*) FROM users WHERE role='customer' AND active=1")
+
+    c.execute(
+        f"SELECT COUNT(*) FROM users WHERE role='customer' AND active=1{scope_sql}",
+        scope_params,
+    )
     active_customers = c.fetchone()[0]
-    
-    # Recent registrations (last 30 days)
+
     thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
-    c.execute("SELECT COUNT(*) FROM users WHERE role='customer' AND created_at > ?", (thirty_days_ago,))
+    c.execute(
+        f"SELECT COUNT(*) FROM users WHERE role='customer' AND created_at > ?{scope_sql}",
+        [thirty_days_ago, *scope_params],
+    )
     recent_registrations = c.fetchone()[0]
-    
-    # Total support notes
-    c.execute("SELECT COUNT(*) FROM customer_notes")
+
+    if scope_sql:
+        c.execute(
+            """
+            SELECT COUNT(*) FROM customer_notes cn
+            INNER JOIN users u ON cn.customer_username = u.username
+            WHERE u.role='customer' AND u.tenant_id = ?
+            """,
+            scope_params,
+        )
+    else:
+        c.execute("SELECT COUNT(*) FROM customer_notes")
     total_notes = c.fetchone()[0]
-    
+
     conn.close()
-    
+
     return {
         "total_customers": total_customers,
         "active_customers": active_customers,
@@ -3169,8 +3587,20 @@ def main_dashboard(request: Request, user=Depends(require_login())):
     return templates.TemplateResponse("main.html", {"request": request, "user": user})
 
 
+@app.get("/admin/tickets", response_class=HTMLResponse)
+def admin_tickets_page(request: Request, user=Depends(require_normal_admin())):
+    """Admin support tickets management page"""
+    return templates.TemplateResponse("admin_tickets.html", {"request": request, "user": user})
+
+
+@app.get("/employee/tickets", response_class=HTMLResponse)
+def employee_tickets_page(request: Request, user=Depends(require_role("admin", "master_admin", "employee"))):
+    """Employee support tickets page"""
+    return templates.TemplateResponse("employee_tickets.html", {"request": request, "user": user})
+
+
 @app.get("/employee/customers", response_class=HTMLResponse)
-def employee_customers_page(request: Request, user=Depends(require_role("admin", "employee"))):
+def employee_customers_page(request: Request, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Employee customer management page"""
     return templates.TemplateResponse("employee_customers.html", {"request": request, "user": user})
 
@@ -3277,6 +3707,22 @@ async def conversation_rename_proxy(conversation_id: str, request: Request, user
                 f"{RAG_HTTP_BASE}/conversations/{conversation_id}",
                 data=body,
                 headers=headers,
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.delete("/conversations")
+async def conversations_clear_all_proxy(request: Request, user=Depends(require_login())):
+    """Proxy bulk conversation deletion to the RAG server."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.delete(
+                f"{RAG_HTTP_BASE}/conversations",
+                headers=_rag_proxy_headers(request),
             ) as resp:
                 return await _rag_json_or_error(resp)
     except HTTPException:
@@ -3406,7 +3852,7 @@ async def tts_proxy(request: Request):
 
 
 @app.post("/proxy/upload_rag")
-async def proxy_upload_rag(request: Request, file: UploadFile = File(...), user=Depends(require_login("admin"))):
+async def proxy_upload_rag(request: Request, file: UploadFile = File(...), user=Depends(require_tenant_staff())):
     """Proxy uploads to the RAG server, which is the single ingestion owner."""
     verify_csrf(request)
 
@@ -3519,16 +3965,10 @@ def _tenant_assets_dir(user) -> Path:
 
 
 def _knowledge_search_dirs(user) -> list:
-    """Directories to inspect for a tenant's documents.
-
-    The tenant's own subdir is authoritative. For the default tenant we also
-    include the assets root so legacy files (uploaded before multi-tenancy, or
-    not yet moved by the migration) still appear.
-    """
-    dirs = [_tenant_assets_dir(user)]
-    if _user_tenant_id(user) == DEFAULT_TENANT_ID:
-        dirs.append(_assets_root())
-    return dirs
+    """Directories to inspect for a tenant's documents (shared with RAG delete)."""
+    tid = _user_tenant_id(user)
+    scope_tid = None if tid == DEFAULT_TENANT_ID else tid
+    return kb_asset_search_dirs(scope_tid)
 
 
 def _resolve_tenant_asset_file(user, filename):
@@ -3552,8 +3992,22 @@ def _resolve_tenant_asset_file(user, filename):
 
 
 @app.get("/api/knowledge/files")
-def list_knowledge_files(request: Request, user=Depends(require_api_role("admin", "employee"))):
+def list_knowledge_files(request: Request, user=Depends(require_api_role("admin", "master_admin", "employee"))):
     """List all files in the caller's tenant knowledge base assets directory."""
+    chunk_map: dict[str, int] = {}
+    try:
+        from backend.knowledge_base import list_uploaded_files, normalize_uploaded_filename
+
+        tid = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+        scope = None if tid == DEFAULT_TENANT_ID else tid
+        for entry in list_uploaded_files(tenant_id=scope):
+            fn = str(entry.get("filename") or "")
+            key = normalize_uploaded_filename(fn)
+            if key:
+                chunk_map[key] = chunk_map.get(key, 0) + int(entry.get("chunks") or 0)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("KB chunk lookup failed: %s", exc)
+
     files = []
     seen = set()
     for assets_dir in _knowledge_search_dirs(user):
@@ -3567,19 +4021,31 @@ def list_knowledge_files(request: Request, user=Depends(require_api_role("admin"
                 continue  # tenant subdir wins over legacy root
             seen.add(stored_name)
             stat = file_path.stat()
+            try:
+                from backend.knowledge_base import normalize_uploaded_filename
+
+                lookup_keys = {
+                    normalize_uploaded_filename(stored_name),
+                    normalize_uploaded_filename(_display_filename(stored_name)),
+                }
+                indexed_chunks = max((chunk_map.get(k, 0) for k in lookup_keys if k), default=0)
+            except Exception:
+                indexed_chunks = 0
             files.append({
                 "name": stored_name,
                 "stored_name": stored_name,
                 "display_name": _display_filename(stored_name),
                 "size": stat.st_size,
-                "modified": stat.st_mtime
+                "modified": stat.st_mtime,
+                "indexed_chunks": indexed_chunks,
+                "indexed": indexed_chunks > 0,
             })
     
     return sorted(files, key=lambda x: x['modified'], reverse=True)
 
 
 @app.get("/api/knowledge/kb_status")
-async def proxy_kb_status(request: Request, user=Depends(require_api_role("admin", "employee"))):
+async def proxy_kb_status(request: Request, user=Depends(require_api_role("admin", "master_admin", "employee"))):
     """Proxy the RAG ingestion status for the admin knowledge page."""
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -3594,8 +4060,45 @@ async def proxy_kb_status(request: Request, user=Depends(require_api_role("admin
         raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
 
 
+@app.post("/api/knowledge/reindex-file")
+async def proxy_reindex_file(request: Request, filename: str, user=Depends(require_api_role("admin", "master_admin", "employee"))):
+    """Reindex one knowledge-base file via the RAG server."""
+    verify_csrf(request)
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600)) as session:
+            async with session.post(
+                f"{RAG_HTTP_BASE}/rag/reindex-file",
+                params={"filename": Path(filename).name},
+                headers=_rag_proxy_headers(request),
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.post("/api/knowledge/reindex-all")
+async def proxy_reindex_all(request: Request, user=Depends(require_api_role("admin", "master_admin", "employee"))):
+    """Reindex all knowledge-base files via the RAG server."""
+    verify_csrf(request)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1800)) as session:
+            async with session.post(
+                f"{RAG_HTTP_BASE}/rag/reindex-all",
+                headers=_rag_proxy_headers(request),
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
 @app.get("/api/knowledge/files/{filename}")
-def get_knowledge_file_content(request: Request, filename: str, user=Depends(require_role("admin", "employee"))):
+def get_knowledge_file_content(request: Request, filename: str, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Get the content of a knowledge base file (scoped to the caller's tenant)."""
     file_path = _resolve_tenant_asset_file(user, filename)
     if file_path is None:
@@ -3628,7 +4131,7 @@ def get_knowledge_file_content(request: Request, filename: str, user=Depends(req
 
 
 @app.get("/api/knowledge/files/{filename}/download")
-def download_knowledge_file(request: Request, filename: str, inline: bool = False, user=Depends(require_role("admin", "employee"))):
+def download_knowledge_file(request: Request, filename: str, inline: bool = False, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Download a knowledge base file (scoped to the caller's tenant)."""
     file_path = _resolve_tenant_asset_file(user, filename)
     if file_path is None:
@@ -3647,7 +4150,7 @@ def download_knowledge_file(request: Request, filename: str, inline: bool = Fals
 
 
 @app.get("/api/knowledge/files/{filename}/preview")
-def preview_knowledge_pdf(request: Request, filename: str, user=Depends(require_role("admin", "employee"))):
+def preview_knowledge_pdf(request: Request, filename: str, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Serve PDF as inline content for in-browser preview iframe (tenant-scoped)."""
     file_path = _resolve_tenant_asset_file(user, filename)
     if file_path is None:
@@ -3664,7 +4167,7 @@ def preview_knowledge_pdf(request: Request, filename: str, user=Depends(require_
 
 
 @app.get("/api/knowledge/files/{filename}/pdf-data")
-def get_knowledge_pdf_data(request: Request, filename: str, user=Depends(require_role("admin", "employee"))):
+def get_knowledge_pdf_data(request: Request, filename: str, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Return PDF bytes as base64 for reliable in-browser rendering (tenant-scoped)."""
     file_path = _resolve_tenant_asset_file(user, filename)
     if file_path is None:
@@ -3682,7 +4185,7 @@ def get_knowledge_pdf_data(request: Request, filename: str, user=Depends(require
 
 
 @app.put("/api/knowledge/files/{filename}")
-async def update_knowledge_file(request: Request, filename: str, user=Depends(require_login("admin"))):
+async def update_knowledge_file(request: Request, filename: str, user=Depends(require_tenant_staff())):
     """Proxy text-file updates to the RAG server, the ingestion owner."""
     verify_csrf(request)
 
@@ -3718,7 +4221,7 @@ async def update_knowledge_file(request: Request, filename: str, user=Depends(re
 
 
 @app.delete("/api/knowledge/files/{filename}")
-async def delete_knowledge_file(request: Request, filename: str, user=Depends(require_login("admin"))):
+async def delete_knowledge_file(request: Request, filename: str, user=Depends(require_tenant_staff())):
     """Proxy deletion to the RAG server, which owns assets and Chroma cleanup."""
     verify_csrf(request)
 
@@ -3750,7 +4253,7 @@ async def delete_knowledge_file(request: Request, filename: str, user=Depends(re
 
 
 @app.post("/api/knowledge/clear-cache")
-async def proxy_clear_cache(request: Request, user=Depends(require_login("admin"))):
+async def proxy_clear_cache(request: Request, user=Depends(require_tenant_staff())):
     """Proxy clear-cache request to the RAG server to flush all stale data.
 
     Clears conversation history + Ollama KV cache so the next query
@@ -3995,9 +4498,11 @@ async def profile_page(request: Request, user=Depends(require_login())):
     
     # Determine back URL based on role
     back_urls = {
+        'superadmin': '/superadmin',
+        'master_admin': '/master_admin',
         'admin': '/admin',
         'employee': '/employee',
-        'customer': '/main'
+        'customer': '/main',
     }
     back_url = back_urls.get(role, '/main')
     
@@ -4103,7 +4608,8 @@ async def verify_email_change_page(request: Request, new_email: str, user=Depend
     """Show the email change verification page."""
     return templates.TemplateResponse("verify_email_change.html", {
         "request": request,
-        "new_email": new_email
+        "new_email": new_email,
+        "user": user,
     })
 
 
@@ -4301,7 +4807,8 @@ async def change_password_request(
 async def verify_password_change_page(request: Request, user=Depends(require_login())):
     """Show the password change verification page."""
     return templates.TemplateResponse("verify_password_change.html", {
-        "request": request
+        "request": request,
+        "user": user,
     })
 
 
@@ -4435,7 +4942,7 @@ async def websocket_proxy(websocket: WebSocket):
             max_attempts = 5
             for attempt in range(1, max_attempts + 1):
                 try:
-                    backend_ws = await session.ws_connect(RAG_WS_URL, headers=_ws_fwd_headers, timeout=3)
+                    backend_ws = await session.ws_connect(RAG_WS_URL, headers=_ws_fwd_headers, timeout=120)
                     break
                 except Exception as e:
                     # Log and retry with a small backoff
@@ -4973,7 +5480,7 @@ async def add_ticket_message(ticket_id: int, request: Request, user=Depends(requ
     return {"message": "Message added successfully"}
 
 @app.post("/api/support/ticket/{ticket_id}/assign")
-async def assign_ticket(ticket_id: int, request: Request, user=Depends(require_role("admin", "employee"))):
+async def assign_ticket(ticket_id: int, request: Request, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Employee/Admin assigns ticket to themselves or another user"""
     verify_csrf(request)
     data = await request.json()
@@ -5069,7 +5576,7 @@ async def escalate_ticket(ticket_id: int, request: Request, user=Depends(require
     return {"message": "Ticket escalated to admin"}
 
 @app.post("/api/support/ticket/{ticket_id}/resolve")
-async def resolve_ticket(ticket_id: int, request: Request, user=Depends(require_role("admin", "employee"))):
+async def resolve_ticket(ticket_id: int, request: Request, user=Depends(require_role("admin", "master_admin", "employee"))):
     """Employee/Admin marks ticket as resolved"""
     verify_csrf(request)
     data = await request.json()
@@ -5200,7 +5707,7 @@ async def mark_all_read(request: Request, user=Depends(require_login())):
     return {"message": "All notifications marked as read"}
 
 @app.get("/api/admin/support/summary")
-def get_admin_support_summary(request: Request, user=Depends(require_role("admin"))):
+def get_admin_support_summary(request: Request, user=Depends(require_role("admin", "master_admin"))):
     """Get support ticket summary for the admin's own business."""
     conn = get_db()
     c = conn.cursor()
@@ -5248,36 +5755,6 @@ def get_admin_support_summary(request: Request, user=Depends(require_role("admin
         "by_priority": by_priority,
         "negative_feedback_unaddressed": negative_feedback_count
     }
-
-
-# ========== EMPLOYEE ROUTES ==========
-
-@app.get("/employee", response_class=HTMLResponse)
-def employee_dashboard(request: Request, user=Depends(require_role("admin", "employee"))):
-    """Employee dashboard"""
-    return templates.TemplateResponse("employee.html", {"request": request, "user": user})
-
-
-@app.get("/employee/tickets", response_class=HTMLResponse)
-def employee_tickets_page(request: Request, user=Depends(require_role("admin", "employee"))):
-    """Employee support tickets page"""
-    return templates.TemplateResponse("employee_tickets.html", {"request": request, "user": user})
-
-
-# ========== ADMIN ROUTES ==========
-
-@app.get("/admin", response_class=HTMLResponse)
-def admin_page(request: Request, user=Depends(require_role("admin"))):
-    """Admin dashboard page"""
-    return templates.TemplateResponse("admin.html", {"request": request, "user": user})
-
-
-@app.get("/admin/tickets", response_class=HTMLResponse)
-def admin_tickets_page(request: Request, user=Depends(require_role("admin"))):
-    """Admin support tickets management page"""
-    return templates.TemplateResponse("admin_tickets.html", {"request": request, "user": user})
-
-
 
 
 @app.get("/internal/check_rag_ws")

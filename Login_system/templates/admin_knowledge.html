@@ -5,7 +5,8 @@
     <title>Knowledge Base - Assistify Admin</title>
         <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self';">
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
+    {% include "_nav_shell.html" %}
+<style>
         :root {
             --accent: #10a37f;
             --bg: #232323;
@@ -40,105 +41,7 @@
             color: var(--accent);
             font-size: 1.5em;
         }
-        /* Header and Menu Styles */
-        header {
-            background: var(--sidebar);
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
-            padding: 16px 32px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            position: sticky;
-            top: 0;
-            z-index: 998;
-        }
-        .menu-btn {
-            background: var(--accent);
-            color: var(--light);
-            border: none;
-            font-size: 24px;
-            width: 48px;
-            height: 48px;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: background 0.3s;
-        }
-        .menu-btn:hover {
-            background: #0e8c6d;
-        }
-        .header-title {
-            font-size: 1.5rem;
-            margin: 0;
-            color: var(--accent);
-        }
-        .header-spacer {
-            width: 72px;
-        }
-        .nav-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.7);
-            opacity: 0;
-            visibility: hidden;
-            transition: opacity 0.3s, visibility 0.3s;
-            z-index: 999;
-        }
-        .nav-overlay.show {
-            opacity: 1;
-            visibility: visible;
-        }
-        .nav-menu {
-            position: fixed;
-            top: 0;
-            left: -280px;
-            width: 280px;
-            height: 100%;
-            background: var(--sidebar);
-            box-shadow: 2px 0 16px rgba(0,0,0,0.5);
-            transition: left 0.3s;
-            z-index: 1000;
-            overflow-y: auto;
-        }
-        .nav-menu.open {
-            left: 0;
-        }
-        .nav-header {
-            padding: 24px;
-            border-bottom: 1px solid #3a3a3a;
-        }
-        .nav-header h2 {
-            margin: 0;
-            color: var(--accent);
-            font-size: 1.5rem;
-        }
-        .nav-links {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-        }
-        .nav-links li {
-            border-bottom: 1px solid rgba(255,255,255,0.1);
-        }
-        .nav-link {
-            display: flex;
-            align-items: center;
-            padding: 16px 24px;
-            color: var(--light);
-            text-decoration: none;
-            transition: background 0.3s;
-        }
-        .nav-link:hover {
-            background: rgba(16,163,127,0.2);
-        }
-        .nav-link svg {
-            width: 20px;
-            height: 20px;
-            margin-right: 12px;
-        }
-        .upload-section {
+.upload-section {
             background: #202020;
             padding: 24px;
             border-radius: 12px;
@@ -246,20 +149,38 @@
         }
         #documentsTable th:nth-child(1),
         #documentsTable td:nth-child(1) {
-            width: 30%;
+            width: 26%;
             max-width: 0;
         }
         #documentsTable th:nth-child(2),
         #documentsTable td:nth-child(2) {
-            width: 12%;
+            width: 10%;
         }
         #documentsTable th:nth-child(3),
         #documentsTable td:nth-child(3) {
-            width: 20%;
+            width: 10%;
         }
         #documentsTable th:nth-child(4),
         #documentsTable td:nth-child(4) {
-            width: 38%;
+            width: 18%;
+        }
+        #documentsTable th:nth-child(5),
+        #documentsTable td:nth-child(5) {
+            width: 36%;
+        }
+        .chunk-badge {
+            font-size: 0.85em;
+            color: var(--muted);
+        }
+        .chunk-badge.indexed {
+            color: var(--accent);
+        }
+        .chunk-badge.missing {
+            color: var(--danger);
+        }
+        button.warn {
+            background: var(--warning);
+            color: #111;
         }
         #documentsTable td:nth-child(1) {
             white-space: nowrap;
@@ -385,93 +306,17 @@
     </style>
     <script src="/static/security.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
-    <script>
-        function openNav() {
-            document.querySelector('.nav-menu').classList.add('open');
-            document.querySelector('.nav-overlay').classList.add('show');
-        }
-        
-        function closeNav() {
-            document.querySelector('.nav-menu').classList.remove('open');
-            document.querySelector('.nav-overlay').classList.remove('show');
-        }
-    </script>
 </head>
 <body>
-    <!-- Navigation Overlay -->
-    <div class="nav-overlay" onclick="closeNav()"></div>
-    
-    <!-- Side Navigation Menu -->
-    <nav class="nav-menu">
-        <div class="nav-header">
-            <h2>Menu</h2>
-        </div>
-        <ul class="nav-links">
-            <li>
-                <a href="/admin" class="nav-link">
-                    <svg fill="currentColor" viewBox="0 0 20 20"><path d="M10.707 2.293a1 1 0 00-1.414 0l-7 7a1 1 0 001.414 1.414L4 10.414V17a1 1 0 001 1h2a1 1 0 001-1v-2a1 1 0 011-1h2a1 1 0 011 1v2a1 1 0 001 1h2a1 1 0 001-1v-6.586l.293.293a1 1 0 001.414-1.414l-7-7z"/></svg>
-                    Dashboard
-                </a>
-            </li>
-            <li>
-                <a href="/admin/users" class="nav-link">
-                    <svg fill="currentColor" viewBox="0 0 20 20"><path d="M9 6a3 3 0 11-6 0 3 3 0 016 0zM17 6a3 3 0 11-6 0 3 3 0 016 0zM12.93 17c.046-.327.07-.66.07-1a6.97 6.97 0 00-1.5-4.33A5 5 0 0119 16v1h-6.07zM6 11a5 5 0 015 5v1H1v-1a5 5 0 015-5z"/></svg>
-                    Users
-                </a>
-            </li>
-            <li>
-                <a href="/admin/knowledge" class="nav-link">
-                    <svg fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clip-rule="evenodd"/></svg>
-                    Knowledge Base
-                </a>
-            </li>
-            <li>
-                <a href="/admin/analytics" class="nav-link">
-                    <svg fill="currentColor" viewBox="0 0 20 20"><path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1v-5zM8 7a1 1 0 011-1h2a1 1 0 011 1v9a1 1 0 01-1 1H9a1 1 0 01-1-1V7zM14 4a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1h-2a1 1 0 01-1-1V4z"/></svg>
-                    Analytics
-                </a>
-            </li>
-            <li>
-                <a href="/admin/audit-logs" class="nav-link">
-                    <svg fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M3 5a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 10a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 15a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd"/></svg>
-                    Audit Logs
-                </a>
-            </li>
-            <li>
-                <a href="/profile" class="nav-link">
-                    <svg fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"/></svg>
-                    Profile Settings
-                </a>
-            </li>
-            <li>
-                <a href="/frontend/index.html" class="nav-link">
-                    <svg fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M18 10c0 3.866-3.582 7-8 7a8.841 8.841 0 01-4.083-.98L2 17l1.338-3.123C2.493 12.767 2 11.434 2 10c0-3.866 3.582-7 8-7s8 3.134 8 7zM7 9H5v2h2V9zm8 0h-2v2h2V9zM9 9h2v2H9V9z" clip-rule="evenodd"/></svg>
-                    Chat
-                </a>
-            </li>
-            <li>
-                <a href="/logout" class="nav-link">
-                    <svg fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M3 3a1 1 0 00-1 1v12a1 1 0 102 0V4a1 1 0 00-1-1zm10.293 9.293a1 1 0 001.414 1.414l3-3a1 1 0 000-1.414l-3-3a1 1 0 10-1.414 1.414L14.586 9H7a1 1 0 100 2h7.586l-1.293 1.293z" clip-rule="evenodd"/></svg>
-                    Logout
-                </a>
-            </li>
-        </ul>
-    </nav>
-
-    <!-- Header with hamburger button -->
-    <header>
-        <button class="menu-btn" onclick="openNav()">☰</button>
-        <h1 class="header-title">Assistify Admin</h1>
-        <div class="header-spacer"></div>
-    </header>
-
-    <div class="container">
+<div class="container">
         <h1>📚 Knowledge Base Management</h1>
 
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:16px">
             <button id="clear-cache" class="cache-btn">🧹 Clear All Caches</button>
+            <button id="reindex-all" class="warn" type="button">⚠ Reindex All Files</button>
             <span id="cache-status" class="cache-status"></span>
         </div>
+        <div id="kb-health-notice" class="cache-notice" style="display:none"></div>
         <div id="cache-notice" class="cache-notice">
             <b>⚠ Stale cache detected:</b> The knowledge base was recently changed. If the AI is still giving old answers,
             click <b>Clear All Caches</b> above to force a full reset (conversations + LLM model memory).
@@ -493,13 +338,14 @@
             <thead>
                 <tr>
                     <th>Filename</th>
+                    <th>Chunks</th>
                     <th>Size</th>
                     <th>Modified</th>
                     <th>Actions</th>
                 </tr>
             </thead>
             <tbody id="documentsBody">
-                <tr><td colspan="4" style="text-align: center;">Loading documents...</td></tr>
+                <tr><td colspan="5" style="text-align: center;">Loading documents...</td></tr>
             </tbody>
         </table>
     </div>
@@ -839,7 +685,7 @@
                 if (files.length === 0) {
                     const row = tbody.insertRow();
                     const cell = row.insertCell();
-                    cell.colSpan = 4;
+                    cell.colSpan = 5;
                     cell.style.textAlign = 'center';
                     cell.textContent = 'No documents found';
                     return;
@@ -858,6 +704,17 @@
                     filenameCell.title = displayName;
                     filenameCell.textContent = displayName;
                     
+                    // Chunks cell
+                    const chunksCell = row.insertCell();
+                    const chunkCount = Number(file.indexed_chunks || 0);
+                    const chunkSpan = document.createElement('span');
+                    chunkSpan.className = 'chunk-badge ' + (chunkCount > 0 ? 'indexed' : 'missing');
+                    chunkSpan.textContent = chunkCount > 0 ? `${chunkCount} indexed` : 'not indexed';
+                    chunkSpan.title = chunkCount > 0
+                        ? `${chunkCount} vector chunks in the knowledge base`
+                        : 'File is on disk but has no searchable chunks — click Reindex';
+                    chunksCell.appendChild(chunkSpan);
+                    
                     // Size cell
                     const sizeCell = row.insertCell();
                     sizeCell.textContent = formatBytes(file.size);
@@ -869,6 +726,13 @@
                     // Actions cell
                     const actionsCell = row.insertCell();
                     actionsCell.className = 'action-btns';
+                    
+                    // Reindex button
+                    const reindexBtn = document.createElement('button');
+                    reindexBtn.className = 'warn btn-reindex';
+                    reindexBtn.textContent = 'Reindex';
+                    reindexBtn.dataset.filename = storedName;
+                    actionsCell.appendChild(reindexBtn);
                     
                     // Preview button
                     const previewBtn = document.createElement('button');
@@ -897,7 +761,63 @@
             } catch (error) {
                 console.error('Error loading documents:', error);
                 const tbody = document.getElementById('documentsBody');
-                tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #ff7979;">Error loading documents</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #ff7979;">Error loading documents</td></tr>';
+            }
+        }
+
+        async function refreshKbHealthNotice() {
+            const notice = document.getElementById('kb-health-notice');
+            try {
+                const response = await fetch('/api/knowledge/kb_status', {
+                    credentials: 'same-origin'
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    return;
+                }
+                const stage = data.stage || data.state || '';
+                const orphans = Array.isArray(data.orphan_files) ? data.orphan_files : [];
+                const parts = [];
+                if (stage === 'failed') {
+                    parts.push(`<b>Indexing failed:</b> ${data.message || 'see RAG server logs'}`);
+                } else if (stage && stage !== 'ready' && stage !== 'processing') {
+                    parts.push(`<b>KB status:</b> ${describeKbStatus(data)}`);
+                }
+                if (orphans.length) {
+                    parts.push(`<b>${orphans.length} file(s) on disk are not indexed</b> — use Reindex All or per-file Reindex.`);
+                }
+                if (parts.length) {
+                    notice.style.display = 'block';
+                    notice.innerHTML = parts.join('<br>');
+                } else {
+                    notice.style.display = 'none';
+                }
+            } catch (error) {
+                console.warn('KB health check failed:', error);
+            }
+        }
+
+        async function reindexFile(filename) {
+            if (!confirm(`Reindex "${toDisplayFilename(filename)}"? This rebuilds searchable chunks from the file on disk.`)) {
+                return;
+            }
+            setUploadStatus(`Reindexing ${toDisplayFilename(filename)}...`);
+            try {
+                const response = await fetch(`/api/knowledge/reindex-file?filename=${encodeURIComponent(filename)}`, {
+                    method: 'POST',
+                    headers: { 'x-csrf-token': csrf },
+                    credentials: 'same-origin'
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    setUploadStatus(`Reindexed ${data.reindexed_chunks || '?'} chunks`, 'ready');
+                    loadDocuments();
+                    refreshKbHealthNotice();
+                } else {
+                    setUploadStatus(data.detail || 'Reindex failed', 'failed');
+                }
+            } catch (error) {
+                setUploadStatus(error.message, 'failed');
             }
         }
 
@@ -905,6 +825,10 @@
         function attachButtonListeners() {
             const tbody = document.getElementById('documentsBody');
             
+            tbody.querySelectorAll('.btn-reindex').forEach(btn => {
+                btn.addEventListener('click', () => reindexFile(btn.dataset.filename));
+            });
+
             tbody.querySelectorAll('.btn-preview').forEach(btn => {
                 btn.addEventListener('click', () => previewFile(btn.dataset.filename));
             });
@@ -1075,7 +999,36 @@
                     inFlightFetches.delete(filename);
                     loadDocuments();
                 } else {
-                    alert('Error deleting document');
+                    const raw = await response.text();
+                    let data = {};
+                    try { data = JSON.parse(raw); } catch (e) { data = {}; }
+                    let msg = 'Error deleting document';
+                    if (response.status === 502) {
+                        msg = 'RAG server unreachable. Start the full stack (port 7000) and try again.';
+                    } else {
+                        const detail = data.detail;
+                        if (typeof detail === 'string') {
+                            msg = detail;
+                        } else if (detail && typeof detail === 'object') {
+                            const parts = [];
+                            if (detail.target_remaining_chunks > 0) {
+                                parts.push(`Delete incomplete: ${detail.target_remaining_chunks} chunk(s) remain`);
+                            }
+                            if (Array.isArray(detail.files_failed) && detail.files_failed.length) {
+                                parts.push('Could not remove file(s): ' + detail.files_failed.map(f => f.file || f).join(', '));
+                            }
+                            if (parts.length) {
+                                msg = parts.join('\n');
+                            } else if (detail.message) {
+                                msg = detail.message;
+                            }
+                        } else if (data.message) {
+                            msg = data.message;
+                        } else if (raw) {
+                            msg = raw.slice(0, 500);
+                        }
+                    }
+                    alert(msg);
                 }
             } catch (error) {
                 alert('Error: ' + error.message);
@@ -1091,6 +1044,39 @@
 
         // Load documents on page load
         loadDocuments();
+        refreshKbHealthNotice();
+        pollKbStatus().catch(() => {});
+
+        document.getElementById('reindex-all').addEventListener('click', async () => {
+            if (!confirm('Reindex ALL files in the knowledge base? This may take several minutes for large PDFs.')) {
+                return;
+            }
+            const btn = document.getElementById('reindex-all');
+            const orig = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Reindexing…';
+            setUploadStatus('Reindexing all files...');
+            try {
+                const response = await fetch('/api/knowledge/reindex-all', {
+                    method: 'POST',
+                    headers: { 'x-csrf-token': csrf },
+                    credentials: 'same-origin'
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    setUploadStatus(`Reindexed ${data.reindexed || data.files || '?'} file(s)`, 'ready');
+                    loadDocuments();
+                    refreshKbHealthNotice();
+                } else {
+                    setUploadStatus(data.detail || 'Reindex all failed', 'failed');
+                }
+            } catch (error) {
+                setUploadStatus(error.message, 'failed');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = orig;
+            }
+        });
 
         // ---- CLEAR ALL CACHES ----
         document.getElementById('clear-cache').addEventListener('click', async () => {
