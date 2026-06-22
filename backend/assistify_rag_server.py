@@ -4,6 +4,7 @@ import uuid
 import json
 import asyncio
 import logging
+import backend.sqlite_compat  # noqa: F401 — patches sys.modules["sqlite3"] if needed
 import sqlite3
 import math
 from datetime import datetime, timezone

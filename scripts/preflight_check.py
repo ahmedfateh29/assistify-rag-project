@@ -24,6 +24,16 @@ def main() -> int:
     ok = True
 
     try:
+        import backend.sqlite_compat  # noqa: F401
+        import sqlite3
+
+        print(f"sqlite3: OK ({sqlite3.sqlite_version})")
+    except Exception as exc:
+        print(f"FAIL: sqlite3 not available ({exc})")
+        print("  See docs/WINDOWS_TROUBLESHOOTING.md")
+        return 1
+
+    try:
         from config import WHISPER_MODEL_PATH, ASSETS_DIR
     except Exception as exc:
         print(f"FAIL: cannot import config ({exc})")

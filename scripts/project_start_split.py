@@ -60,6 +60,28 @@ from scripts.launch_windows.write_launch_scripts import (  # noqa: E402
 assert REPO_ROOT == _REPO
 
 SPAWN_SETTLE_SEC = 1.5
+PORT_KILL_SETTLE_SEC = 0.5
+
+_LOGIN_PORT_HINT = (
+    "Port 7001 already in use — close other Assistify Login windows or run with --kill-ports."
+)
+
+
+def ensure_sqlite3_or_exit() -> None:
+    """Fail fast before spawning RAG/Login if sqlite3 native DLL is blocked."""
+    try:
+        import backend.sqlite_compat  # noqa: F401
+        import sqlite3
+
+        print(f"[COORDINATOR] sqlite3 OK ({sqlite3.sqlite_version})")
+    except Exception as exc:
+        print()
+        print("[COORDINATOR] FATAL: sqlite3 is not available — RAG and Login cannot start.")
+        print(f"  {exc}")
+        print("  Run: python scripts/preflight_check.py")
+        print("  See: docs/WINDOWS_TROUBLESHOOTING.md")
+        print()
+        raise SystemExit(1)
 
 
 def _resolve_python_exe() -> str:
@@ -158,6 +180,26 @@ async def wait_service_ready(name: str, host: str, port: int, ready_path: str, q
     return True
 
 
+async def _service_is_healthy(host: str, port: int, ready_path: str) -> bool:
+    """True when something is listening and passes the HTTP readiness probe."""
+    if not find_pids_on_port_windows(port):
+        return False
+    if not ready_path:
+        return True
+    check_host = _host_for_check(host)
+    url = f"http://{check_host}:{port}{ready_path}"
+    return await http_check(url)
+
+
+async def _free_port_listeners(port: int, *, label: str) -> None:
+    pids = find_pids_on_port_windows(port)
+    if not pids:
+        return
+    print(f"[COORDINATOR] Freed port {port} before {label} (PIDs: {pids})")
+    kill_listeners_on_ports([port])
+    await asyncio.sleep(PORT_KILL_SETTLE_SEC)
+
+
 def report_service_failure(
     name: str,
     window_title: str,
@@ -189,11 +231,23 @@ async def start_service_sequential(
     *,
     failure_hint: Optional[str] = None,
     force_spawn: bool = False,
+    pre_kill_port: bool = False,
 ) -> bool:
-    row = status_by_name.get(name)
-    if not force_spawn and row and row.listening:
-        print(f"[{name}] Already running on port {row.port} — skipping new window")
-        return True
+    if pre_kill_port:
+        await _free_port_listeners(port, label=name)
+
+    if not force_spawn:
+        if await _service_is_healthy(host, port, ready_path):
+            print(f"[{name}] Already healthy on port {port} — skipping new window")
+            return True
+        if find_pids_on_port_windows(port):
+            print(f"[{name}] Stale listener on port {port} — freeing before spawn")
+            await _free_port_listeners(port, label=name)
+    elif not pre_kill_port:
+        row = status_by_name.get(name)
+        if row and row.listening:
+            print(f"[{name}] Already running on port {row.port} — skipping new window")
+            return True
 
     print(f"[COORDINATOR] Starting {name} in a new window...")
     spawn_bat_window(window_title, bat_path)
@@ -208,6 +262,7 @@ async def start_service_sequential(
 async def run_split_launcher(args) -> int:
     ensure_cwd_and_path()
     apply_cli_overrides(args)
+    ensure_sqlite3_or_exit()
 
     python_exe = _resolve_python_exe()
     print(f"[COORDINATOR] Repo root : {REPO_ROOT}")
@@ -336,7 +391,7 @@ async def run_split_launcher(args) -> int:
             SERVICES[2]["port"],
             SERVICES[2]["ready_path"],
             args.no_login,
-            None,
+            _LOGIN_PORT_HINT,
         ),
     ]
 
@@ -364,6 +419,7 @@ async def run_split_launcher(args) -> int:
             status_by_name,
             specs,
             failure_hint=hint,
+            pre_kill_port=args.kill_ports and display == "Login",
         )
         all_ok = all_ok and ok
         if not ok:

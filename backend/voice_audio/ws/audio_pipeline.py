@@ -17,6 +17,7 @@ from backend.voice_audio.stt.transcribe import (
     run_transcription,
 )
 from backend.voice_audio.concurrency import voice_inference_slot
+from backend.voice_audio.tts.streaming import cancel_active_ws_tts
 
 logger = logging.getLogger("voice_audio.ws.audio_pipeline")
 
@@ -99,31 +100,33 @@ async def run_auto_transcribe(
         return
 
     session_start = _time.perf_counter()
-    cancel_active_ws_tts(conn_id, "new_voice_query")
-
-    current_task = asyncio.current_task()
-    if (
-        memory_guard.active_voice_task
-        and not memory_guard.active_voice_task.done()
-        and memory_guard.active_voice_task is not current_task
-    ):
-        memory_guard.active_voice_task.cancel()
-        try:
-            await memory_guard.active_voice_task
-        except (asyncio.CancelledError, Exception):
-            pass
-    memory_guard.active_voice_conn_id = conn_id
-
     mem_before = _mem()
-    logger.info("===== VOICE SESSION START  [%s] =====", conn_id)
-    logger.info(
-        "  GPU before: reserved=%.0fMB  alloc=%.0fMB  |  CPU RSS=%.0fMB",
-        mem_before["gpu_reserved_mb"],
-        mem_before.get("gpu_allocated_mb", 0),
-        mem_before["cpu_rss_mb"],
-    )
+    client_notified = False
 
     try:
+        cancel_active_ws_tts(conn_id, "new_voice_query")
+
+        current_task = asyncio.current_task()
+        if (
+            memory_guard.active_voice_task
+            and not memory_guard.active_voice_task.done()
+            and memory_guard.active_voice_task is not current_task
+        ):
+            memory_guard.active_voice_task.cancel()
+            try:
+                await memory_guard.active_voice_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        memory_guard.active_voice_conn_id = conn_id
+
+        logger.info("===== VOICE SESSION START  [%s] =====", conn_id)
+        logger.info(
+            "  GPU before: reserved=%.0fMB  alloc=%.0fMB  |  CPU RSS=%.0fMB",
+            mem_before["gpu_reserved_mb"],
+            mem_before.get("gpu_allocated_mb", 0),
+            mem_before["cpu_rss_mb"],
+        )
+
         async with voice_inference_slot(ws, conn_id):
             requested_voice_lang = str(lang or "en").strip().lower()
             if requested_voice_lang not in {"en", "ar"}:
@@ -137,6 +140,7 @@ async def run_auto_transcribe(
                     "audio_too_short",
                     "Didn't catch enough audio. Please try again.",
                 )
+                client_notified = True
                 return
 
             try:
@@ -149,9 +153,11 @@ async def run_auto_transcribe(
                     "timeout",
                     "Speech recognition timed out. Please try again.",
                 )
+                client_notified = True
                 return
             except Exception as exc:
                 logger.error("%s STT Error: %s", conn_id, exc)
+                client_notified = True
                 try:
                     await send_final_response(
                         conn_id,
@@ -177,6 +183,7 @@ async def run_auto_transcribe(
                         "message": "Arabic speech was not transcribed confidently. Please try again.",
                         "arabic_mode": True,
                     })
+                    client_notified = True
                 except Exception:
                     pass
                 return
@@ -194,6 +201,7 @@ async def run_auto_transcribe(
                         t_meta={"request_start": time.perf_counter()},
                         branch="stt_unclear_arabic",
                     )
+                    client_notified = True
                 except Exception:
                     pass
                 return
@@ -205,6 +213,7 @@ async def run_auto_transcribe(
                     "empty_transcript",
                     "Couldn't understand that. Please speak again.",
                 )
+                client_notified = True
                 return
 
             t_meta = dict(t_meta or {})
@@ -221,6 +230,7 @@ async def run_auto_transcribe(
                 "final": True,
                 "timing": t_meta,
             })
+            client_notified = True
 
             await process_voice_transcript(
                 ws=ws,
@@ -234,6 +244,13 @@ async def run_auto_transcribe(
         logger.warning("%s Voice pipeline cancelled (superseded)", conn_id)
     except Exception as exc:
         logger.exception("Auto-transcription error: %s", exc)
+        if not client_notified:
+            await send_stt_failed(
+                ws,
+                conn_id,
+                "pipeline_error",
+                "Voice processing failed. Please try again.",
+            )
     finally:
         mem_after_raw = _mem()
         mem_after = await _stable()

@@ -1,6 +1,40 @@
 {
   "conversations": [
     {
+      "id": "25d0de37-b171-4080-8e2f-2542b274343e",
+      "title": "How are you doing?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "How are you doing?"
+        },
+        {
+          "role": "assistant",
+          "text": "I'm doing well, thank you for asking. How can I help you with your support question today?"
+        },
+        {
+          "role": "user",
+          "text": "Tell me what mod you do have in your mod base."
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "Tell me what main topics do you have in your knowledge base?"
+        },
+        {
+          "role": "assistant",
+          "text": "The provided document knowledge base contains information on various psychology-related topics such as study techniques, misconceptions about psychology and psychologists, contributions of Hippocrates to medicine, concepts in psychology including categorization, sensory memory introduction, and handling psychological problems with relaxation exercises or meditation. Specific details are not found for each topic within the given documents."
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "ahmed_fateh22",
+      "created_at": "2026-06-21T11:56:40.085501+00:00",
+      "updated_at": "2026-06-22T06:29:39.717994+00:00"
+    },
+    {
       "id": "aa49780d-d772-48ba-8371-e0a29d621a62",
       "title": "New chat",
       "messages": [],

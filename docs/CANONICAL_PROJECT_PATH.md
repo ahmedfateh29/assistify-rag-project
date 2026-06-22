@@ -23,3 +23,4 @@ Large files (`backend\Models`, etc.) may exist here from an older layout. The C:
 
 1. Keep `backend\Models`, `backend/chroma_db_v3`, and `backend/assets` under the C: project root, **or** set `WHISPER_MODEL_PATH`, `CHROMA_DB_PATH`, and `ASSETS_DIR` in `.env`.
 2. Run `python scripts/preflight_check.py` before starting servers.
+3. If sqlite3 fails with "Application Control policy", see [WINDOWS_TROUBLESHOOTING.md](WINDOWS_TROUBLESHOOTING.md).

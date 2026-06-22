@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import os
+import backend.sqlite_compat  # noqa: F401 — patches sys.modules["sqlite3"] if needed
 # Disable chromadb telemetry BEFORE any chromadb/knowledge_base imports
 os.environ['ANONYMIZED_TELEMETRY'] = 'False'
 os.environ['CHROMA_TELEMETRY_IMPL'] = 'none'
