@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Request, Form, Depends, status, HTTPException, WebSocket
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse, Response
-from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -66,7 +65,7 @@ from config import (
     ENFORCE_HTTPS, ALLOWED_HOSTS, IS_PRODUCTION,
     RATE_LIMIT_LOGIN, RATE_LIMIT_REGISTER, RATE_LIMIT_OTP,
     BCRYPT_ROUNDS, DEFAULT_TENANT_ID, kb_asset_search_dirs,
-    ALLOW_DEV_LOGIN_FALLBACK, assert_production_config,
+    ALLOW_DEV_LOGIN_FALLBACK, SKIP_EMAIL_OTP, assert_production_config,
 )
 
 try:
@@ -180,6 +179,18 @@ login_handler = RotatingFileHandler(
 login_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
 logger.addHandler(login_handler)
 logger.propagate = False
+
+
+class _ExpectedUnauthProfileAccessLogFilter(logging.Filter):
+    """Hide expected logged-out probes on /api/my-profile from uvicorn access logs."""
+
+    _NEEDLE = '"GET /api/my-profile HTTP/1.1" 401'
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return self._NEEDLE not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_ExpectedUnauthProfileAccessLogFilter())
 
 _UUID_FILENAME_PREFIX = re.compile(r"^[0-9a-f]{8}_(.+)$", re.IGNORECASE)
 _PDF_TEXT_CACHE = {}
@@ -623,46 +634,71 @@ def verify_otp_hash_old(otp: str, hashed: str) -> bool:
     """Verify OTP against hash (kept for compatibility)"""
     return hashlib.sha256(otp.encode()).hexdigest() == hashed
 
-# Resolve templates directory relative to this module file so uvicorn's CWD
-# doesn't affect template resolution.
-BASE_DIR = os.path.dirname(__file__)
-TEMPLATES_DIR = os.path.abspath(os.path.join(BASE_DIR, "templates"))
-STATIC_DIR = os.path.abspath(os.path.join(BASE_DIR, "static"))
-
-# Mount static files
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-# CSRF token for Jinja2 templates — must match the csrf_token cookie set at login.
-from jinja2 import pass_context
-
-@pass_context
-def csrf_token(context):
-    """Return the request's csrf_token cookie for hidden fields and meta tags."""
-    request = context.get("request")
-    if request is not None:
-        return request.cookies.get("csrf_token") or ""
-    return ""
-
-templates = Jinja2Templates(directory=TEMPLATES_DIR)
-templates.env.globals['csrf_token'] = csrf_token
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def resolve_template(name: str) -> str:
-    """Return an existing template filename from the templates directory.
-    Tries the exact name, then a few common variants (capitalized/lower/title).
-    """
-    tpl_dir = TEMPLATES_DIR
-    candidate = os.path.join(tpl_dir, name)
-    if os.path.exists(candidate):
-        return name
-    # try a few common variants
-    variants = [name.capitalize(), name.lower(), name.title()]
-    for v in variants:
-        if v == name:
-            continue
-        if os.path.exists(os.path.join(tpl_dir, v)):
-            return v
-    return name
+def _resolve_react_ui_build_dir() -> Path:
+    """Locate exported React UI (Next.js `out/`, or legacy dist/build folder names)."""
+    for name in ("out", "dist", "build"):
+        candidate = _REPO_ROOT / "assistify-ui-design" / name
+        if (candidate / "index.html").is_file():
+            return candidate
+    return _REPO_ROOT / "assistify-ui-design" / "out"
+
+
+REACT_UI_DIR = _resolve_react_ui_build_dir()
+REACT_UI_NEXT_DIR = REACT_UI_DIR / "_next"
+FAVICON_PATH = Path(__file__).resolve().parent / "static" / "favicon.ico"
+REACT_PUBLIC_PATH_PREFIXES = (
+    "login",
+    "register",
+    "verify-otp",
+    "forgot-password",
+    "reset-password",
+    "change-username",
+)
+
+
+def react_redirect(path: str, query: str = "") -> str:
+    """Map legacy path to static React export under /frontend/."""
+    normalized = path if path.startswith("/") else f"/{path}"
+    normalized = normalized.rstrip("/") or "/"
+    if normalized == "/":
+        url = "/frontend/"
+    else:
+        url = f"/frontend{normalized}/"
+    if query:
+        q = query.lstrip("?")
+        url = f"{url}?{q}"
+    return url
+
+
+def _react_path_is_public(path: str) -> bool:
+    normalized = (path or "").strip("/").lower()
+    if not normalized:
+        return False
+    first = normalized.split("/")[0]
+    return first in REACT_PUBLIC_PATH_PREFIXES
+
+
+def auth_form_redirect(path: str, **params: str) -> RedirectResponse:
+    from urllib.parse import urlencode
+    q = urlencode({k: v for k, v in params.items() if v is not None and v != ""})
+    return RedirectResponse(url=react_redirect(path, q), status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _optional_login_for_react(path: str):
+    if _react_path_is_public(path):
+        return None
+    return Depends(require_login())
+
+
+if REACT_UI_NEXT_DIR.is_dir():
+    app.mount(
+        "/frontend/_next",
+        StaticFiles(directory=str(REACT_UI_NEXT_DIR)),
+        name="react_ui_assets",
+    )
 
 DB_PATH = str((Path(__file__).resolve().parent / "users.db"))
 
@@ -686,12 +722,15 @@ def create_user(username, password, role, mfa_enabled=0, mfa_secret=None, tenant
 
 
 
-def verify_csrf(request: Request):
-    """Simple CSRF verification: header X-CSRF-Token must match csrf_token cookie."""
-    header = request.headers.get("x-csrf-token")
+def verify_csrf(request: Request, *, form_token: str | None = None):
+    """Simple CSRF verification: header X-CSRF-Token or form csrf_token must match cookie."""
     cookie = request.cookies.get("csrf_token")
-    if not cookie or header != cookie:
+    if not cookie:
         raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+    header = request.headers.get("x-csrf-token")
+    if header == cookie or (form_token and form_token == cookie):
+        return
+    raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
 
 
 def init_db():
@@ -1107,6 +1146,25 @@ def get_or_create_google_user(google_id: str, email: str, name: str, picture: st
     return {"username": username, "role": "customer"}
 
 
+def _create_local_registered_user(
+    *,
+    username: str,
+    password_hash: str,
+    email: str,
+    full_name: str,
+    role: str = "customer",
+    email_verified: int = 0,
+) -> None:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO users (username, password_hash, role, email, full_name, email_verified, auth_provider, active, tenant_id)
+        VALUES (?, ?, ?, ?, ?, ?, 'local', 1, ?)
+    """, (username, password_hash, role, email, full_name, email_verified, DEFAULT_TENANT_ID))
+    conn.commit()
+    conn.close()
+
+
 def generate_otp(length=6):
     """Generate a random OTP code."""
     return ''.join(random.choices(string.digits, k=length))
@@ -1250,14 +1308,28 @@ def get_current_user(request: Request):
         return None
 
 
+def _is_api_style_request(request: Request) -> bool:
+    """JSON/API clients must get 401, not HTML redirects."""
+    path = request.url.path
+    if path.startswith("/api/") or path.startswith("/conversations"):
+        return True
+    accept = request.headers.get("accept", "")
+    return "application/json" in accept
+
+
 def require_login(role=None):
     def wrapper(request: Request):
         user = get_current_user(request)
         if not user or (role and user.get("role") != role):
+            if _is_api_style_request(request):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required",
+                )
             raise HTTPException(
                 status_code=status.HTTP_303_SEE_OTHER,
                 detail="Not authenticated",
-                headers={"Location": "/?error=login"},
+                headers={"Location": react_redirect("/login", "error=login")},
             )
         return user
     return wrapper
@@ -1286,10 +1358,15 @@ def require_role(*allowed_roles):
     def wrapper(request: Request):
         user = get_current_user(request)
         if not user:
+            if _is_api_style_request(request):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required",
+                )
             raise HTTPException(
                 status_code=status.HTTP_303_SEE_OTHER,
                 detail="Not authenticated",
-                headers={"Location": "/?error=login"},
+                headers={"Location": react_redirect("/login", "error=login")},
             )
         if allowed_roles and user.get("role") not in allowed_roles:
             # Log unauthorized access attempt
@@ -1356,9 +1433,9 @@ def require_master_admin_page():
 
 @app.get("/register", response_class=HTMLResponse)
 def register_form(request: Request):
-    """Show registration form for new users."""
     error = request.query_params.get("error")
-    return templates.TemplateResponse(resolve_template("register.html"), {"request": request, "error": error})
+    q = f"error={error}" if error else ""
+    return RedirectResponse(url=react_redirect("/register", q), status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/register")
@@ -1424,7 +1501,22 @@ async def register_user(
         return RedirectResponse(url="/register?error=invalid_password", status_code=status.HTTP_303_SEE_OTHER)
     except Exception as e:
         return RedirectResponse(url="/register?error=server_error", status_code=status.HTTP_303_SEE_OTHER)
-    
+
+    if SKIP_EMAIL_OTP:
+        _create_local_registered_user(
+            username=username,
+            password_hash=password_hash,
+            email=email,
+            full_name=full_name,
+            role="customer",
+            email_verified=0,
+        )
+        print(f"[DEV] SKIP_EMAIL_OTP: created user {username} without OTP")
+        return RedirectResponse(
+            url="/?success=registration_complete",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
     # Generate OTP
     otp_code = generate_otp()
     
@@ -1447,21 +1539,17 @@ async def register_user(
     
     # Redirect to OTP verification page WITHOUT exposing OTP in URL
     return RedirectResponse(
-        url=f"/verify-otp?email={email}", 
-        status_code=status.HTTP_303_SEE_OTHER
+        url=react_redirect("/verify-otp", f"email={email}"),
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
 @app.get("/verify-otp", response_class=HTMLResponse)
 def verify_otp_form(request: Request):
-    """Show OTP verification form."""
-    email = request.query_params.get("email")
-    error = request.query_params.get("error")
-    return templates.TemplateResponse(resolve_template("verify_otp.html"), {
-        "request": request, 
-        "email": email,
-        "error": error
-    })
+    email = request.query_params.get("email", "")
+    error = request.query_params.get("error", "")
+    q = "&".join(p for p in [f"email={email}" if email else "", f"error={error}" if error else ""] if p)
+    return RedirectResponse(url=react_redirect("/verify-otp", q), status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/verify-otp")
@@ -1502,23 +1590,16 @@ async def verify_otp_code(
     
     # Parse user data
     user_data = json.loads(temp_user_data)
-    
+
     # Create user account
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO users (username, password_hash, role, email, full_name, email_verified, auth_provider, active, tenant_id)
-        VALUES (?, ?, ?, ?, ?, 1, 'local', 1, ?)
-    """, (
-        user_data["username"],
-        user_data["password_hash"],
-        user_data["role"],
-        user_data["email"],
-        user_data["full_name"],
-        None,
-    ))
-    conn.commit()
-    conn.close()
+    _create_local_registered_user(
+        username=user_data["username"],
+        password_hash=user_data["password_hash"],
+        email=user_data["email"],
+        full_name=user_data["full_name"],
+        role=user_data["role"],
+        email_verified=1,
+    )
     
     # Redirect to login with success message
     return RedirectResponse(url="/?success=registration_complete", status_code=status.HTTP_303_SEE_OTHER)
@@ -1526,14 +1607,10 @@ async def verify_otp_code(
 
 @app.get("/change-username", response_class=HTMLResponse)
 def change_username_form(request: Request):
-    """Show username change form."""
-    error = request.query_params.get("error")
-    success = request.query_params.get("success")
-    return templates.TemplateResponse(resolve_template("change_username.html"), {
-        "request": request,
-        "error": error,
-        "success": success
-    })
+    error = request.query_params.get("error", "")
+    success = request.query_params.get("success", "")
+    q = "&".join(p for p in [f"error={error}" if error else "", f"success={success}" if success else ""] if p)
+    return RedirectResponse(url=react_redirect("/change-username", q), status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/change-username")
@@ -1541,9 +1618,11 @@ async def change_username(
     request: Request,
     email: str = Form(...),
     password: str = Form(...),
-    new_username: str = Form(...)
+    new_username: str = Form(...),
+    csrf_token: str = Form(None),
 ):
     """Process username change request (one-time only)."""
+    verify_csrf(request, form_token=csrf_token)
     import re
     
     # Validate new username format
@@ -1694,15 +1773,28 @@ async def google_callback(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def root_redirect(request: Request):
-    """Redirect root to login page."""
-    return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    """Redirect root to React login or role home."""
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url=react_redirect("/login"), status_code=status.HTTP_303_SEE_OTHER)
+    role = user.get("role")
+    if role == "admin":
+        return RedirectResponse(url=react_redirect("/admin"), status_code=status.HTTP_303_SEE_OTHER)
+    if role == "master_admin":
+        return RedirectResponse(url=react_redirect("/master_admin"), status_code=status.HTTP_303_SEE_OTHER)
+    if role == "employee":
+        return RedirectResponse(url=react_redirect("/employee"), status_code=status.HTTP_303_SEE_OTHER)
+    if role == "superadmin":
+        return RedirectResponse(url=react_redirect("/superadmin"), status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url=react_redirect("/main"), status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form(request: Request):
-    """Show login form."""
+    """Redirect to React login page."""
     error = request.query_params.get("error")
-    return templates.TemplateResponse(resolve_template("login.html"), {"request": request, "error": error})
+    q = f"error={error}" if error else ""
+    return RedirectResponse(url=react_redirect("/login", q), status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/login")
@@ -1715,10 +1807,7 @@ async def login(request: Request, username: str = Form(...), password: str = For
             "ip_address": client_ip,
             "limit": RATE_LIMIT_LOGIN
         }, severity="WARNING")
-        return templates.TemplateResponse(resolve_template("login.html"), {
-            "request": request, 
-            "error": "Too many login attempts. Please try again later."
-        })
+        return auth_form_redirect("/login", error="Too many login attempts. Please try again later.")
     
     # Check account lockout
     is_locked, remaining_seconds = check_account_lockout(username)
@@ -1729,10 +1818,10 @@ async def login(request: Request, username: str = Form(...), password: str = For
             "ip_address": client_ip,
             "remaining_seconds": remaining_seconds
         }, severity="WARNING")
-        return templates.TemplateResponse(resolve_template("login.html"), {
-            "request": request, 
-            "error": f"Account locked. Try again in {minutes_remaining} minute(s)."
-        })
+        return auth_form_redirect(
+            "/login",
+            error=f"Account locked. Try again in {minutes_remaining} minute(s).",
+        )
     
     # Accept username OR email for login
     actual_username, role = auth_user(username, password)
@@ -1749,15 +1838,15 @@ async def login(request: Request, username: str = Form(...), password: str = For
             form = await request.form()
             mfa_token = form.get("mfa_token")
             if not mfa_token:
-                return templates.TemplateResponse(resolve_template("login.html"), {"request": request, "error": "MFA token required"})
+                return auth_form_redirect("/login", error="MFA token required")
             try:
                 import pyotp
                 totp = pyotp.TOTP(row[2])
                 if not totp.verify(mfa_token):
                     record_failed_login(actual_username, client_ip)
-                    return templates.TemplateResponse(resolve_template("login.html"), {"request": request, "error": "Invalid MFA token"})
+                    return auth_form_redirect("/login", error="Invalid MFA token")
             except Exception:
-                return templates.TemplateResponse(resolve_template("login.html"), {"request": request, "error": "MFA verification failed (pyotp required)"})
+                return auth_form_redirect("/login", error="MFA verification failed (pyotp required)")
 
         # Successful login - clear failed attempts and create session
         clear_failed_attempts(actual_username)
@@ -1784,14 +1873,7 @@ async def login(request: Request, username: str = Form(...), password: str = For
             "auth_provider": "local"
         })
         
-        if role == "admin":
-            redirect_url = "/admin"
-        elif role == "master_admin":
-            redirect_url = "/master_admin"
-        elif role == "employee":
-            redirect_url = "/employee"
-        else:
-            redirect_url = _resolve_post_login_redirect(role, actual_username)
+        redirect_url = react_redirect(_resolve_post_login_redirect(role, actual_username))
         response = RedirectResponse(url=redirect_url, status_code=302)
         response.set_cookie(
             SESSION_COOKIE,
@@ -1815,7 +1897,7 @@ async def login(request: Request, username: str = Form(...), password: str = For
     else:
         # Failed login
         record_failed_login(username, client_ip)
-        return templates.TemplateResponse(resolve_template("login.html"), {"request": request, "error": "Invalid credentials"})
+        return auth_form_redirect("/login", error="Invalid credentials")
 
 
 @app.get("/users")
@@ -1960,7 +2042,7 @@ def admin_dashboard(request: Request, user=Depends(require_normal_admin())):
     if "application/json" in accept_header:
         return JSONResponse({"status": "ok", "role": "admin", "username": user.get("username")})
     # Return HTML for browser
-    return templates.TemplateResponse("admin.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/admin"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/employee")
@@ -1971,7 +2053,7 @@ def employee_dashboard(request: Request, user=Depends(require_role("admin", "mas
     if "application/json" in accept_header:
         return JSONResponse({"status": "ok", "role": "employee", "username": user.get("username")})
     # Return HTML for browser
-    return templates.TemplateResponse("employee.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/employee"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/master_admin")
@@ -1979,61 +2061,87 @@ def master_admin_dashboard(request: Request, user=Depends(require_master_admin_p
     accept_header = request.headers.get("accept", "")
     if "application/json" in accept_header:
         return JSONResponse({"status": "ok", "role": "master_admin", "username": user.get("username")})
-    return templates.TemplateResponse("master_admin.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/master_admin"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/master_admin/admins", response_class=HTMLResponse)
 def master_admin_admins_page(request: Request, user=Depends(require_master_admin_page())):
-    return templates.TemplateResponse("master_admin_admins.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/master_admin/admins"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/master_admin/users", response_class=HTMLResponse)
 def master_admin_users_page(request: Request, user=Depends(require_master_admin_page())):
-    return templates.TemplateResponse("admin_users.html", {"request": request, "user": user, "staff_mode": "master_admin"})
+    return RedirectResponse(url=react_redirect("/master_admin/users"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/master_admin/knowledge", response_class=HTMLResponse)
 def master_admin_knowledge_page(request: Request, user=Depends(require_master_admin_page())):
-    return templates.TemplateResponse("admin_knowledge.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/master_admin/knowledge"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/master_admin/analytics", response_class=HTMLResponse)
 def master_admin_analytics_page(request: Request, user=Depends(require_master_admin_page())):
-    return templates.TemplateResponse("admin_analytics.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/master_admin/analytics"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/master_admin/access-requests", response_class=HTMLResponse)
 def master_admin_access_requests_page(request: Request, user=Depends(require_master_admin_page())):
-    return templates.TemplateResponse("admin_access_requests.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/master_admin/access-requests"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/master_admin/tickets", response_class=HTMLResponse)
 def master_admin_tickets_page(request: Request, user=Depends(require_master_admin_page())):
-    return templates.TemplateResponse("admin_tickets.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/master_admin/tickets"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/master_admin/audit-logs", response_class=HTMLResponse)
 def master_admin_audit_logs_page(request: Request, user=Depends(require_master_admin_page())):
+    return RedirectResponse(url=react_redirect("/master_admin/audit-logs"), status_code=status.HTTP_302_FOUND)
+
+
+@app.get("/api/audit-logs")
+def api_audit_logs(request: Request, user=Depends(require_api_role("admin", "master_admin")), limit: int = 200):
+    """JSON audit logs for React admin UI (tenant-scoped for business admins)."""
     conn = get_db()
     c = conn.cursor()
-    tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
-    c.execute(
-        """
-        SELECT id, username, action, old_value, new_value, ip_address, performed_by, created_at
-        FROM audit_logs
-        WHERE user_id IN (SELECT id FROM users WHERE tenant_id=?)
-        ORDER BY created_at DESC
-        LIMIT 200
-        """,
-        (tenant_id,),
-    )
-    logs = c.fetchall()
+    role = user.get("role")
+    if role in ("master_admin", "admin"):
+        tenant_id = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
+        c.execute(
+            """
+            SELECT id, username, action, old_value, new_value, ip_address, performed_by, timestamp
+            FROM audit_logs
+            WHERE user_id IN (SELECT id FROM users WHERE tenant_id=?)
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (tenant_id, int(limit)),
+        )
+    else:
+        c.execute(
+            """
+            SELECT id, username, action, old_value, new_value, ip_address, performed_by, timestamp
+            FROM audit_logs
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+    rows = c.fetchall()
     conn.close()
-    return templates.TemplateResponse("admin_audit_logs.html", {
-        "request": request,
-        "user": user,
-        "logs": logs,
-    })
+    logs = []
+    for row in rows:
+        logs.append({
+            "id": row[0],
+            "username": row[1],
+            "action": row[2],
+            "old_value": row[3],
+            "new_value": row[4],
+            "ip_address": row[5],
+            "performed_by": row[6],
+            "created_at": row[7],
+        })
+    return {"logs": logs}
 
 
 @app.get("/customer")
@@ -2044,56 +2152,27 @@ def customer_dashboard(request: Request, user=Depends(require_login("customer"))
     if "application/json" in accept_header:
         return JSONResponse({"status": "ok", "role": "customer", "username": user.get("username")})
     # Return HTML for browser (redirect to main for customers)
-    return RedirectResponse("/main", status_code=302)
+    return RedirectResponse(url=react_redirect("/main"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/admin/users", response_class=HTMLResponse)
 def admin_users_page(request: Request, user=Depends(require_normal_admin())):
-    return templates.TemplateResponse("admin_users.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/admin/users"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/admin/knowledge", response_class=HTMLResponse)
 def admin_knowledge_page(request: Request, user=Depends(require_normal_admin())):
-    return templates.TemplateResponse("admin_knowledge.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/admin/knowledge"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/admin/analytics", response_class=HTMLResponse)
 def admin_analytics_page(request: Request, user=Depends(require_normal_admin())):
-    return templates.TemplateResponse("admin_analytics.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/admin/analytics"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/admin/audit-logs", response_class=HTMLResponse)
 def admin_audit_logs_page(request: Request, user=Depends(require_normal_admin())):
-    """Display audit logs for admin review."""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, user_id, username, action, old_value, new_value, timestamp, ip_address
-        FROM audit_logs
-        ORDER BY timestamp DESC
-        LIMIT 100
-    """)
-    rows = c.fetchall()
-    conn.close()
-    
-    logs = []
-    for row in rows:
-        logs.append({
-            "id": row[0],
-            "user_id": row[1],
-            "username": row[2],
-            "action": row[3],
-            "old_value": row[4],
-            "new_value": row[5],
-            "timestamp": row[6],
-            "ip_address": row[7]
-        })
-    
-    return templates.TemplateResponse("admin_audit_logs.html", {
-        "request": request,
-        "user": user,
-        "logs": logs
-    })
+    return RedirectResponse(url=react_redirect("/admin/audit-logs"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/api/users")
@@ -3084,26 +3163,17 @@ async def set_active_tenant(request: Request, user=Depends(require_api_auth("cus
 
 @app.get("/select-business", response_class=HTMLResponse)
 def select_business_page(request: Request, user=Depends(require_login("customer"))):
-    return templates.TemplateResponse(
-        "select_business.html",
-        {"request": request, "user": user},
-    )
+    return RedirectResponse(url=react_redirect("/select-business"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/superadmin", response_class=HTMLResponse)
 def superadmin_page(request: Request, user=Depends(require_login("superadmin"))):
-    return templates.TemplateResponse(
-        "superadmin.html",
-        {"request": request, "user": user},
-    )
+    return RedirectResponse(url=react_redirect("/superadmin"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/admin/access-requests", response_class=HTMLResponse)
 def admin_access_requests_page(request: Request, user=Depends(require_normal_admin())):
-    return templates.TemplateResponse(
-        "admin_access_requests.html",
-        {"request": request, "user": user},
-    )
+    return RedirectResponse(url=react_redirect("/admin/access-requests"), status_code=status.HTTP_302_FOUND)
 
 
 @app.post("/api/tenants/{tenant_id}/settings")
@@ -3515,22 +3585,81 @@ def employee_analytics(request: Request, user=Depends(require_role("admin", "mas
     }
 
 
+def _analytics_tenant_id(user) -> int | None:
+    role = str((user or {}).get("role") or "").lower()
+    if role == "superadmin":
+        return None
+    return int((user or {}).get("tenant_id") or DEFAULT_TENANT_ID)
+
+
+@app.get("/api/analytics/comprehensive")
+def api_analytics_comprehensive(
+    request: Request,
+    user=Depends(require_api_role("admin", "master_admin", "employee")),
+    days: int = 30,
+):
+    """Tenant-scoped RAG analytics for React admin dashboards."""
+    from backend.analytics import get_comprehensive_analytics
+
+    return get_comprehensive_analytics(days, tenant_id=_analytics_tenant_id(user))
+
+
+@app.get("/api/analytics/errors")
+def api_analytics_errors(
+    request: Request,
+    user=Depends(require_api_role("admin", "master_admin", "employee")),
+    limit: int = 50,
+):
+    """Recent analytics errors for React admin dashboards."""
+    from backend.analytics import get_recent_errors
+
+    tenant_id = _analytics_tenant_id(user)
+    rows = get_recent_errors(limit=limit, tenant_id=tenant_id)
+    return {
+        "errors": [
+            {"timestamp": r[0], "username": r[1], "error": r[2], "response_time": None}
+            for r in rows
+        ]
+    }
+
+
 # ========== CUSTOMER: SELF-SERVICE FEATURES ==========
 
 @app.get("/api/my-profile")
 def get_my_profile(request: Request, user=Depends(require_login())):
-    """Customer: Get own profile data"""
+    """Get own profile data including active business context."""
     conn = get_db()
     c = conn.cursor()
+    role = str(user.get("role") or "").lower()
+    profile_tenant_id = user.get("active_tenant_id") if role == "customer" else user.get("tenant_id")
+    if profile_tenant_id is None:
+        profile_tenant_id = user.get("tenant_id")
+
     c.execute("""
-        SELECT username, email, full_name, role, created_at, active
-        FROM users WHERE username=?
-    """, (user.get("username"),))
+        SELECT u.username, u.email, u.full_name, u.role, u.created_at, u.active,
+               u.tenant_id, t.name, t.slug
+        FROM users u
+        LEFT JOIN tenants t ON t.id = ?
+        WHERE u.username=?
+    """, (profile_tenant_id, user.get("username")))
     row = c.fetchone()
     conn.close()
     
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
+
+    tenant_id = profile_tenant_id if profile_tenant_id is not None else row[6]
+    tenant_name = row[7]
+    tenant_slug = row[8]
+    if tenant_id and (tenant_name is None or tenant_slug is None):
+        conn2 = get_db()
+        c2 = conn2.cursor()
+        c2.execute("SELECT name, slug FROM tenants WHERE id=?", (int(tenant_id),))
+        trow = c2.fetchone()
+        conn2.close()
+        if trow:
+            tenant_name = tenant_name or trow[0]
+            tenant_slug = tenant_slug or trow[1]
     
     return {
         "username": row[0],
@@ -3538,7 +3667,10 @@ def get_my_profile(request: Request, user=Depends(require_login())):
         "full_name": row[2],
         "role": row[3],
         "created_at": row[4],
-        "active": bool(row[5])
+        "active": bool(row[5]),
+        "tenant_id": tenant_id,
+        "tenant_name": tenant_name,
+        "tenant_slug": tenant_slug,
     }
 
 
@@ -3578,44 +3710,39 @@ async def delete_my_account(request: Request, password: str = Form(...), user=De
     conn.close()
     
     # Logout
-    response = RedirectResponse("/", status_code=302)
+    response = RedirectResponse(react_redirect("/login"), status_code=302)
     response.delete_cookie(SESSION_COOKIE)
     return response
 
 
 @app.get("/main", response_class=HTMLResponse)
 def main_dashboard(request: Request, user=Depends(require_login())):
-    return templates.TemplateResponse("main.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/main"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/admin/tickets", response_class=HTMLResponse)
 def admin_tickets_page(request: Request, user=Depends(require_normal_admin())):
-    """Admin support tickets management page"""
-    return templates.TemplateResponse("admin_tickets.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/admin/tickets"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/employee/tickets", response_class=HTMLResponse)
 def employee_tickets_page(request: Request, user=Depends(require_role("admin", "master_admin", "employee"))):
-    """Employee support tickets page"""
-    return templates.TemplateResponse("employee_tickets.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/employee/tickets"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/employee/customers", response_class=HTMLResponse)
 def employee_customers_page(request: Request, user=Depends(require_role("admin", "master_admin", "employee"))):
-    """Employee customer management page"""
-    return templates.TemplateResponse("employee_customers.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/employee/customers"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/notifications", response_class=HTMLResponse)
 def notifications_page(request: Request, user=Depends(require_login())):
-    """Notification center for all users"""
-    return templates.TemplateResponse("notifications.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/notifications"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/my-tickets", response_class=HTMLResponse)
 def my_tickets_page(request: Request, user=Depends(require_login("customer"))):
-    """Customer support tickets page"""
-    return templates.TemplateResponse("customer_tickets.html", {"request": request, "user": user})
+    return RedirectResponse(url=react_redirect("/my-tickets"), status_code=status.HTTP_302_FOUND)
 
 
 @app.get("/logout")
@@ -3638,7 +3765,7 @@ def logout(request: Request):
         except:
             pass  # Invalid token, just delete cookie
     
-    response = RedirectResponse("/", status_code=302)
+    response = RedirectResponse(react_redirect("/login"), status_code=302)
     response.delete_cookie(SESSION_COOKIE)
     response.delete_cookie("csrf_token")
     return response
@@ -3683,6 +3810,7 @@ async def conversation_detail_proxy(conversation_id: str, request: Request, user
 @app.post("/conversations")
 async def conversation_create_proxy(request: Request, user=Depends(require_login())):
     """Proxy conversation creation to the RAG server."""
+    verify_csrf(request)
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
             async with session.post(
@@ -3699,6 +3827,7 @@ async def conversation_create_proxy(request: Request, user=Depends(require_login
 @app.patch("/conversations/{conversation_id}")
 async def conversation_rename_proxy(conversation_id: str, request: Request, user=Depends(require_login())):
     """Proxy conversation rename requests to the RAG server."""
+    verify_csrf(request)
     body = await request.body()
     headers = _rag_proxy_headers(request)
     headers["Content-Type"] = request.headers.get("content-type", "application/json")
@@ -3719,6 +3848,7 @@ async def conversation_rename_proxy(conversation_id: str, request: Request, user
 @app.delete("/conversations")
 async def conversations_clear_all_proxy(request: Request, user=Depends(require_login())):
     """Proxy bulk conversation deletion to the RAG server."""
+    verify_csrf(request)
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             async with session.delete(
@@ -3735,6 +3865,7 @@ async def conversations_clear_all_proxy(request: Request, user=Depends(require_l
 @app.delete("/conversations/{conversation_id}")
 async def conversation_delete_proxy(conversation_id: str, request: Request, user=Depends(require_login())):
     """Proxy conversation deletion requests to the RAG server."""
+    verify_csrf(request)
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
             async with session.delete(
@@ -3751,6 +3882,7 @@ async def conversation_delete_proxy(conversation_id: str, request: Request, user
 @app.post("/conversations/{conversation_id}/message")
 async def conversation_message_proxy(conversation_id: str, request: Request, user=Depends(require_login())):
     """Proxy frontend-only message persistence to the RAG server."""
+    verify_csrf(request)
     body = await request.body()
     headers = _rag_proxy_headers(request)
     headers["Content-Type"] = request.headers.get("content-type", "application/json")
@@ -4274,57 +4406,111 @@ async def proxy_clear_cache(request: Request, user=Depends(require_tenant_staff(
         raise HTTPException(status_code=500, detail=f"Cache clear failed: {str(e)}")
 
 
-@app.get('/frontend/{path:path}')
-def serve_frontend(path: str, request: Request, user=Depends(require_login())):
-    """Serve files from the project's frontend directory but only to authenticated users.
-    Protects the frontend when accessed via HTTP so anonymous visitors cannot load index.html.
-    """
-    # Compute frontend directory relative to repository root
-    repo_root = Path(__file__).resolve().parent.parent
-    frontend_dir = repo_root / 'frontend'
-    # Default to index.html when path is empty or a directory
-    if not path or path.endswith('/'):
-        target = frontend_dir / 'index.html'
+_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
+def _safe_file_under_root(root: Path, relative_path: str) -> Path:
+    """Resolve a path under the React export root (handles trailing slashes and index.html)."""
+    root_resolved = root.resolve()
+    cleaned = (relative_path or "").strip().strip("/")
+    if not cleaned:
+        candidates = [root / "index.html"]
     else:
-        target = frontend_dir / path
-
-
+        candidates = [
+            root / cleaned,
+            root / cleaned / "index.html",
+            root / f"{cleaned}.html",
+        ]
+    for target in candidates:
+        try:
+            target_resolved = target.resolve()
+        except Exception:
+            continue
+        if root_resolved not in target_resolved.parents and root_resolved != target_resolved:
+            continue
+        if target_resolved.is_file():
+            return target_resolved
     try:
-        target_resolved = target.resolve()
+        fallback = (root / cleaned).resolve() if cleaned else (root / "index.html").resolve()
     except Exception:
+        raise HTTPException(status_code=404, detail="Not Found") from None
+    if root_resolved not in fallback.parents and root_resolved != fallback:
         raise HTTPException(status_code=404, detail="Not Found")
+    return fallback
 
 
-    # Prevent directory traversal: ensure the resolved path is inside frontend_dir
-    try:
-        if frontend_dir.resolve() not in target_resolved.parents and frontend_dir.resolve() != target_resolved:
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    if FAVICON_PATH.is_file():
+        return FileResponse(str(FAVICON_PATH), media_type="image/x-icon")
+    return Response(status_code=204)
+
+
+@app.get("/frontend")
+def serve_react_frontend_root(request: Request, user=Depends(require_login())):
+    """Authenticated entry to the React chat UI."""
+    return RedirectResponse(url="/frontend/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
+def _resolve_react_frontend_file(path: str):
+    """Resolve a path under the static React export directory."""
+    react_dir = REACT_UI_DIR
+    if not react_dir.is_dir():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "React UI build not found. Run: cd assistify-ui-design && npm install && npm run build"
+            ),
+        )
+
+    target_resolved = _safe_file_under_root(react_dir, path)
+    if not target_resolved.is_file():
+        index_html = (react_dir / "index.html").resolve()
+        if index_html.is_file():
+            target_resolved = index_html
+        else:
             raise HTTPException(status_code=404, detail="Not Found")
-    except Exception:
-        raise HTTPException(status_code=404, detail="Not Found")
+    return target_resolved
 
 
-    if not target_resolved.exists() or not target_resolved.is_file():
-        raise HTTPException(status_code=404, detail="Not Found")
+@app.head("/frontend")
+def head_react_frontend_root():
+    return Response(status_code=200)
 
-    # Add cache-busting headers to prevent browser from caching old versions
-    return FileResponse(
-        str(target_resolved),
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        }
-    )
+
+@app.get("/frontend/{path:path}")
+def serve_react_frontend(path: str, request: Request):
+    """Serve exported React UI; auth pages are public, dashboards and chat require login."""
+    if not _react_path_is_public(path):
+        if not get_current_user(request):
+            return RedirectResponse(url=react_redirect("/login"), status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+    target_resolved = _resolve_react_frontend_file(path)
+    return FileResponse(str(target_resolved), headers=_NO_CACHE_HEADERS)
+
+
+@app.head("/frontend/{path:path}")
+def head_react_frontend(path: str, request: Request):
+    """Allow Next.js link prefetch without 405 log noise."""
+    if not _react_path_is_public(path):
+        if not get_current_user(request):
+            return Response(status_code=401)
+    try:
+        _resolve_react_frontend_file(path)
+    except HTTPException as exc:
+        return Response(status_code=exc.status_code)
+    return Response(status_code=200)
 
 
 # ========== FORGOT PASSWORD ROUTES ==========
 
 @app.get("/forgot-password", response_class=HTMLResponse)
 async def forgot_password_page(request: Request):
-    """Show the forgot password page."""
-    return templates.TemplateResponse("forgot_password.html", {
-        "request": request
-    })
+    return RedirectResponse(url=react_redirect("/forgot-password"), status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/forgot-password")
@@ -4333,10 +4519,10 @@ async def forgot_password_submit(request: Request, email: str = Form(...)):
     # Rate limiting - 3 attempts per minute per IP
     client_ip = request.client.host
     if not check_rate_limit(f"forgot_password:{client_ip}", RATE_LIMIT_OTP, 60):
-        return templates.TemplateResponse("forgot_password.html", {
-            "request": request,
-            "error": "rate_limit"
-        })
+        return auth_form_redirect(
+            "/forgot-password",
+            error="Too many requests. Please try again later.",
+        )
     
     # Rate limiting check - max 3 requests per email per hour
     conn = get_db()
@@ -4352,10 +4538,10 @@ async def forgot_password_submit(request: Request, email: str = Form(...)):
     
     if count >= 3:
         conn.close()
-        return templates.TemplateResponse("forgot_password.html", {
-            "request": request,
-            "error": "rate_limit"
-        })
+        return auth_form_redirect(
+            "/forgot-password",
+            error="Too many requests. Please try again later.",
+        )
     
     # Check if email exists
     c.execute("SELECT username FROM users WHERE email = ?", (email,))
@@ -4363,10 +4549,10 @@ async def forgot_password_submit(request: Request, email: str = Form(...)):
     
     if not row:
         conn.close()
-        return templates.TemplateResponse("forgot_password.html", {
-            "request": request,
-            "error": "email_not_found"
-        })
+        return auth_form_redirect(
+            "/forgot-password",
+            error="No account found with that email address.",
+        )
     
     username = row[0]
     
@@ -4387,16 +4573,16 @@ async def forgot_password_submit(request: Request, email: str = Form(...)):
     send_otp_email(email, username, otp_code)
     
     # Redirect to reset password page with email parameter
-    return RedirectResponse(url=f"/reset-password?email={email}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        url=react_redirect("/reset-password", f"email={email}&message=Check your email for the verification code."),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @app.get("/reset-password", response_class=HTMLResponse)
-async def reset_password_page(request: Request, email: str):
-    """Show the reset password page."""
-    return templates.TemplateResponse("reset_password.html", {
-        "request": request,
-        "email": email
-    })
+async def reset_password_page(request: Request, email: str = ""):
+    q = f"email={email}" if email else ""
+    return RedirectResponse(url=react_redirect("/reset-password", q), status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/reset-password")
@@ -4411,19 +4597,19 @@ async def reset_password_submit(
     
     # Check passwords match
     if new_password != confirm_password:
-        return templates.TemplateResponse("reset_password.html", {
-            "request": request,
-            "email": email,
-            "error": "password_mismatch"
-        })
-    
+        return auth_form_redirect(
+            "/reset-password",
+            email=email,
+            error="Passwords do not match.",
+        )
+
     # Check password strength
     if len(new_password) < 8:
-        return templates.TemplateResponse("reset_password.html", {
-            "request": request,
-            "email": email,
-            "error": "weak_password"
-        })
+        return auth_form_redirect(
+            "/reset-password",
+            email=email,
+            error="Password must be at least 8 characters long.",
+        )
     
     # Verify OTP
     conn = get_db()
@@ -4437,11 +4623,11 @@ async def reset_password_submit(
     
     if not rows:
         conn.close()
-        return templates.TemplateResponse("reset_password.html", {
-            "request": request,
-            "email": email,
-            "error": "invalid_otp"
-        })
+        return auth_form_redirect(
+            "/reset-password",
+            email=email,
+            error="Invalid or expired verification code.",
+        )
     
     # Find matching OTP hash
     otp_id = None
@@ -4451,21 +4637,21 @@ async def reset_password_submit(
             expires_at = datetime.fromisoformat(expires_at_str)
             if datetime.now() > expires_at:
                 conn.close()
-                return templates.TemplateResponse("reset_password.html", {
-                    "request": request,
-                    "email": email,
-                    "error": "invalid_otp"
-                })
+                return auth_form_redirect(
+                    "/reset-password",
+                    email=email,
+                    error="Invalid or expired verification code.",
+                )
             otp_id = row_id
             break
     
     if not otp_id:
         conn.close()
-        return templates.TemplateResponse("reset_password.html", {
-            "request": request,
-            "email": email,
-            "error": "invalid_otp"
-        })
+        return auth_form_redirect(
+            "/reset-password",
+            email=email,
+            error="Invalid or expired verification code.",
+        )
     
     # Mark OTP as verified
     c.execute("UPDATE otp_verification SET verified = 1 WHERE id = ?", (otp_id,))
@@ -4477,46 +4663,17 @@ async def reset_password_submit(
     conn.close()
     
     # Redirect to login with success message
-    return RedirectResponse(url="/login?password_reset=success", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        url=react_redirect("/login", "message=Password reset successfully. You can sign in now."),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 # ========== PROFILE MANAGEMENT ROUTES ==========
 
 @app.get("/profile", response_class=HTMLResponse)
 async def profile_page(request: Request, user=Depends(require_login())):
-    """Show the profile management page."""
-    username = user['username']
-    role = user['role']
-    
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT username, email, role, full_name FROM users WHERE username = ?", (username,))
-    row = c.fetchone()
-    conn.close()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Determine back URL based on role
-    back_urls = {
-        'superadmin': '/superadmin',
-        'master_admin': '/master_admin',
-        'admin': '/admin',
-        'employee': '/employee',
-        'customer': '/main',
-    }
-    back_url = back_urls.get(role, '/main')
-    
-    return templates.TemplateResponse("profile.html", {
-        "request": request,
-        "user": {
-            "username": row[0],
-            "email": row[1],
-            "role": row[2],
-            "full_name": row[3]
-        },
-        "back_url": back_url
-    })
+    return RedirectResponse(url=react_redirect("/profile"), status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/profile/change-email")
@@ -4524,9 +4681,11 @@ async def change_email_request(
     request: Request,
     new_email: str = Form(...),
     current_password: str = Form(...),
+    csrf_token: str = Form(None),
     user=Depends(require_login())
 ):
     """Request email change - verify password and send OTP to new email."""
+    verify_csrf(request, form_token=csrf_token)
     username = user['username']
     
     conn = get_db()
@@ -4538,25 +4697,7 @@ async def change_email_request(
     
     if not row or not pwd_context.verify(current_password, row[0]):
         conn.close()
-        role = user['role']
-        back_urls = {'admin': '/admin', 'employee': '/employee', 'customer': '/main'}
-        back_url = back_urls.get(role, '/main')
-        
-        c2 = get_db().cursor()
-        c2.execute("SELECT username, email, role, full_name FROM users WHERE username = ?", (username,))
-        user_row = c2.fetchone()
-        
-        return templates.TemplateResponse("profile.html", {
-            "request": request,
-            "user": {
-                "username": user_row[0],
-                "email": user_row[1],
-                "role": user_row[2],
-                "full_name": user_row[3]
-            },
-            "back_url": back_url,
-            "error": "invalid_password"
-        })
+        return auth_form_redirect("/profile", error="Incorrect password.")
     
     current_email = row[1]
     
@@ -4564,25 +4705,7 @@ async def change_email_request(
     c.execute("SELECT username FROM users WHERE email = ? AND username != ?", (new_email, username))
     if c.fetchone():
         conn.close()
-        role = user['role']
-        back_urls = {'admin': '/admin', 'employee': '/employee', 'customer': '/main'}
-        back_url = back_urls.get(role, '/main')
-        
-        c2 = get_db().cursor()
-        c2.execute("SELECT username, email, role, full_name FROM users WHERE username = ?", (username,))
-        user_row = c2.fetchone()
-        
-        return templates.TemplateResponse("profile.html", {
-            "request": request,
-            "user": {
-                "username": user_row[0],
-                "email": user_row[1],
-                "role": user_row[2],
-                "full_name": user_row[3]
-            },
-            "back_url": back_url,
-            "error": "email_taken"
-        })
+        return auth_form_redirect("/profile", error="That email is already in use.")
     
     # Generate OTP
     otp_code = ''.join(random.choices(string.digits, k=6))
@@ -4601,17 +4724,16 @@ async def change_email_request(
     send_otp_email(new_email, username, otp_code)
     
     # Redirect to verification page
-    return RedirectResponse(url=f"/profile/verify-email-change?new_email={new_email}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        url=react_redirect("/profile/verify-email-change", f"new_email={new_email}"),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @app.get("/profile/verify-email-change", response_class=HTMLResponse)
-async def verify_email_change_page(request: Request, new_email: str, user=Depends(require_login())):
-    """Show the email change verification page."""
-    return templates.TemplateResponse("verify_email_change.html", {
-        "request": request,
-        "new_email": new_email,
-        "user": user,
-    })
+async def verify_email_change_page(request: Request, new_email: str = "", user=Depends(require_login())):
+    q = f"new_email={new_email}" if new_email else ""
+    return RedirectResponse(url=react_redirect("/profile/verify-email-change", q), status_code=status.HTTP_302_FOUND)
 
 
 @app.post("/profile/verify-email-change")
@@ -4619,9 +4741,11 @@ async def verify_email_change_submit(
     request: Request,
     new_email: str = Form(...),
     otp_code: str = Form(...),
+    csrf_token: str = Form(None),
     user=Depends(require_login())
 ):
     """Verify OTP and update email."""
+    verify_csrf(request, form_token=csrf_token)
     username = user['username']
     
     # Verify OTP
@@ -4636,11 +4760,11 @@ async def verify_email_change_submit(
     
     if not rows:
         conn.close()
-        return templates.TemplateResponse("verify_email_change.html", {
-            "request": request,
-            "new_email": new_email,
-            "error": "invalid_otp"
-        })
+        return auth_form_redirect(
+            "/profile/verify-email-change",
+            new_email=new_email,
+            error="Invalid or expired verification code.",
+        )
     
     # Find matching OTP hash
     otp_id = None
@@ -4650,21 +4774,21 @@ async def verify_email_change_submit(
             expires_at = datetime.fromisoformat(expires_at_str)
             if datetime.now() > expires_at:
                 conn.close()
-                return templates.TemplateResponse("verify_email_change.html", {
-                    "request": request,
-                    "new_email": new_email,
-                    "error": "invalid_otp"
-                })
+                return auth_form_redirect(
+                    "/profile/verify-email-change",
+                    new_email=new_email,
+                    error="Invalid or expired verification code.",
+                )
             otp_id = row_id
             break
     
     if not otp_id:
         conn.close()
-        return templates.TemplateResponse("verify_email_change.html", {
-            "request": request,
-            "new_email": new_email,
-            "error": "invalid_otp"
-        })
+        return auth_form_redirect(
+            "/profile/verify-email-change",
+            new_email=new_email,
+            error="Invalid or expired verification code.",
+        )
     
     # Mark OTP as verified
     c.execute("UPDATE otp_verification SET verified = 1 WHERE id = ?", (otp_id,))
@@ -4687,7 +4811,10 @@ async def verify_email_change_submit(
     conn.close()
     
     # Redirect to profile with success message
-    return RedirectResponse(url="/profile?email_changed=success", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        url=react_redirect("/profile", "message=Email updated successfully."),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @app.post("/profile/change-password")
@@ -4696,58 +4823,23 @@ async def change_password_request(
     old_password: str = Form(...),
     new_password: str = Form(...),
     confirm_password: str = Form(...),
+    csrf_token: str = Form(None),
     user=Depends(require_login())
 ):
     """Request password change - verify old password and send OTP."""
+    verify_csrf(request, form_token=csrf_token)
     username = user['username']
     
     # Check passwords match
     if new_password != confirm_password:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT username, email, role, full_name FROM users WHERE username = ?", (username,))
-        user_row = c.fetchone()
-        conn.close()
-        
-        role = user['role']
-        back_urls = {'admin': '/admin', 'employee': '/employee', 'customer': '/main'}
-        back_url = back_urls.get(role, '/main')
-        
-        return templates.TemplateResponse("profile.html", {
-            "request": request,
-            "user": {
-                "username": user_row[0],
-                "email": user_row[1],
-                "role": user_row[2],
-                "full_name": user_row[3]
-            },
-            "back_url": back_url,
-            "error": "password_mismatch"
-        })
-    
+        return auth_form_redirect("/profile", error="New passwords do not match.")
+
     # Check password strength
     if len(new_password) < 8:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT username, email, role, full_name FROM users WHERE username = ?", (username,))
-        user_row = c.fetchone()
-        conn.close()
-        
-        role = user['role']
-        back_urls = {'admin': '/admin', 'employee': '/employee', 'customer': '/main'}
-        back_url = back_urls.get(role, '/main')
-        
-        return templates.TemplateResponse("profile.html", {
-            "request": request,
-            "user": {
-                "username": user_row[0],
-                "email": user_row[1],
-                "role": user_row[2],
-                "full_name": user_row[3]
-            },
-            "back_url": back_url,
-            "error": "weak_password"
-        })
+        return auth_form_redirect(
+            "/profile",
+            error="Password must be at least 8 characters long.",
+        )
     
     conn = get_db()
     c = conn.cursor()
@@ -4758,26 +4850,7 @@ async def change_password_request(
     
     if not row or not pwd_context.verify(old_password, row[0]):
         conn.close()
-        
-        c2 = get_db().cursor()
-        c2.execute("SELECT username, email, role, full_name FROM users WHERE username = ?", (username,))
-        user_row = c2.fetchone()
-        
-        role = user['role']
-        back_urls = {'admin': '/admin', 'employee': '/employee', 'customer': '/main'}
-        back_url = back_urls.get(role, '/main')
-        
-        return templates.TemplateResponse("profile.html", {
-            "request": request,
-            "user": {
-                "username": user_row[0],
-                "email": user_row[1],
-                "role": user_row[2],
-                "full_name": user_row[3]
-            },
-            "back_url": back_url,
-            "error": "invalid_old_password"
-        })
+        return auth_form_redirect("/profile", error="Current password is incorrect.")
     
     email = row[1]
     
@@ -4801,25 +4874,26 @@ async def change_password_request(
     send_otp_email(email, username, otp_code)
     
     # Redirect to verification page
-    return RedirectResponse(url="/profile/verify-password-change", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        url=react_redirect("/profile/verify-password-change"),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @app.get("/profile/verify-password-change", response_class=HTMLResponse)
 async def verify_password_change_page(request: Request, user=Depends(require_login())):
-    """Show the password change verification page."""
-    return templates.TemplateResponse("verify_password_change.html", {
-        "request": request,
-        "user": user,
-    })
+    return RedirectResponse(url=react_redirect("/profile/verify-password-change"), status_code=status.HTTP_302_FOUND)
 
 
 @app.post("/profile/verify-password-change")
 async def verify_password_change_submit(
     request: Request,
     otp_code: str = Form(...),
+    csrf_token: str = Form(None),
     user=Depends(require_login())
 ):
     """Verify OTP and update password."""
+    verify_csrf(request, form_token=csrf_token)
     username = user['username']
     
     # Get user email
@@ -4844,10 +4918,10 @@ async def verify_password_change_submit(
     
     if not rows:
         conn.close()
-        return templates.TemplateResponse("verify_password_change.html", {
-            "request": request,
-            "error": "invalid_otp"
-        })
+        return auth_form_redirect(
+            "/profile/verify-password-change",
+            error="Invalid or expired verification code.",
+        )
     
     # Find matching OTP hash
     otp_id = None
@@ -4858,20 +4932,20 @@ async def verify_password_change_submit(
             expires_at = datetime.fromisoformat(expires_at_str)
             if datetime.now() > expires_at:
                 conn.close()
-                return templates.TemplateResponse("verify_password_change.html", {
-                    "request": request,
-                    "error": "invalid_otp"
-                })
+                return auth_form_redirect(
+                    "/profile/verify-password-change",
+                    error="Invalid or expired verification code.",
+                )
             otp_id = row_id
             new_password_hash = temp_pwd_hash
             break
     
     if not otp_id:
         conn.close()
-        return templates.TemplateResponse("verify_password_change.html", {
-            "request": request,
-            "error": "invalid_otp"
-        })
+        return auth_form_redirect(
+            "/profile/verify-password-change",
+            error="Invalid or expired verification code.",
+        )
     
     # Mark OTP as verified
     c.execute("UPDATE otp_verification SET verified = 1 WHERE id = ?", (otp_id,))
@@ -4890,7 +4964,10 @@ async def verify_password_change_submit(
     conn.close()
     
     # Redirect to profile with success message
-    return RedirectResponse(url="/profile?password_changed=success", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        url=react_redirect("/profile", "message=Password updated successfully."),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @app.websocket("/ws")
@@ -5266,8 +5343,8 @@ def get_my_tickets(request: Request, user=Depends(require_api_auth())):
                 END,
                 created_at DESC
         """, (user.get("username"), _tid))
-    elif user.get("role") == "admin":
-        # Admins see all tickets for THEIR business only
+    elif user.get("role") in ("admin", "master_admin"):
+        # Admins and master admins see all tickets for THEIR business only
         _tid = int(user.get("tenant_id") or DEFAULT_TENANT_ID)
         c.execute("""
             SELECT id, ticket_number, subject, description, status, priority,
@@ -5350,7 +5427,7 @@ def get_ticket_details(ticket_id: int, request: Request, user=Depends(require_lo
         conn.close()
         raise HTTPException(status_code=403, detail="Access denied")
     # Staff (admin/employee) may only access tickets within their own business.
-    if _role in ("admin", "employee"):
+    if _role in ("admin", "master_admin", "employee"):
         _ticket_tenant = ticket_row[15] if len(ticket_row) > 15 and ticket_row[15] is not None else DEFAULT_TENANT_ID
         if int(_ticket_tenant) != int(user.get("tenant_id") or DEFAULT_TENANT_ID):
             conn.close()
@@ -5436,7 +5513,7 @@ async def add_ticket_message(ticket_id: int, request: Request, user=Depends(requ
         conn.close()
         raise HTTPException(status_code=403, detail="Access denied")
     # Staff may only act on tickets within their own business.
-    if _role in ("admin", "employee"):
+    if _role in ("admin", "master_admin", "employee"):
         _tt = ticket_tenant_id if ticket_tenant_id is not None else DEFAULT_TENANT_ID
         if int(_tt) != int(user.get("tenant_id") or DEFAULT_TENANT_ID):
             conn.close()

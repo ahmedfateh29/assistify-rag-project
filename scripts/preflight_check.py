@@ -34,7 +34,12 @@ def main() -> int:
         return 1
 
     try:
-        from config import WHISPER_MODEL_PATH, ASSETS_DIR
+        from config import (
+            ASSETS_DIR,
+            WHISPER_MODEL_PATH,
+            WHISPER_MODEL_RESOLVED_PATH,
+            WHISPER_MODEL_SOURCE,
+        )
     except Exception as exc:
         print(f"FAIL: cannot import config ({exc})")
         return 1
@@ -56,8 +61,12 @@ def main() -> int:
         print(f"WARN: Ollama resolution failed ({exc})")
 
     whisper = Path(WHISPER_MODEL_PATH)
-    print(f"Whisper path: {whisper} -> {'OK' if whisper.exists() else 'MISSING'}")
-    if not whisper.exists():
+    if WHISPER_MODEL_SOURCE == "plain":
+        print(f"Whisper path: {whisper} -> OK")
+    elif WHISPER_MODEL_SOURCE == "cache":
+        print(f"Whisper path: {whisper} -> OK (HF cache: {WHISPER_MODEL_RESOLVED_PATH})")
+    else:
+        print(f"Whisper path: {whisper} -> MISSING")
         ok = False
 
     en = REPO_ROOT / "models" / "piper" / "en" / "voice.onnx"

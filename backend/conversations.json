@@ -1,20 +1,48 @@
 {
   "conversations": [
     {
-      "id": "25d0de37-b171-4080-8e2f-2542b274343e",
-      "title": "How are you doing?",
+      "id": "31817e26-57fe-44db-9e02-51e3c87e1272",
+      "title": "What was the ROC AUC score of the...",
       "messages": [
         {
           "role": "user",
-          "text": "How are you doing?"
+          "text": "What was the ROC AUC score of the logistic regression baseline model at the default of 0.5 threshold?"
+        },
+        {
+          "role": "assistant",
+          "text": "The ROC-AUCscore of the Logistic Regression baseline model at the default 0.50 threshold is 0.7272."
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "superadmin",
+      "created_at": "2026-06-23T02:42:10.141402+00:00",
+      "updated_at": "2026-06-23T02:42:33.043295+00:00"
+    },
+    {
+      "id": "adc908d6-306a-490d-9454-1dee129478d6",
+      "title": "Hi, how are you doing?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "Hi, how are you doing?"
         },
         {
           "role": "assistant",
           "text": "I'm doing well, thank you for asking. How can I help you with your support question today?"
-        },
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "ahmed_khaled1",
+      "created_at": "2026-06-23T02:34:45.274112+00:00",
+      "updated_at": "2026-06-23T02:34:45.305211+00:00"
+    },
+    {
+      "id": "4d8d9c70-dd03-48f8-81f7-6630551331d3",
+      "title": "What was the ROC ASC score of the...",
+      "messages": [
         {
           "role": "user",
-          "text": "Tell me what mod you do have in your mod base."
+          "text": "What was the ROC ASC score of the logistic regression baseline model at the default 0.5 threshold?"
         },
         {
           "role": "assistant",
@@ -22,17 +50,265 @@
         },
         {
           "role": "user",
-          "text": "Tell me what main topics do you have in your knowledge base?"
+          "text": "What was the ROCA SC score of the logistic regression?"
         },
         {
           "role": "assistant",
-          "text": "The provided document knowledge base contains information on various psychology-related topics such as study techniques, misconceptions about psychology and psychologists, contributions of Hippocrates to medicine, concepts in psychology including categorization, sensory memory introduction, and handling psychological problems with relaxation exercises or meditation. Specific details are not found for each topic within the given documents."
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
         }
       ],
       "tenant_id": 1,
-      "owner": "ahmed_fateh22",
-      "created_at": "2026-06-21T11:56:40.085501+00:00",
-      "updated_at": "2026-06-22T06:29:39.717994+00:00"
+      "owner": "ahmed_khaled1",
+      "created_at": "2026-06-22T23:08:25.748599+00:00",
+      "updated_at": "2026-06-22T23:08:56.034086+00:00"
+    },
+    {
+      "id": "fdec61cb-499e-4ff8-ba39-ca5e4212bc40",
+      "title": "Hi, are you getting me?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "Hi, are you getting me?"
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, I'm here with you and I received your message. How can I help you today?"
+        },
+        {
+          "role": "user",
+          "text": "What was the RUC AUC score of the logistic regression baseline model at the default 0.5 threshold?"
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "ahmed_khaled1",
+      "created_at": "2026-06-22T23:07:26.413628+00:00",
+      "updated_at": "2026-06-22T23:07:52.426205+00:00"
+    },
+    {
+      "id": "f7d3cd7e-b68d-4e6f-8a43-c22ec41878eb",
+      "title": "What was the ROC AUC score of the...",
+      "messages": [
+        {
+          "role": "user",
+          "text": "What was the ROC AUC score of the logistic regression baseline model at the default 0.5 threshold?"
+        },
+        {
+          "role": "assistant",
+          "text": "The ROC-AUCscore of the Logistic Regression baseline model at the default 0.50 threshold is 0.7272."
+        },
+        {
+          "role": "user",
+          "text": "Okay, thank you."
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "ahmed_khaled1",
+      "created_at": "2026-06-22T22:52:58.049324+00:00",
+      "updated_at": "2026-06-22T22:53:21.032025+00:00"
+    },
+    {
+      "id": "199c1078-941a-4f10-82bd-d63d1799ac35",
+      "title": "New chat",
+      "messages": [],
+      "tenant_id": 1,
+      "owner": "ahmed_khaled1",
+      "created_at": "2026-06-22T22:52:26.509289+00:00",
+      "updated_at": "2026-06-22T22:52:26.509289+00:00"
+    },
+    {
+      "id": "9a33eff9-99db-46c3-a6a2-e9e717e90bdf",
+      "title": "hi",
+      "messages": [
+        {
+          "role": "user",
+          "text": "hi"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": null,
+      "created_at": "2026-06-22T21:04:55.509452+00:00",
+      "updated_at": "2026-06-22T21:04:55.514288+00:00"
+    },
+    {
+      "id": "31a708f9-1d34-41ad-8563-df334f27331f",
+      "title": "hi",
+      "messages": [
+        {
+          "role": "user",
+          "text": "hi"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": null,
+      "created_at": "2026-06-22T21:04:55.500663+00:00",
+      "updated_at": "2026-06-22T21:04:55.503900+00:00"
+    },
+    {
+      "id": "a5909782-d4a1-4eb6-9bfc-b824e2f4a9e2",
+      "title": "hi",
+      "messages": [
+        {
+          "role": "user",
+          "text": "hi"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": null,
+      "created_at": "2026-06-22T21:04:55.444984+00:00",
+      "updated_at": "2026-06-22T21:04:55.464279+00:00"
+    },
+    {
+      "id": "2bd53682-de3e-4a97-afb0-64c95a581d89",
+      "title": "Tell me about security.",
+      "messages": [
+        {
+          "role": "user",
+          "text": "Tell me about security."
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "Tell me about psychology."
+        },
+        {
+          "role": "assistant",
+          "text": "Psychology is the scientific study of behavior and mental processes."
+        },
+        {
+          "role": "user",
+          "text": "صباح الخير"
+        },
+        {
+          "role": "assistant",
+          "text": "أهلاً! شكراً لتواصلك مع الدعم. كيف يمكنني مساعدتك اليوم؟"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": null,
+      "created_at": "2026-06-22T18:58:31.790812+00:00",
+      "updated_at": "2026-06-22T18:59:04.188980+00:00"
+    },
+    {
+      "id": "7a119a60-320c-424f-b325-a604d667d73e",
+      "title": "Hi, how are you?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "Hi, how are you?"
+        },
+        {
+          "role": "assistant",
+          "text": "I'm doing well, thank you for asking. How can I help you with your support question today?"
+        },
+        {
+          "role": "user",
+          "text": "Yeah"
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "Then we have about the security."
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": null,
+      "created_at": "2026-06-22T18:57:37.528061+00:00",
+      "updated_at": "2026-06-22T18:58:04.638552+00:00"
+    },
+    {
+      "id": "602addf1-ed00-47ba-9932-e24f7d80db70",
+      "title": "How are you?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "How are you?"
+        },
+        {
+          "role": "assistant",
+          "text": "I'm doing well, thank you for asking. How can I help you with your support question today?"
+        },
+        {
+          "role": "user",
+          "text": "What can I ask?"
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": null,
+      "created_at": "2026-06-22T18:34:41.372330+00:00",
+      "updated_at": "2026-06-22T18:34:58.997452+00:00"
+    },
+    {
+      "id": "35b32f81-4330-4ee9-943a-cadb4f4ba085",
+      "title": "New chat",
+      "messages": [],
+      "tenant_id": 1,
+      "owner": null,
+      "created_at": "2026-06-22T14:58:15.121384+00:00",
+      "updated_at": "2026-06-22T14:58:15.121384+00:00"
+    },
+    {
+      "id": "2811a017-2c3e-4864-a5d8-d95d7101a93c",
+      "title": "about psychology.",
+      "messages": [
+        {
+          "role": "user",
+          "text": "about psychology."
+        },
+        {
+          "role": "assistant",
+          "text": "Popular areas of psychology Clinical Psychology Abranch of psychology concerned with the study, diagnosis, and treatment ofabnormal behavior. Introduction to Psychology -PSY101 VUScientific nature of Psychology is a science Itemploys the scientific method for gathering knowledge and information."
+        },
+        {
+          "role": "user",
+          "text": "Tell me about five phases of psychology or four phases. I did not know"
+        },
+        {
+          "role": "assistant",
+          "text": "Four phases of psychology include Introduction to Psychology - Scientific method for gathering knowledge and information, Clinical Psychology focusing on studying, diagnosing, and treating abnormal behavior, Research involving observation, description, control, and replication of phenomena, and Education / teaching where psychological principles are applied in teaching settings."
+        },
+        {
+          "role": "user",
+          "text": "The HR report uses a correlation heatmap to identify drivers of attrition. Referencing the **Research Methods in Psychology** chapter, explain the difference between correlation and causation. Why must IBM HR be careful not to assume that reducing 'OverTime' will *causally* reduce attrition without further experimental or quasi-experimental research?"
+        },
+        {
+          "role": "user",
+          "text": "The HR report uses a correlation heatmap to identify drivers of attrition. Referencing the **Research Methods in Psychology** chapter, explain the difference between correlation and causation. Why must IBM HR be careful not to assume that reducing 'OverTime' will *causally* reduce attrition without further experimental or quasi-experimental research?"
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "Ahmed_Fateh",
+      "created_at": "2026-06-22T10:20:06.013096+00:00",
+      "updated_at": "2026-06-22T15:14:29.783209+00:00"
     },
     {
       "id": "aa49780d-d772-48ba-8371-e0a29d621a62",
@@ -51,76 +327,6 @@
       "owner": "admin",
       "created_at": "2026-06-21T02:06:21.518994+00:00",
       "updated_at": "2026-06-21T02:06:21.518994+00:00"
-    },
-    {
-      "id": "d2b075c0-3291-441f-962e-b2f8fc7d897a",
-      "title": "According to the IBM HR Attrition CRISP-DM report,...",
-      "messages": [
-        {
-          "role": "user",
-          "text": "According to the IBM HR Attrition CRISP-DM report, what is the exact attrition rate, and which department has the highest attrition percentage?"
-        },
-        {
-          "role": "assistant",
-          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
-        },
-        {
-          "role": "user",
-          "text": "According to the IBM HR Attrition CRISP-DM report, what is the exact attrition rate, and which department has the highest attrition percentage?"
-        },
-        {
-          "role": "assistant",
-          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
-        },
-        {
-          "role": "user",
-          "text": "According to the IBM HR Attrition CRISP-DM report, what is the exact attrition rate, and which department has the highest attrition percentage?"
-        },
-        {
-          "role": "assistant",
-          "text": "The exact attrition rate is 16.12%. Sales has the highest attrition percentage at 20.63%."
-        },
-        {
-          "role": "user",
-          "text": "What was the ROC-AUC score of the Logistic Regression baseline model at the default 0.50 threshold?"
-        },
-        {
-          "role": "assistant",
-          "text": "The ROC-AUCscore of the Logistic Regression baseline model at the default 0.50 threshold is 0.7272."
-        },
-        {
-          "role": "user",
-          "text": "What are the three parts of the soul according to Plato, and how did he define the 'rational' part?"
-        },
-        {
-          "role": "assistant",
-          "text": "Sorry, request timed out. Please tryagain."
-        },
-        {
-          "role": "user",
-          "text": "What are the three parts of the soul according to Plato, and how did he define the 'rational' part?"
-        },
-        {
-          "role": "user",
-          "text": "What are the three parts of the soul according to Plato, and how did he define the 'rational' part?"
-        },
-        {
-          "role": "assistant",
-          "text": "Sorry, request timed out. Please tryagain."
-        },
-        {
-          "role": "user",
-          "text": "What are the three parts of the soul according to Plato, and how did he define the 'rational' part?"
-        },
-        {
-          "role": "assistant",
-          "text": "Item 1: The soul has three parts or components according to Plato. He calls them reason, spirit, and appetite. Item 2: The rational part is defined as the highest in order. When a person moves from believing to thinking, they move from the visible world to the intelligible world. Thinking is particularly characteristic of the scientist."
-        }
-      ],
-      "tenant_id": 1,
-      "owner": "ahmed_fateh22",
-      "created_at": "2026-06-20T22:17:40.451881+00:00",
-      "updated_at": "2026-06-21T11:40:38.462742+00:00"
     },
     {
       "id": "2c52938b-cb02-46b9-ae6e-50ba738acf3c",

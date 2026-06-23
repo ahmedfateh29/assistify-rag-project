@@ -126,3 +126,27 @@ python scripts/verify_stack.py
 ```
 
 Expect `Login (7001): OK`. Open http://127.0.0.1:7001/login in the browser.
+
+## Stuck on email verification (/verify-otp)
+
+### Symptom
+
+After registering, the browser shows **Verify Your Email** and no code arrives (EmailJS not configured yet).
+
+### Fix (development)
+
+Add to your `.env` file (copy from `.env.example` if needed):
+
+```
+SKIP_EMAIL_OTP=true
+```
+
+Restart the Login server, then register again at http://127.0.0.1:7001/register. The account is created immediately and you are redirected to login.
+
+**Note:** A registration that stopped on `/verify-otp` did not create the user yet — register again after enabling the flag.
+
+Alternatively, use dev logins (`admin` / `admin`) until EmailJS is configured for production.
+
+### Production
+
+Set real `EMAILJS_*` credentials in `.env`, keep `SKIP_EMAIL_OTP` unset or `false`, and leave `ENVIRONMENT=production`.

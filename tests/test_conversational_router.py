@@ -19,9 +19,12 @@ from backend.assistify_rag_server import (
     _assistant_meta_direct_answer,
     _build_grounded_explanations_for_items,
     _classify_assistant_meta_intent,
+    _classify_smalltalk_intent,
     _finalize_user_visible_answer,
+    _is_pure_smalltalk_query,
     _is_support_procedural_query,
     _rescue_support_procedural_from_docs,
+    _smalltalk_response,
     classify_query_route,
 )
 
@@ -201,6 +204,31 @@ def test_assistant_meta_capability_questions() -> None:
         assert "Not found in the document." not in answer
 
 
+def test_thank_you_smalltalk_routing() -> None:
+    thanks_cases = [
+        "Okay, thank you.",
+        "ok thank you",
+        "thanks",
+        "okay thanks",
+        "much appreciated",
+    ]
+    for query in thanks_cases:
+        assert classify_query_route(query) == "smalltalk", f"{query!r} -> {classify_query_route(query)!r}"
+        assert _classify_smalltalk_intent(query) == "thanks", query
+        response = _smalltalk_response(query)
+        assert "welcome" in response.lower(), response
+
+    assert classify_query_route("thanks, what is logistic regression?") == "document_question"
+    assert not _is_pure_smalltalk_query("thanks, what is logistic regression?")
+
+
+def test_finalize_maps_sentinel_for_thank_you() -> None:
+    out = _finalize_user_visible_answer("Okay, thank you.", RAG_NO_MATCH_RESPONSE)
+    assert out != RAG_NO_MATCH_RESPONSE
+    assert out != CS_NO_MATCH_RESPONSE_EN
+    assert "welcome" in out.lower()
+
+
 if __name__ == "__main__":
     test_classify_query_route_conversational()
     test_finalize_maps_sentinel_for_conversational()
@@ -217,4 +245,6 @@ if __name__ == "__main__":
     test_password_change_phrasing_rescued_from_docs()
     test_password_change_no_docs_uses_cs_not_blunt()
     test_assistant_meta_capability_questions()
+    test_thank_you_smalltalk_routing()
+    test_finalize_maps_sentinel_for_thank_you()
     print("All conversational router tests passed.")

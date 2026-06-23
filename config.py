@@ -67,6 +67,12 @@ ALLOW_DEV_LOGIN_FALLBACK = (
     and os.getenv("ALLOW_DEV_LOGIN_FALLBACK", "false").lower() in {"1", "true", "yes", "on"}
 )
 
+# Dev-only: create accounts on POST /register without EmailJS OTP (never in production).
+SKIP_EMAIL_OTP = (
+    not IS_PRODUCTION
+    and os.getenv("SKIP_EMAIL_OTP", "false").lower() in {"1", "true", "yes", "on"}
+)
+
 # Development fallbacks (ONLY for local development)
 if not IS_PRODUCTION:
     if not SESSION_SECRET:
@@ -161,8 +167,52 @@ RAG_USE_GPU = os.getenv("RAG_USE_GPU", "1").lower() not in {"0", "false", "no"}
 
 # Speech Recognition - faster-whisper (replaces Vosk)
 # Voice STT is CPU-only so VRAM stays available for Ollama + RAG embeddings.
+
+
+def resolve_whisper_model_path(
+    configured_path: Path | None = None,
+    model_size: str | None = None,
+) -> tuple[Path, str]:
+    """Resolve faster-whisper model location for preflight and loaders.
+
+    Returns (path, source) where source is one of: plain, cache, missing.
+    When the configured plain directory is absent, checks the HuggingFace cache
+    layout under backend/Models/models--Systran--faster-whisper-*/snapshots/*.
+    """
+    path = Path(configured_path or ROOT / "backend" / "Models" / "faster-whisper-small")
+    if path.exists():
+        return path, "plain"
+
+    size = (model_size or os.getenv("WHISPER_MODEL_SIZE", "small.en")).strip()
+    size_slug = size.replace(".", "-")
+    models_root = ROOT / "backend" / "Models"
+    cache_candidates = [
+        models_root / f"models--Systran--faster-whisper-{size_slug}",
+        models_root / "models--Systran--faster-whisper-small",
+        models_root / "models--Systran--faster-whisper-small.en",
+    ]
+    seen: set[str] = set()
+    for cache_dir in cache_candidates:
+        key = str(cache_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        snapshots = cache_dir / "snapshots"
+        if not snapshots.is_dir():
+            continue
+        for snapshot in sorted(snapshots.iterdir()):
+            if snapshot.is_dir() and (snapshot / "model.bin").exists():
+                return snapshot, "cache"
+
+    return path, "missing"
+
+
 WHISPER_MODEL_PATH = Path(os.getenv("WHISPER_MODEL_PATH", str(ROOT / "backend" / "Models" / "faster-whisper-small")))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small.en")
+WHISPER_MODEL_RESOLVED_PATH, WHISPER_MODEL_SOURCE = resolve_whisper_model_path(
+    WHISPER_MODEL_PATH,
+    WHISPER_MODEL_SIZE,
+)
 _requested_whisper_device = os.getenv("WHISPER_DEVICE", "cpu").strip().lower()
 if _requested_whisper_device != "cpu":
     import warnings
@@ -173,7 +223,7 @@ if _requested_whisper_device != "cpu":
     )
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 for CPU efficiency
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))  # beam=1 for speed
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))  # beam=5 for accuracy
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"  # Voice Activity Detection
 
 # Legacy (deprecated - keeping for migration)
@@ -314,6 +364,7 @@ __all__ = [
     "OLLAMA_PORT",
     "OLLAMA_CLI",
     "ALLOW_DEV_LOGIN_FALLBACK",
+    "SKIP_EMAIL_OTP",
     "LLM_SERVER_PORT",
     "assert_production_config",
 ]

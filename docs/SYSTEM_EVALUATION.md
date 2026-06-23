@@ -16,7 +16,7 @@ Assistify is a multi-process local stack: **Login (7001)**, **RAG + voice (7000)
 | Correctness | B- | Chroma path drift; tenant analytics leak |
 | Performance | B | Single-GPU voice/LLM queue without user feedback |
 | Architecture | C | 43k-line RAG monolith; duplicate routes |
-| Reliability | C+ | In-memory sessions/rate-limits lost on restart |
+| Reliability | B- | SQLite-backed session invalidation/rate-limits; single-GPU inference queue |
 
 ---
 

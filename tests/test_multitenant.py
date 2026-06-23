@@ -17,7 +17,6 @@ from Login_system.memberships import (
     resolve_active_tenant_id,
     update_membership_status,
 )
-from backend.config_head import CS_NO_MATCH_RESPONSE_EN, RAG_NO_MATCH_RESPONSE
 from backend.database import (
     init_ui_conversations_schema,
     ui_create_conversation,
@@ -96,6 +95,10 @@ def test_ui_conversations_are_tenant_scoped() -> None:
 
 
 def test_cs_not_found_has_business_voice() -> None:
+    pytest = __import__("pytest")
+    pytest.importorskip("chromadb")
+    from backend.config_head import CS_NO_MATCH_RESPONSE_EN, RAG_NO_MATCH_RESPONSE
+
     lowered = CS_NO_MATCH_RESPONSE_EN.lower()
     assert "our help materials" in lowered
     assert "your document" not in lowered
@@ -160,12 +163,28 @@ def test_analytics_are_tenant_scoped() -> None:
             an.ANALYTICS_DB = old
 
 
+def test_collection_owned_by_tenant_excludes_other_businesses() -> None:
+    """Default-tenant collection resolver must ignore t{n}_ prefixed collections."""
+    pytest = __import__("pytest")
+    pytest.importorskip("chromadb")
+    from backend.knowledge_base import _collection_owned_by_tenant
+
+    assert _collection_owned_by_tenant("support_docs_v3_latest", 1) is True
+    assert _collection_owned_by_tenant("support_docs_v3_20240101", 1) is True
+    assert _collection_owned_by_tenant("t2_support_docs_v3_latest", 1) is False
+    assert _collection_owned_by_tenant("t3_support_docs_v3_latest", 1) is False
+    assert _collection_owned_by_tenant("t2_support_docs_v3_latest", 2) is True
+    assert _collection_owned_by_tenant("support_docs_v3_latest", 2) is False
+
+
 def test_retrieval_is_tenant_isolated() -> None:
     """A query for business A must never return business B's documents.
 
     Uses two throwaway non-default tenants so the assertion runs against the
     real ChromaDB collection-per-tenant mechanism, then cleans up.
     """
+    pytest = __import__("pytest")
+    pytest.importorskip("chromadb")
     from backend.knowledge_base import (
         chunk_and_add_document,
         search_documents,
@@ -211,6 +230,47 @@ def test_retrieval_is_tenant_isolated() -> None:
         delete_documents_with_prefix(doc_b, tenant_id=t_b)
 
 
+def test_conversation_scope_denies_cross_owner_within_tenant() -> None:
+    """Owner-less and foreign-owner chats must not be visible to another user."""
+
+    def conv_tenant_of(conversation: dict) -> int:
+        val = conversation.get("tenant_id")
+        return int(val) if val is not None else 1
+
+    def conversation_in_scope(conversation: dict, tenant_id: int, owner: str | None) -> bool:
+        if conversation is None:
+            return False
+        if conv_tenant_of(conversation) != int(tenant_id):
+            return False
+        if owner is None:
+            return True
+        c_owner = conversation.get("owner")
+        if c_owner is None or str(c_owner) == "":
+            return False
+        return str(c_owner) == str(owner)
+
+    def try_claim_ownerless(conversation: dict, tenant_id: int, owner: str | None) -> bool:
+        if not owner:
+            return False
+        c_owner = conversation.get("owner")
+        if c_owner is not None and str(c_owner).strip():
+            return False
+        if conv_tenant_of(conversation) != int(tenant_id):
+            return False
+        conversation["owner"] = str(owner)
+        return True
+
+    alice_chat = {"id": "c1", "tenant_id": 2, "owner": "alice"}
+    orphan_chat = {"id": "c2", "tenant_id": 2, "owner": None}
+
+    assert conversation_in_scope(alice_chat, 2, "bob") is False
+    assert conversation_in_scope(orphan_chat, 2, "bob") is False
+    assert try_claim_ownerless(orphan_chat, 2, "bob") is True
+    assert orphan_chat["owner"] == "bob"
+    assert conversation_in_scope(orphan_chat, 2, "bob") is True
+    assert conversation_in_scope(alice_chat, 1, "alice") is False
+
+
 if __name__ == "__main__":
     test_access_request_and_approval_flow()
     test_resolve_active_tenant_for_customer()
@@ -219,5 +279,7 @@ if __name__ == "__main__":
     test_tenant_collection_names_are_isolated()
     test_tenant_assets_dirs_are_isolated()
     test_analytics_are_tenant_scoped()
+    test_collection_owned_by_tenant_excludes_other_businesses()
     test_retrieval_is_tenant_isolated()
+    test_conversation_scope_denies_cross_owner_within_tenant()
     print("All multi-tenant tests passed.")

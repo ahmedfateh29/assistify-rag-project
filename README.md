@@ -29,6 +29,7 @@ Install before you start:
 
 - **Windows 10/11**
 - **[Miniconda](https://docs.conda.io/en/latest/miniconda.html)** (or Anaconda)
+- **[Node.js](https://nodejs.org/)** (LTS) — required to build the React UI (`assistify-ui-design/`)
 - **[Git](https://git-scm.com/download/win)** (optional, for clones)
 - **NVIDIA GPU + driver** (recommended; CPU-only is slower)
 - **[Ollama for Windows](https://ollama.com)** — must be running while you use the app
@@ -144,6 +145,8 @@ Passwords are stored as bcrypt hashes (see `Login_system/init_users_db.py`).
 
 Use **one PowerShell window** for the launcher. Always run from the **project root** (see `docs/CANONICAL_PROJECT_PATH.md` if you moved the folder).
 
+The launcher **builds the React UI** (`assistify-ui-design/out/`) and serves it as the **only** web UI at `/frontend/*` on port **7001**. Legacy Jinja/HTML pages have been removed.
+
 ### 2.1 Before you start (checklist)
 
 1. **Conda env** — `conda activate assistify_main`
@@ -218,8 +221,8 @@ Pass extra flags through the one-liner, e.g. `python start_main_servers.py --no-
 
 | URL | Purpose |
 |-----|---------|
-| http://127.0.0.1:7001/login | **Main UI — start here** |
-| http://127.0.0.1:7001/frontend/index.html | Chat UI (after login) |
+| http://127.0.0.1:7001/login | **Main UI — start here** (redirects to React `/frontend/login/`) |
+| http://127.0.0.1:7001/frontend/ | Chat UI (after login) |
 | http://127.0.0.1:7000/health | RAG health check |
 | http://127.0.0.1:5002/health | Piper TTS health (optional) |
 | http://127.0.0.1:8010/internal/gpu-status | LLM shim status (if using port 8010) |
@@ -327,12 +330,13 @@ Get-ChildItem tests\test_*.py | Where-Object { $_.Name -ne "test_arabic_tts.py" 
 
 ```
 assistify-rag-project-final-rag-system/
+├── assistify-ui-design/     # React/Next.js UI (static export → out/)
 ├── backend/                 # RAG server, knowledge base, Ollama LLM shim
-├── Login_system/            # Login server, users.db
-├── frontend/                # Static HTML/JS (chat UI)
+├── Login_system/            # Login server, users.db (API + serves React /frontend/)
 ├── tts_service/             # Piper TTS microservice (port 5002)
 ├── scripts/
 │   ├── project_start_server.py   # Multi-server launcher (used by start_main_servers.py)
+│   ├── react_ui_build.py         # npm install + build for React UI
 │   └── preflight_check.py        # Pre-start sanity check
 ├── start_main_servers.py         # Recommended one-command project start
 ├── logs/                    # Per-service logs (created at runtime)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -28,7 +29,7 @@ except Exception:
     WHISPER_MODEL_SIZE = "small.en"
     WHISPER_DEVICE = "cpu"
     WHISPER_COMPUTE_TYPE = "int8"
-    WHISPER_BEAM_SIZE = 1
+    WHISPER_BEAM_SIZE = 5
     WHISPER_VAD_FILTER = True
 
 logger = logging.getLogger("voice_audio.stt")
@@ -106,6 +107,72 @@ def _arabic_stt_unclear(text: str, segments: list[Any] | None = None) -> bool:
         return True
     if avg_logprob and avg_logprob < -1.2 and len(arabic_words) <= 2:
         return True
+    return False
+
+
+def _english_stt_unclear(text: str, segments: list[Any] | None = None) -> bool:
+    """Return True when an English-mode STT transcript looks like noise or hallucination.
+
+    Conservative heuristics: low decoder confidence, repeated filler sentences,
+    elongated single-character tokens, or very low lexical diversity.
+  """
+    value = re.sub(r"\s+", " ", str(text or "").strip())
+    if not value:
+        return True
+
+    avg_logprobs: list[float] = []
+    no_speech_probs: list[float] = []
+    for segment in segments or []:
+        raw_logprob = getattr(segment, "avg_logprob", None)
+        if raw_logprob is not None:
+            try:
+                avg_logprobs.append(float(raw_logprob))
+            except (TypeError, ValueError):
+                pass
+        raw_no_speech = getattr(segment, "no_speech_prob", None)
+        if raw_no_speech is not None:
+            try:
+                no_speech_probs.append(float(raw_no_speech))
+            except (TypeError, ValueError):
+                pass
+
+    avg_logprob = (sum(avg_logprobs) / len(avg_logprobs)) if avg_logprobs else 0.0
+    avg_no_speech = (sum(no_speech_probs) / len(no_speech_probs)) if no_speech_probs else 0.0
+
+    if avg_no_speech and avg_no_speech > 0.7:
+        return True
+    if avg_logprobs and avg_logprob < -1.1:
+        return True
+
+    # Repeated-sentence hallucination (e.g. "I think it's a good idea." x3)
+    sentences = [s.strip().lower() for s in re.split(r"[.!?]+", value) if s.strip()]
+    if len(sentences) >= 3:
+        counts = Counter(sentences)
+        if counts.most_common(1)[0][1] >= 3:
+            return True
+        unique_ratio = len(set(sentences)) / len(sentences)
+        if unique_ratio < 0.35:
+            return True
+
+    # Elongated token (e.g. "Hiiiii...")
+    if re.search(r"(.)\1{9,}", value, re.IGNORECASE):
+        return True
+
+    # Low lexical diversity on longer transcripts (e.g. "awkward person" loop)
+    words = re.findall(r"[A-Za-z']+", value.lower())
+    if len(words) >= 8:
+        unique_words = set(words)
+        if len(unique_words) / len(words) < 0.35:
+            return True
+
+    # Repeated phrase loops (e.g. "awkward person" bigram x4)
+    if len(words) >= 10:
+        bigrams = list(zip(words, words[1:]))
+        if bigrams:
+            bigram_counts = Counter(bigrams)
+            if bigram_counts.most_common(1)[0][1] >= 3:
+                return True
+
     return False
 
 

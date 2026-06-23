@@ -13,10 +13,17 @@ print()
 
 # Navigate from tests/ directory to project root
 project_root = Path(__file__).parent.parent
-templates_dir = project_root / "Login_system" / "templates"
-html_files = list(templates_dir.glob("*.html"))
+react_dirs = [
+    project_root / "assistify-ui-design" / "app",
+    project_root / "assistify-ui-design" / "src",
+]
+html_files = []
+for d in react_dirs:
+    if d.is_dir():
+        html_files.extend(d.rglob("*.tsx"))
+        html_files.extend(d.rglob("*.ts"))
 
-print(f"Found {len(html_files)} HTML templates to audit\n")
+print(f"Found {len(html_files)} React source files to audit\n")
 
 # OWASP Top 10 Checks
 issues = []
@@ -46,21 +53,13 @@ def check_xss_protection(content, filename):
 def check_csrf_protection(content, filename):
     """A01:2021 - Broken Access Control"""
     problems = []
-    
-    # Check forms have CSRF tokens
-    has_form = bool(re.search(r'<form', content, re.IGNORECASE))
-    has_csrf = bool(re.search(r'csrf_token|x-csrf-token', content, re.IGNORECASE))
-    
-    if has_form and not has_csrf and filename not in ['Login.html', 'register.html']:
-        problems.append(f"  🚨 CRITICAL: Form without CSRF protection")
-    
-    # Check fetch/axios includes CSRF token
-    has_fetch = bool(re.search(r'fetch\(|axios\.|\.post\(|\.put\(|\.delete\(', content))
-    has_csrf_header = bool(re.search(r'X-CSRF-Token|csrf_token', content))
-    
-    if has_fetch and not has_csrf_header:
-        problems.append(f"  ⚠️  AJAX requests may lack CSRF tokens")
-    
+
+    has_csrf_component = "CsrfForm" in content or "apiClient" in content or "X-CSRF-Token" in content
+    has_form_action = bool(re.search(r'action="/', content))
+
+    if has_form_action and not has_csrf_component and "page.tsx" in filename:
+        problems.append("  ⚠️  Form POST without CsrfForm or apiClient")
+
     return problems
 
 def check_auth_security(content, filename):
@@ -166,7 +165,7 @@ def check_ssrf_vulnerabilities(content, filename):
 
 # Audit all files
 for html_file in sorted(html_files):
-    filename = html_file.name
+    filename = html_file.relative_to(project_root).as_posix()
     print(f"📄 {filename}")
     
     try:

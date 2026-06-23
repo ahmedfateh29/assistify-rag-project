@@ -52,6 +52,7 @@ from scripts.ollama_bootstrap import (  # noqa: E402
     print_ollama_failure_hints,
     resolve_ollama_exe,
 )
+from scripts.react_ui_build import ensure_react_ui_built  # noqa: E402
 from scripts.launch_windows.write_launch_scripts import (  # noqa: E402
     LAUNCH_DIR,
     write_service_bats,
@@ -264,6 +265,9 @@ async def run_split_launcher(args) -> int:
     apply_cli_overrides(args)
     ensure_sqlite3_or_exit()
 
+    if args.ui_build_only:
+        return 0 if ensure_react_ui_built(skip=args.skip_ui_build) else 1
+
     python_exe = _resolve_python_exe()
     print(f"[COORDINATOR] Repo root : {REPO_ROOT}")
     print(f"[COORDINATOR] Python    : {python_exe}")
@@ -308,6 +312,19 @@ async def run_split_launcher(args) -> int:
 
     all_ok = True
     failures: list[str] = []
+
+    ui_build_ok = True
+    if not args.no_login:
+        print()
+        print("[COORDINATOR] Building React UI for /frontend/ ...")
+        ui_build_ok = ensure_react_ui_built(skip=args.skip_ui_build)
+        if not ui_build_ok:
+            print("[COORDINATOR] React UI build failed — Login will be skipped.")
+            failures.append("React UI build")
+            all_ok = False
+    elif args.skip_ui_build:
+        ensure_react_ui_built(skip=True)
+
     ollama_ok = args.no_ollama or ollama_port_ready()
 
     if not args.no_ollama:
@@ -403,6 +420,9 @@ async def run_split_launcher(args) -> int:
         if skipped:
             print(f"[SKIPPED] {display}")
             continue
+        if display == "Login" and not ui_build_ok:
+            print(f"[SKIPPED] {display} — React UI build failed")
+            continue
         if display == "RAG" and not ollama_ok and not args.continue_without_ollama:
             print("[SKIPPED] RAG — Ollama is not ready (use --continue-without-ollama to force)")
             failures.append("RAG (blocked: Ollama)")
@@ -435,10 +455,12 @@ async def run_split_launcher(args) -> int:
         print("  Check the matching Assistify * windows for error output.")
     print("=" * 72)
     print(f"  Open: http://127.0.0.1:{SERVICES[2]['port']}/login")
+    print(f"  Chat UI: http://127.0.0.1:{SERVICES[2]['port']}/frontend/  (after login)")
     print("  Dev login: admin / admin  or  superadmin / superadmin")
     if all_ok:
         print()
         print("  Running stack verification...")
+        print("  Login window may show HTTP 401 on /api/my-profile during verification — expected when logged out.")
         try:
             from scripts.verify_stack import run_checks
 

@@ -18,6 +18,7 @@ from backend.voice_audio.deps import VoiceWebSocketDeps
 from backend.voice_audio.tts.streaming import cancel_active_ws_tts
 from backend.voice_audio.ws.audio_pipeline import run_auto_transcribe, send_stt_failed
 from backend.voice_audio.ws.capture import ConversationCaptureWebSocket
+from Login_system.session_validation import load_and_validate_session_token
 
 logger = logging.getLogger("voice_audio.ws.handler")
 
@@ -27,7 +28,7 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
         await websocket.accept()
         connection_id = f"conn_{uuid.uuid4().hex[:8]}"
         logger.info(f"New websocket connection {connection_id}")
-        # Register for KB broadcast notifications
+        # Register for KB broadcast notifications (tenant bound after auth below).
         deps.active_ws_connections[connection_id] = websocket
 
         # Create cancel event for barge-in support
@@ -38,9 +39,9 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
 
         user = None
         try:
-            token = websocket.cookies.get(SESSION_COOKIE)
-            if token:
-                user = serializer.loads(token)
+            token = websocket.cookies.get(deps.session_cookie)
+            if token and deps.serializer is not None:
+                user, _err = load_and_validate_session_token(deps.serializer, token)
         except Exception:
             user = None
 
@@ -53,6 +54,8 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
         ws_tenant_id = deps.resolve_request_tenant(user)
         ws_owner = deps.coerce_owner(user)
         deps.set_request_tenant_id(ws_tenant_id)
+        if deps.active_ws_tenants is not None:
+            deps.active_ws_tenants[connection_id] = ws_tenant_id
         logger.info("Websocket %s bound to tenant=%s owner=%s", connection_id, ws_tenant_id, ws_owner)
 
         # Buffer for accumulating audio chunks
@@ -341,11 +344,16 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
             except Exception:
                 pass
         finally:
-            # Cleanup interrupt event and write lock
-            if connection_id in state.interrupt_events:
-                del state.interrupt_events[connection_id]
-            state.ws_write_locks.pop(connection_id, None)
-            # Cancel dangling voice task on disconnect
+            # Stop in-flight TTS/LLM work before tearing down per-connection state.
+            cancel_evt = state.interrupt_events.get(connection_id)
+            if cancel_evt is not None and not cancel_evt.is_set():
+                cancel_evt.set()
+            cancel_active_ws_tts(connection_id, "ws_disconnect")
+            ws_tts_task = state.ws_tts_active_tasks.pop(connection_id, None)
+            if ws_tts_task and not ws_tts_task.done():
+                ws_tts_task.cancel()
+            state.ws_tts_active_response_ids.pop(connection_id, None)
+
             if memory_guard.active_voice_task and not memory_guard.active_voice_task.done() and memory_guard.active_voice_conn_id == connection_id:
                 logger.info(f"Cancelling dangling voice task for {connection_id}")
                 memory_guard.active_voice_task.cancel()
@@ -353,13 +361,26 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
                     await memory_guard.active_voice_task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+            if deps.on_ws_disconnect is not None:
+                try:
+                    deps.on_ws_disconnect(connection_id)
+                except Exception:
+                    logger.exception("on_ws_disconnect failed for %s", connection_id)
+
+            if connection_id in state.interrupt_events:
+                del state.interrupt_events[connection_id]
+            state.ws_write_locks.pop(connection_id, None)
             # Clean up conversation memory for this connection
-            if connection_id in deps.conversation_history:
+            if deps.conversation_history is not None and connection_id in deps.conversation_history:
                 del deps.conversation_history[connection_id]
-            if connection_id in deps.conversation_timestamps:
+            if deps.conversation_timestamps is not None and connection_id in deps.conversation_timestamps:
                 del deps.conversation_timestamps[connection_id]
             # Deregister from KB broadcast pool
-            deps.active_ws_connections.pop(connection_id, None)
+            if deps.active_ws_connections is not None:
+                deps.active_ws_connections.pop(connection_id, None)
+            if deps.active_ws_tenants is not None:
+                deps.active_ws_tenants.pop(connection_id, None)
             mem_final = deps.get_memory_snapshot()
             if memory_guard.sessions_blocked:
                 if (

@@ -478,13 +478,13 @@ CREATE TABLE users (
 );
 ```
 
-#### sessions (stored in memory)
+#### sessions (ephemeral security state in SQLite)
 ```python
-user_sessions = defaultdict(list)  # user_id -> list of session info
-invalidated_sessions = set()       # Set of revoked session IDs
+# Login_system/persistent_state.py — SQLite tables in users.db (WAL mode):
+# invalidated_sessions, user_sessions, rate_limit_buckets, account_lockouts
 ```
 
-**Note:** Session not in database, stored in RAM. Will reset when server restart. In production should use Redis.
+**Note:** Signed session cookies are stateless; revocation, concurrent-session tracking, rate limits, and lockouts persist across restarts via SQLite. For multi-node production, Redis remains recommended.
 
 ### 3.2 Conversations Database (conversations.db)
 
@@ -1490,10 +1490,10 @@ python login_server.py
    - Cause: Buffer overflow
    - Workaround: Pause between sentences
 
-2. **Session lost on server restart**
-   - Cause: In-memory session storage
-   - Impact: All user logged out
-   - Solution: Need implement Redis
+2. **Session invalidation survives restart; signed cookies do not require server-side session store**
+   - Ephemeral security state (invalidated sessions, rate limits, lockouts) is SQLite-backed via `Login_system/persistent_state.py`
+   - Impact: Users stay logged in across restarts unless explicitly invalidated
+   - For multi-node production: Redis still recommended for shared revocation state
 
 3. **PDF parsing fail** for scanned PDF
    - Cause: PyPDF2 only extract text layer

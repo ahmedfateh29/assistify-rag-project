@@ -13,6 +13,7 @@ from backend.voice_audio import memory_guard, state
 from backend.voice_audio.config import XTTS_LANGUAGE
 from backend.voice_audio.stt.transcribe import (
     _arabic_stt_unclear,
+    _english_stt_unclear,
     _looks_like_english_stt_garbage_for_arabic,
     run_transcription,
 )
@@ -212,6 +213,16 @@ async def run_auto_transcribe(
                     conn_id,
                     "empty_transcript",
                     "Couldn't understand that. Please speak again.",
+                )
+                client_notified = True
+                return
+
+            if not arabic_voice_mode and _english_stt_unclear(full_text, result.segments):
+                await send_stt_failed(
+                    ws,
+                    conn_id,
+                    "unclear_speech",
+                    "Couldn't understand that clearly. Please try again.",
                 )
                 client_notified = True
                 return

@@ -189,3 +189,20 @@ tools/testing/_legacy_xtts/
 start_xtts_service.bat.disabled
 non_functional/old_python/
 # <<< cleanup_repo.py
+
+# =========================
+
+# Dependencies
+
+# =========================
+
+node_modules/
+
+# =========================
+
+# Next.js build outputs
+
+# =========================
+
+.next/
+out/

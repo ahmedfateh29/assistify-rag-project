@@ -340,17 +340,15 @@ def delete_documents_by_source_identity(
             fallback = get_or_create_collection(allow_empty=True, tenant_id=tenant_id)
             collections = [fallback] if fallback else []
 
-        # Restrict to the tenant's own collections when scoped.
-        if tenant_id is not None:
-            base = tenant_base_name(tenant_id)
-
-            def _owned(c) -> bool:
-                nm = c if isinstance(c, str) else getattr(c, "name", None)
-                if not nm:
-                    return False
-                return nm == base or nm.startswith(base + "_")
-
-            collections = [c for c in collections if _owned(c)]
+        # Always restrict to collections owned by the effective tenant.
+        effective_tid = _effective_tenant_id(tenant_id)
+        collections = [
+            c for c in collections
+            if _collection_owned_by_tenant(
+                c if isinstance(c, str) else getattr(c, "name", "") or "",
+                effective_tid,
+            )
+        ]
 
         for col in collections:
             if not col:
@@ -413,6 +411,40 @@ def tenant_base_name(tenant_id) -> str:
         except (TypeError, ValueError):
             tid = 1
         return "support_docs_v3" if tid == 1 else f"t{tid}_support_docs_v3"
+
+
+_OTHER_TENANT_PREFIX_RE = re.compile(r"^t\d+_")
+
+
+def _effective_tenant_id(tenant_id) -> int:
+    try:
+        from config import DEFAULT_TENANT_ID
+        default_tid = int(DEFAULT_TENANT_ID)
+    except Exception:
+        default_tid = 1
+    if tenant_id is None:
+        return default_tid
+    try:
+        return int(tenant_id)
+    except (TypeError, ValueError):
+        return default_tid
+
+
+def _collection_owned_by_tenant(col_name: str, tenant_id) -> bool:
+    """Return True when a Chroma collection name belongs to the given tenant.
+
+    Default tenant (1) collections must NOT match the ``t{n}_`` prefix used by
+    other businesses — that was the root cause of cross-tenant vector leakage.
+    """
+    if not col_name:
+        return False
+    tid = _effective_tenant_id(tenant_id)
+    base = tenant_base_name(tid)
+    if tid == 1:
+        if _OTHER_TENANT_PREFIX_RE.match(col_name):
+            return False
+        return col_name == base or col_name.startswith(base + "_")
+    return col_name == base or col_name.startswith(base + "_")
 
 
 def get_or_create_collection(allow_empty: bool = False, tenant_id=None):
@@ -478,10 +510,17 @@ def get_or_create_collection(allow_empty: bool = False, tenant_id=None):
             except Exception as pref_err:
                 logger.warning(f"Preferred collection '{preferred}' unavailable: {pref_err}")
 
-        # Dynamically load the newest v3 collection
+        # Dynamically load the newest default-tenant v3 collection (never t{n}_ prefixed).
         collections = client.list_collections()
         if collections:
-            candidate_names = sorted([c.name for c in collections if "support_docs" in c.name], reverse=True)
+            candidate_names = sorted(
+                [
+                    c.name for c in collections
+                    if "support_docs" in c.name
+                    and _collection_owned_by_tenant(c.name, 1)
+                ],
+                reverse=True,
+            )
             for col_name in candidate_names:
                 try:
                     col = client.get_collection(name=col_name)
@@ -948,7 +987,7 @@ def chunk_and_add_document(
                     "title": "",
                     "chapter": "",
                 })
-        elif len(flat_text) >= 120:
+        elif len(flat_text) >= (40 if total_doc_words <= 120 else 120):
             structured_units.append({
                 "text": flat_text,
                 "page": None,
@@ -1049,7 +1088,11 @@ def chunk_and_add_document(
                 curr_chapter = str(unit.get("chapter") or curr_chapter)
                 curr_title = str(unit.get("title") or unit.get("heading") or curr_title)
 
-    if curr_words and len(curr_words) >= max(60, TARGET_MIN_WORDS // 3):
+    min_emit_words = max(60, TARGET_MIN_WORDS // 3)
+    file_ext = str((metadata or {}).get("file_ext") or "").lower()
+    if file_ext == "txt" or total_doc_words <= TARGET_MIN_WORDS:
+        min_emit_words = 3
+    if curr_words and len(curr_words) >= min_emit_words:
         _emit_current_chunk()
 
     for record in chunk_records:

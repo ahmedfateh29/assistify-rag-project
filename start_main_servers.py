@@ -20,6 +20,11 @@ import sys
 import subprocess
 from pathlib import Path
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from scripts.react_ui_build import ensure_react_ui_built  # noqa: E402
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SPLIT_SCRIPT = PROJECT_ROOT / "scripts" / "project_start_split.py"
@@ -84,12 +89,15 @@ def print_startup_banner(*, single_console: bool, status_only: bool) -> None:
     print("  Piper TTS   -> http://127.0.0.1:5002  (skipped if --no-piper)")
     print("  LLM shim    -> http://127.0.0.1:8010")
     print("  RAG server  -> http://127.0.0.1:7000")
-    print("  Login UI    -> http://127.0.0.1:7001")
+    print("  Login + UI  -> http://127.0.0.1:7001  (React app at /frontend/)")
+    print("  Chat UI     -> http://127.0.0.1:7001/frontend/  (after login)")
     if not status_only and not single_console:
         print()
         print("Open when Ready: http://127.0.0.1:7001/login")
+        print("  Chat UI:     http://127.0.0.1:7001/frontend/")
         print("  Dev login: admin / admin  or  superadmin / superadmin")
         print()
+        print("Fast backend-only restart: python start_main_servers.py --skip-ui-build")
         print("If Ollama bind errors: python start_main_servers.py --restart-ollama")
         print("After startup:           python scripts/verify_stack.py")
         print()
@@ -101,11 +109,19 @@ def print_startup_banner(*, single_console: bool, status_only: bool) -> None:
     print("------------------------------------")
 
 
-def run_via_conda(target: Path, extra_args: list[str]) -> int:
+def _child_args(extra_args: list[str], *, ui_built: bool) -> list[str]:
+    """Forward CLI args to the coordinator; avoid duplicate UI builds after start_main built."""
+    child = list(extra_args)
+    if ui_built and "--skip-ui-build" not in child and "--ui-build-only" not in child:
+        child.append("--skip-ui-build")
+    return child
+
+
+def run_via_conda(target: Path, extra_args: list[str], *, ui_built: bool = False) -> int:
     print(f"[LAUNCHER] Falling back to 'conda run -n {CONDA_ENV_NAME}'...")
     cmd = [
         "conda", "run", "--no-capture-output", "-n", CONDA_ENV_NAME,
-        "python", str(target), *DEFAULT_ARGS, *extra_args,
+        "python", str(target), *DEFAULT_ARGS, *_child_args(extra_args, ui_built=ui_built),
     ]
     try:
         return subprocess.call(cmd, cwd=str(PROJECT_ROOT))
@@ -133,9 +149,24 @@ def main() -> int:
 
     print_startup_banner(single_console=single_console, status_only=status_only)
 
+    skip_ui_build = "--skip-ui-build" in extra_args
+    ui_build_only = "--ui-build-only" in extra_args
+    ui_built = False
+
+    if ui_build_only:
+        ok = ensure_react_ui_built(skip=skip_ui_build)
+        return 0 if ok else 1
+
+    if not status_only:
+        print("[LAUNCHER] Building React UI for /frontend/ ...")
+        if not ensure_react_ui_built(skip=skip_ui_build):
+            print("[LAUNCHER] React UI build failed — aborting startup.", file=sys.stderr)
+            return 1
+        ui_built = not skip_ui_build
+
     env_python = find_env_python()
     if env_python is None:
-        return run_via_conda(target, extra_args)
+        return run_via_conda(target, extra_args, ui_built=ui_built)
 
     print(f"[LAUNCHER] Repo root : {PROJECT_ROOT}")
     print(f"[LAUNCHER] Conda env : {CONDA_ENV_NAME}")
@@ -143,7 +174,7 @@ def main() -> int:
     print(f"[LAUNCHER] Script    : {target.name}")
     print(f"[LAUNCHER] KMP_DUPLICATE_LIB_OK = {os.environ['KMP_DUPLICATE_LIB_OK']}")
 
-    cmd = [str(env_python), str(target), *DEFAULT_ARGS, *extra_args]
+    cmd = [str(env_python), str(target), *DEFAULT_ARGS, *_child_args(extra_args, ui_built=ui_built)]
     print(f"[LAUNCHER] Running   : {' '.join(cmd)}")
     print("------------------------------------")
 

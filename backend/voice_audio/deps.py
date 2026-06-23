@@ -28,6 +28,8 @@ class VoiceWebSocketDeps:
     get_stable_memory_snapshot: Callable = None
     on_ws_connect: Optional[Callable] = None
     on_ws_disconnect: Optional[Callable] = None
+    on_ws_disconnect: Optional[Callable[[str], None]] = None
     conversation_history: Any = None
     conversation_timestamps: Any = None
     active_ws_connections: Any = None
+    active_ws_tenants: Any = None

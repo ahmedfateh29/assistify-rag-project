@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from pathlib import Path
 from collections import defaultdict, Counter
+from contextlib import contextmanager
 from threading import RLock
 
 print("RUNNING PATCHED VERSION")
@@ -317,6 +318,7 @@ from backend.voice_audio.ws.handler import create_rag_ws_handler
 from backend.voice_audio.deps import VoiceWebSocketDeps
 from backend.rag_middleware import rag_allowed_origins, verify_csrf
 from config import BASE_URL, assert_production_config
+from Login_system.session_validation import load_and_validate_session_token
 from backend.voice_audio.tts.streaming import (
     cancel_active_ws_tts,
     tts_progressive_response,
@@ -445,6 +447,22 @@ _current_user_query: "_contextvars.ContextVar[str]" = _contextvars.ContextVar(
 )
 
 
+def _user_has_explicit_tenant(user) -> bool:
+    """True when the session carries an explicit tenant id (> 0)."""
+    if not user:
+        return False
+    for key in ("active_tenant_id", "tenant_id"):
+        val = user.get(key)
+        if val is None:
+            continue
+        try:
+            if int(val) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def resolve_request_tenant(user) -> int:
     """Resolve the effective tenant id for a request from the session cookie.
 
@@ -469,19 +487,14 @@ def resolve_request_tenant(user) -> int:
 
 
 def require_request_tenant(user) -> int:
-    """Like resolve_request_tenant but rejects a logged-in customer that has no
-    active business selected, so a customer can never silently fall back to
-    another tenant's knowledge base.
-    """
-    tid = resolve_request_tenant(user)
+    """Like resolve_request_tenant but rejects callers with no explicit tenant
+    so they can never silently fall back to another business's data."""
     role = str((user or {}).get("role") or "").lower()
-    if role == "customer":
-        has_tenant = any(
-            (user or {}).get(k) is not None for k in ("active_tenant_id", "tenant_id")
-        )
-        if not has_tenant:
+    if role in ("customer", "admin", "master_admin", "employee") and not _user_has_explicit_tenant(user):
+        if role == "customer":
             raise HTTPException(status_code=403, detail="No active business selected.")
-    return tid
+        raise HTTPException(status_code=403, detail="No business assigned to this account.")
+    return resolve_request_tenant(user)
 
 
 class _TenantScope:
@@ -580,40 +593,61 @@ def _empty_conversation_store() -> dict:
     return {"conversations": []}
 
 
+def _ensure_conversation_store_file_unlocked() -> None:
+    if not CONVERSATIONS_FILE.exists():
+        CONVERSATIONS_FILE.write_text(
+            json.dumps(_empty_conversation_store(), indent=2),
+            encoding="utf-8",
+        )
+
+
 def _ensure_conversation_store_file() -> None:
     with _conversation_store_lock:
-        if not CONVERSATIONS_FILE.exists():
-            CONVERSATIONS_FILE.write_text(
-                json.dumps(_empty_conversation_store(), indent=2),
-                encoding="utf-8",
-            )
+        _ensure_conversation_store_file_unlocked()
+
+
+def _load_conversation_store_unlocked() -> dict:
+    _ensure_conversation_store_file_unlocked()
+    try:
+        data = json.loads(CONVERSATIONS_FILE.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        logger.exception("[CONV] failed to read conversation store; using empty store")
+        data = _empty_conversation_store()
+    if not isinstance(data, dict):
+        data = _empty_conversation_store()
+    conversations = data.get("conversations")
+    if not isinstance(conversations, list):
+        data["conversations"] = []
+    return data
+
+
+def _save_conversation_store_unlocked(data: dict) -> None:
+    _ensure_conversation_store_file_unlocked()
+    tmp_path = CONVERSATIONS_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_path.replace(CONVERSATIONS_FILE)
+
+
+@contextmanager
+def _mutating_conversation_store():
+    """Hold the store lock across read-modify-write to prevent lost updates."""
+    with _conversation_store_lock:
+        data = _load_conversation_store_unlocked()
+        yield data
+        _save_conversation_store_unlocked(data)
 
 
 def _load_conversation_store() -> dict:
     with _conversation_store_lock:
-        _ensure_conversation_store_file()
-        try:
-            data = json.loads(CONVERSATIONS_FILE.read_text(encoding="utf-8") or "{}")
-        except Exception:
-            logger.exception("[CONV] failed to read conversation store; using empty store")
-            data = _empty_conversation_store()
-        if not isinstance(data, dict):
-            data = _empty_conversation_store()
-        conversations = data.get("conversations")
-        if not isinstance(conversations, list):
-            data["conversations"] = []
-        return data
+        return _load_conversation_store_unlocked()
 
 
 def _save_conversation_store(data: dict) -> None:
     with _conversation_store_lock:
-        _ensure_conversation_store_file()
-        tmp_path = CONVERSATIONS_FILE.with_suffix(".json.tmp")
-        tmp_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp_path.replace(CONVERSATIONS_FILE)
+        _save_conversation_store_unlocked(data)
 
 
 def _find_conversation(data: dict, conversation_id: str) -> dict | None:
@@ -665,8 +699,23 @@ def _conversation_in_scope(conversation: dict, tenant_id: int, owner: str | None
         return True
     c_owner = conversation.get("owner")
     if c_owner is None or str(c_owner) == "":
-        return True  # legacy/unclaimed row in this tenant
+        # Legacy unclaimed rows: deny when caller has an owner identity so one
+        # user cannot read another user's orphaned chat within the same tenant.
+        return owner is None
     return str(c_owner) == str(owner)
+
+
+def _try_claim_ownerless_conversation(conversation: dict, tenant_id: int, owner: str | None) -> bool:
+    """Claim a legacy owner-less conversation for the first accessor."""
+    if not isinstance(conversation, dict) or not owner:
+        return False
+    c_owner = conversation.get("owner")
+    if c_owner is not None and str(c_owner).strip():
+        return False
+    if _conv_tenant_of(conversation) != int(tenant_id):
+        return False
+    conversation["owner"] = str(owner)
+    return True
 
 
 def _stamp_conversation_scope(conversation: dict, tenant_id: int, owner: str | None) -> None:
@@ -692,8 +741,12 @@ def _conversation_title_from_text(text: str) -> str:
     return title[:80]
 
 
-def create_conversation(title: str | None = None, tenant_id=None, owner: str | None = None) -> dict:
-    data = _load_conversation_store()
+def _create_conversation_unlocked(
+    data: dict,
+    title: str | None = None,
+    tenant_id=None,
+    owner: str | None = None,
+) -> dict:
     now = _utc_now_iso()
     try:
         tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
@@ -709,9 +762,13 @@ def create_conversation(title: str | None = None, tenant_id=None, owner: str | N
         "updated_at": now,
     }
     data["conversations"].insert(0, conversation)
-    _save_conversation_store(data)
     logger.info("[CONV] created id=%s tenant=%s owner=%s", conversation["id"], tid, owner)
     return conversation
+
+
+def create_conversation(title: str | None = None, tenant_id=None, owner: str | None = None) -> dict:
+    with _mutating_conversation_store() as data:
+        return _create_conversation_unlocked(data, title=title, tenant_id=tenant_id, owner=owner)
 
 
 def get_or_create_conversation(conversation_id: str | None = None, tenant_id=None, owner: str | None = None) -> dict:
@@ -719,20 +776,24 @@ def get_or_create_conversation(conversation_id: str | None = None, tenant_id=Non
         tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
     except (TypeError, ValueError):
         tid = DEFAULT_TENANT_ID
-    data = _load_conversation_store()
-    if conversation_id:
-        existing = _find_conversation(data, conversation_id)
-        if existing is not None:
-            if not _conversation_in_scope(existing, tid, owner):
-                # A conversation id from a different tenant/owner must never be
-                # reused — start a fresh one for this caller instead.
-                logger.warning("[CONV] id=%s out of scope for tenant=%s owner=%s; creating new", conversation_id, tid, owner)
-                return create_conversation(tenant_id=tid, owner=owner)
-            _stamp_conversation_scope(existing, tid, owner)
-            _save_conversation_store(data)
-            logger.info("[CONV] loaded id=%s", conversation_id)
-            return existing
-    return create_conversation(tenant_id=tid, owner=owner)
+    with _mutating_conversation_store() as data:
+        if conversation_id:
+            existing = _find_conversation(data, conversation_id)
+            if existing is not None:
+                if _try_claim_ownerless_conversation(existing, tid, owner):
+                    pass
+                if not _conversation_in_scope(existing, tid, owner):
+                    logger.warning(
+                        "[CONV] id=%s out of scope for tenant=%s owner=%s; creating new",
+                        conversation_id,
+                        tid,
+                        owner,
+                    )
+                    return _create_conversation_unlocked(data, tenant_id=tid, owner=owner)
+                _stamp_conversation_scope(existing, tid, owner)
+                logger.info("[CONV] loaded id=%s", conversation_id)
+                return existing
+        return _create_conversation_unlocked(data, tenant_id=tid, owner=owner)
 
 
 def list_conversations_summary(tenant_id=None, owner: str | None = None) -> list[dict]:
@@ -780,19 +841,18 @@ def append_conversation_message(conversation_id: str, role: str, text: str, tena
         tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
     except (TypeError, ValueError):
         tid = DEFAULT_TENANT_ID
-    data = _load_conversation_store()
-    conversation = _find_conversation(data, conversation_id)
-    if conversation is None or not _conversation_in_scope(conversation, tid, owner):
-        raise KeyError(conversation_id)
-    _stamp_conversation_scope(conversation, tid, owner)
-    messages = conversation.setdefault("messages", [])
-    messages.append({"role": role_value, "text": text_value})
-    if role_value == "user" and (not conversation.get("title") or conversation.get("title") == "New chat"):
-        conversation["title"] = _conversation_title_from_text(text_value)
-    conversation["updated_at"] = _utc_now_iso()
-    _save_conversation_store(data)
-    logger.info("[CONV] message_added role=%s id=%s", role_value, conversation.get("id"))
-    return conversation
+    with _mutating_conversation_store() as data:
+        conversation = _find_conversation(data, conversation_id)
+        if conversation is None or not _conversation_in_scope(conversation, tid, owner):
+            raise KeyError(conversation_id)
+        _stamp_conversation_scope(conversation, tid, owner)
+        messages = conversation.setdefault("messages", [])
+        messages.append({"role": role_value, "text": text_value})
+        if role_value == "user" and (not conversation.get("title") or conversation.get("title") == "New chat"):
+            conversation["title"] = _conversation_title_from_text(text_value)
+        conversation["updated_at"] = _utc_now_iso()
+        logger.info("[CONV] message_added role=%s id=%s", role_value, conversation.get("id"))
+        return conversation
 
 
 def _conversation_summary(conversation: dict) -> dict:
@@ -813,15 +873,14 @@ def rename_conversation(conversation_id: str, title: str, tenant_id=None, owner:
         tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
     except (TypeError, ValueError):
         tid = DEFAULT_TENANT_ID
-    data = _load_conversation_store()
-    conversation = _find_conversation(data, conversation_id)
-    if conversation is None or not _conversation_in_scope(conversation, tid, owner):
-        raise KeyError(conversation_id)
-    conversation["title"] = title_value
-    conversation["updated_at"] = _utc_now_iso()
-    _save_conversation_store(data)
-    logger.info("[CONV] renamed id=%s title=%s", conversation_id, title_value)
-    return _conversation_summary(conversation)
+    with _mutating_conversation_store() as data:
+        conversation = _find_conversation(data, conversation_id)
+        if conversation is None or not _conversation_in_scope(conversation, tid, owner):
+            raise KeyError(conversation_id)
+        conversation["title"] = title_value
+        conversation["updated_at"] = _utc_now_iso()
+        logger.info("[CONV] renamed id=%s title=%s", conversation_id, title_value)
+        return _conversation_summary(conversation)
 
 
 def delete_conversation(conversation_id: str, tenant_id=None, owner: str | None = None) -> None:
@@ -829,16 +888,15 @@ def delete_conversation(conversation_id: str, tenant_id=None, owner: str | None 
         tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
     except (TypeError, ValueError):
         tid = DEFAULT_TENANT_ID
-    data = _load_conversation_store()
-    conversations = [c for c in data.get("conversations", []) if isinstance(c, dict)]
-    target = _find_conversation(data, conversation_id)
-    if target is None or not _conversation_in_scope(target, tid, owner):
-        raise KeyError(conversation_id)
-    remaining = [c for c in conversations if c.get("id") != conversation_id]
-    if len(remaining) == len(conversations):
-        raise KeyError(conversation_id)
-    data["conversations"] = remaining
-    _save_conversation_store(data)
+    with _mutating_conversation_store() as data:
+        conversations = [c for c in data.get("conversations", []) if isinstance(c, dict)]
+        target = _find_conversation(data, conversation_id)
+        if target is None or not _conversation_in_scope(target, tid, owner):
+            raise KeyError(conversation_id)
+        remaining = [c for c in conversations if c.get("id") != conversation_id]
+        if len(remaining) == len(conversations):
+            raise KeyError(conversation_id)
+        data["conversations"] = remaining
     conversation_history.pop(conversation_id, None)
     last_answer_state.pop(conversation_id, None)
     recent_grounded_definition_concepts.pop(conversation_id, None)
@@ -852,21 +910,20 @@ def delete_all_conversations(tenant_id=None, owner: str | None = None) -> int:
         tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
     except (TypeError, ValueError):
         tid = DEFAULT_TENANT_ID
-    data = _load_conversation_store()
-    conversations = [c for c in data.get("conversations", []) if isinstance(c, dict)]
     deleted_ids: list[str] = []
-    remaining: list[dict] = []
-    for conversation in conversations:
-        if _conversation_in_scope(conversation, tid, owner):
-            conv_id = str(conversation.get("id") or "").strip()
-            if conv_id:
-                deleted_ids.append(conv_id)
-            continue
-        remaining.append(conversation)
-    if not deleted_ids:
-        return 0
-    data["conversations"] = remaining
-    _save_conversation_store(data)
+    with _mutating_conversation_store() as data:
+        conversations = [c for c in data.get("conversations", []) if isinstance(c, dict)]
+        remaining: list[dict] = []
+        for conversation in conversations:
+            if _conversation_in_scope(conversation, tid, owner):
+                conv_id = str(conversation.get("id") or "").strip()
+                if conv_id:
+                    deleted_ids.append(conv_id)
+                continue
+            remaining.append(conversation)
+        if not deleted_ids:
+            return 0
+        data["conversations"] = remaining
     for conv_id in deleted_ids:
         conversation_history.pop(conv_id, None)
         last_answer_state.pop(conv_id, None)
@@ -949,25 +1006,62 @@ def cleanup_old_conversations():
         del conversation_timestamps[conn_id]
 
 
-def clear_all_conversation_history():
-    """Wipe every in-memory conversation so stale KB answers are never reused.
+def clear_all_conversation_history(tenant_id: int | None = None):
+    """Wipe in-memory conversation state so stale KB answers are never reused.
 
+    When tenant_id is given, only connections bound to that business are cleared.
     Called automatically after a KB reindex to prevent the LLM from seeing
     old Q&A pairs that contradict the updated knowledge base.
     """
-    count = len(conversation_history)
-    conversation_history.clear()
-    conversation_timestamps.clear()
-    try:
-        last_answer_state.clear()
-    except Exception:
-        pass
-    try:
-        recent_grounded_definition_concepts.clear()
-    except Exception:
-        pass
-    if count:
-        logger.info(f"Cleared {count} conversation(s) after KB reindex")
+    if tenant_id is None:
+        count = len(conversation_history)
+        conversation_history.clear()
+        conversation_timestamps.clear()
+        try:
+            last_answer_state.clear()
+        except Exception:
+            pass
+        try:
+            recent_grounded_definition_concepts.clear()
+        except Exception:
+            pass
+        if count:
+            logger.info(f"Cleared {count} conversation(s) after KB reindex")
+        return
+
+    conn_ids = [
+        cid for cid, tid in _active_ws_tenants.items()
+        if int(tid) == int(tenant_id)
+    ]
+    cleared = 0
+    for conn_id in conn_ids:
+        if conversation_history.pop(conn_id, None) is not None:
+            cleared += 1
+        conversation_timestamps.pop(conn_id, None)
+        last_answer_state.pop(conn_id, None)
+        try:
+            _last_good_answer_state.pop(conn_id, None)
+        except Exception:
+            pass
+        try:
+            _last_list_state.pop(conn_id, None)
+        except Exception:
+            pass
+        try:
+            _ar_resolved_followup_queries.pop(conn_id, None)
+        except Exception:
+            pass
+        try:
+            if conn_id in recent_grounded_definition_concepts:
+                del recent_grounded_definition_concepts[conn_id]
+        except Exception:
+            pass
+    if cleared:
+        logger.info(
+            "Cleared %s in-memory conversation(s) for tenant=%s after KB reindex",
+            cleared,
+            tenant_id,
+        )
 
 
 # ========== FOLLOW-UP / EXPLANATION MODE ==========
@@ -5057,24 +5151,26 @@ async def _check_ollama_connectivity() -> None:
 # ========== REAL-TIME KB EVENT BROADCAST ==========
 # All active user WebSocket connections (keyed by connection_id → WebSocket)
 _active_ws_connections: dict = {}
-# Admin KB-events subscribers (connected to /ws/kb-events)
-_kb_event_subscribers: set = set()
+# Tenant bound to each active WebSocket (connection_id → tenant_id)
+_active_ws_tenants: dict[str, int] = {}
+# Admin KB-events subscribers (WebSocket → tenant_id)
+_kb_event_subscribers: dict = {}
 # Global KB version counter — incremented on every mutation
 _kb_global_version: int = 0
 
 
 async def broadcast_kb_event(action: str, filename: str = "*",
                               chunks_added: int = 0, chunks_deleted: int = 0,
-                              triggered_by: str = "admin"):
-    """Broadcast a KB mutation event to all connected sockets.
+                              triggered_by: str = "admin", tenant_id: int | None = None):
+    """Broadcast a KB mutation event to sockets for the same business only.
 
     Sends:
-      - A ``kb_updated`` message to every active user chat session so the
-        frontend can show a "new information available" notice.
-      - The full event payload to every admin KB-events subscriber.
+      - A ``kb_updated`` message to every active user chat session for this tenant
+      - The full event payload to admin KB-events subscribers for this tenant
     """
     global _kb_global_version
     _kb_global_version += 1
+    tid = int(tenant_id if tenant_id is not None else current_tenant_id())
     event = {
         "type": "kb_updated",
         "action": action,
@@ -5083,6 +5179,7 @@ async def broadcast_kb_event(action: str, filename: str = "*",
         "chunks_deleted": chunks_deleted,
         "kb_version": _kb_global_version,
         "triggered_by": triggered_by,
+        "tenant_id": tid,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -5094,11 +5191,14 @@ async def broadcast_kb_event(action: str, filename: str = "*",
         chunks_deleted=chunks_deleted,
         kb_version=_kb_global_version,
         triggered_by=triggered_by,
+        tenant_id=tid,
     )
 
-    # Notify every active user session (chat WebSocket)
+    # Notify user chat WebSockets for this tenant only
     dead_conns = []
     for conn_id, ws in list(_active_ws_connections.items()):
+        if int(_active_ws_tenants.get(conn_id, DEFAULT_TENANT_ID)) != tid:
+            continue
         try:
             await ws.send_json({
                 "type": "kb_updated",
@@ -5110,35 +5210,38 @@ async def broadcast_kb_event(action: str, filename: str = "*",
             dead_conns.append(conn_id)
     for conn_id in dead_conns:
         _active_ws_connections.pop(conn_id, None)
+        _active_ws_tenants.pop(conn_id, None)
 
-    # Broadcast full event to admin KB-events subscribers
+    # Broadcast full event to admin KB-events subscribers for this tenant
     dead_subs = []
-    for ws in list(_kb_event_subscribers):
+    for ws, sub_tid in list(_kb_event_subscribers.items()):
+        if int(sub_tid) != tid:
+            continue
         try:
             await ws.send_json(event)
         except Exception:
             dead_subs.append(ws)
     for ws in dead_subs:
-        _kb_event_subscribers.discard(ws)
+        _kb_event_subscribers.pop(ws, None)
 
-    logger.info(f"KB broadcast: action={action} file={filename} v{_kb_global_version} "
-                f"→ {len(_active_ws_connections)} user sessions, "
-                f"{len(_kb_event_subscribers)} admin subscribers")
+    logger.info(f"KB broadcast: action={action} file={filename} v{_kb_global_version} tenant={tid} "
+                f"→ user sessions + admin subscribers for this tenant")
 
 
 async def invalidate_all_caches(action: str = "cache_clear", filename: str = "*",
                                  chunks_added: int = 0, chunks_deleted: int = 0,
-                                 triggered_by: str = "admin"):
+                                 triggered_by: str = "admin", tenant_id: int | None = None):
     """Nuclear option: clear conversation history + flush Ollama KV cache + broadcast.
 
     Call this after any KB mutation (upload, edit, delete, reindex) to
     guarantee the next user query gets a fully fresh answer.
     """
-    clear_all_conversation_history()
+    tid = int(tenant_id if tenant_id is not None else current_tenant_id())
+    clear_all_conversation_history(tenant_id=tid)
     await flush_ollama_cache()
     await broadcast_kb_event(action=action, filename=filename,
                               chunks_added=chunks_added, chunks_deleted=chunks_deleted,
-                              triggered_by=triggered_by)
+                              triggered_by=triggered_by, tenant_id=tid)
 
 _active_doc_registry: dict = {
     "mode": RAG_DOC_MODE,
@@ -7288,7 +7391,7 @@ def _active_rag() -> "LiveRAGManager":
         return live_rag
 
 
-def _sync_live_retrieval_collection(target_collection_name: str | None = None) -> str:
+def _sync_live_retrieval_collection(target_collection_name: str | None = None, tenant_id: int | None = None) -> str:
     """Ensure live retrieval is pointed at the same collection used by indexing.
 
     This is the CRITICAL handoff point between upload/indexing and live queries.
@@ -7299,7 +7402,11 @@ def _sync_live_retrieval_collection(target_collection_name: str | None = None) -
     - The indexing collection and retrieval collection fell out of sync
     - ChromaDB returned a stale collection object after deletions
     """
-    kb_collection = get_or_create_collection(allow_empty=True)
+    from backend.knowledge_base import _collection_owned_by_tenant, get_or_create_collection
+
+    tid = int(tenant_id if tenant_id is not None else current_tenant_id())
+    scope_tid = None if int(tid) == int(DEFAULT_TENANT_ID) else int(tid)
+    kb_collection = get_or_create_collection(allow_empty=True, tenant_id=scope_tid)
     if not kb_collection:
         raise RuntimeError("No KB collection available for live retrieval sync")
 
@@ -7309,7 +7416,6 @@ def _sync_live_retrieval_collection(target_collection_name: str | None = None) -
 
     # Always get a FRESH collection reference from ChromaDB — never reuse
     # cached references which may be stale after delete_all + re-index.
-    db_path = str(CHROMA_DB_PATH)
     client = getattr(getattr(live_rag, "vs", None), "client", None)
     if client is None:
         from backend.knowledge_base import client as kb_client
@@ -7322,11 +7428,10 @@ def _sync_live_retrieval_collection(target_collection_name: str | None = None) -
         logger.error("Failed to get fresh collection '%s': %s", desired, e)
         raise RuntimeError(f"Collection '{desired}' not found: {e}")
 
-    # If the target collection is empty (possibly from a failed upload),
-    # scan for any non-empty collection as a safety net.
+    # If the target collection is empty, scan only collections owned by this tenant.
     if fresh_count == 0:
         logger.warning(
-            "Target collection '%s' is empty after sync attempt — scanning for non-empty alternatives",
+            "Target collection '%s' is empty after sync attempt — scanning tenant-owned alternatives",
             desired,
         )
         try:
@@ -7340,6 +7445,8 @@ def _sync_live_retrieval_collection(target_collection_name: str | None = None) -
                     if name:
                         collection_names.append(str(name))
             for c_name in sorted(collection_names, reverse=True):
+                if not _collection_owned_by_tenant(c_name, tid):
+                    continue
                 try:
                     candidate = client.get_collection(name=c_name)
                     if candidate.count() > 0:
@@ -8246,10 +8353,9 @@ def require_login(role=None):
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
             raise HTTPException(status_code=401, detail="Authentication required.")
-        try:
-            user = serializer.loads(token)
-        except Exception:
-            raise HTTPException(status_code=401, detail="Invalid session.")
+        user, err = load_and_validate_session_token(serializer, token)
+        if user is None:
+            raise HTTPException(status_code=401, detail=err or "Invalid session.")
         if role and user.get("role") != role:
             raise HTTPException(status_code=403, detail="Forbidden.")
         return user
@@ -8261,10 +8367,9 @@ def require_roles(*allowed_roles):
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
             raise HTTPException(status_code=401, detail="Authentication required.")
-        try:
-            user = serializer.loads(token)
-        except Exception:
-            raise HTTPException(status_code=401, detail="Invalid session.")
+        user, err = load_and_validate_session_token(serializer, token)
+        if user is None:
+            raise HTTPException(status_code=401, detail=err or "Invalid session.")
         if allowed_roles and user.get("role") not in allowed_roles:
             raise HTTPException(status_code=403, detail="Forbidden.")
         return user
@@ -18192,6 +18297,22 @@ def _search_fast_minimal(query_text: str, top_k: int) -> list[dict]:
         logger.info("[DOC COUNT TRACE] stage=_search_fast_minimal.return count=0")
         logger.info("[RETRIEVAL TIMING] _search_fast_minimal total=%.0f ms top_k=%d docs_returned=0 (exception)", _sfm_ms, actual_top_k)
         return []
+
+
+async def _search_fast_minimal_async(query_text: str, top_k: int) -> list[dict]:
+    """Offload blocking Chroma/embed/rerank work from the asyncio event loop."""
+    return await asyncio.to_thread(_search_fast_minimal, query_text, top_k)
+
+
+async def _search_fast_definition_minimal_async(query_text: str) -> list[dict]:
+    return await asyncio.to_thread(_search_fast_definition_minimal, query_text)
+
+
+async def _active_rag_search_async(**kwargs) -> list:
+    def _run() -> list:
+        return _active_rag().search(**kwargs) or []
+
+    return await asyncio.to_thread(_run)
 
 
 def _search_fast_definition_minimal(query_text: str) -> list[dict]:
@@ -28515,7 +28636,11 @@ def _classify_smalltalk_intent(text: str) -> str:
             return "greeting"
         return "unknown"
 
-    if re.fullmatch(r"(?:thanks|thank you|thx|thank u|ok thanks|okay thanks|thanks a lot|thank you very much)", q):
+    if re.fullmatch(
+        r"(?:thanks|thank you|thx|thank u|ok thanks|okay thanks|ok thank you|okay thank you|"
+        r"thanks a lot|thank you very much|much appreciated|appreciate it|thanks okay|thank you okay)",
+        q,
+    ):
         return "thanks"
     if re.fullmatch(r"(?:(?:hi|hello|hey)\s+)?(?:how\s+(?:are\s+)?you(?:\s+doing)?|how\s+are\s+u|how\s+r\s+u|how\s+you\s+doing|how\s+are\s+things|how\s+(?:is|s)\s+it\s+going)(?:\s+today)?", q):
         return "wellbeing"
@@ -28523,6 +28648,9 @@ def _classify_smalltalk_intent(text: str) -> str:
         return "ack"
     if re.fullmatch(r"(?:hi|hello|hey|good morning|good afternoon|good evening)(?:\s+there)?", q):
         return "greeting"
+    if re.search(r"\b(?:thanks?|thank\s+you|thx|appreciate(?:\s+it)?|appreciated)\b", q):
+        if len(q.split()) <= 5 and not _looks_like_document_question(text):
+            return "thanks"
     return "unknown"
 
 
@@ -28689,6 +28817,8 @@ def _finalize_user_visible_answer(
         return _assistant_meta_direct_answer(query, language)
     if _is_conversational_ack_query(query) or _is_unsupported_unclear_query(query):
         return _conversational_redirect(query, language)
+    if _is_pure_smalltalk_query(query):
+        return _smalltalk_response(query)
     if retrieved_docs:
         rescued = _rescue_support_procedural_from_docs(query, retrieved_docs)
         if rescued:
@@ -34754,9 +34884,9 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
         print("[DEBUG] FINAL QUERY:", text)
         print("[DEBUG] TOP_K:", top_k_req)
         if is_definition_fast:
-            relevant_docs = _search_fast_definition_minimal(text)
+            relevant_docs = await _search_fast_definition_minimal_async(text)
         else:
-            relevant_docs = _search_fast_minimal(text, top_k=top_k_req)
+            relevant_docs = await _search_fast_minimal_async(text, top_k=top_k_req)
         logger.info("[DOC COUNT TRACE] stage=call_llm_with_rag.initial_retrieval count=%s", len(relevant_docs or []))
 
         # One-shot typo-retry when lexical grounding is missing or retrieval evidence is weak.
@@ -34794,9 +34924,9 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
                         corrected_top_k = 3
 
                     if corrected_is_def_fast:
-                        retried_docs = _search_fast_definition_minimal(corrected_query)
+                        retried_docs = await _search_fast_definition_minimal_async(corrected_query)
                     else:
-                        retried_docs = _search_fast_minimal(corrected_query, top_k=corrected_top_k)
+                        retried_docs = await _search_fast_minimal_async(corrected_query, top_k=corrected_top_k)
                     logger.info("[DOC COUNT TRACE] stage=call_llm_with_rag.typo_retry_retrieval count=%s", len(retried_docs or []))
 
                     if retried_docs:
@@ -34814,7 +34944,7 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
                 for retry_count, rq in enumerate((fact_rescue_queries or [])[:MAX_FACT_RETRIES], start=1):
                     logger.info("[FACT RETRY] count=%s", retry_count)
                     logger.info("[FACT RESCUE QUERY] %s", rq)
-                    rescue_collected.extend(_search_fast_minimal(rq, top_k=8) or [])
+                    rescue_collected.extend(await _search_fast_minimal_async(rq, top_k=8) or [])
                 if len(fact_rescue_queries or []) >= MAX_FACT_RETRIES:
                     logger.info("[FACT RETRY] max_reached=True")
                 if rescue_collected:
@@ -34885,7 +35015,7 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
                 enable_rerank=True,
             )
             if (not rescue_docs) and rescue_family == "overview_chapter_compare":
-                rescue_docs = _active_rag().search(
+                rescue_docs = await _active_rag_search_async(
                     _overview_seed_query(),
                     top_k=6,
                     distance_threshold=max(_distance_threshold_for_query(text), 1.8),
@@ -35210,7 +35340,7 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
                 rescue_collected: list[dict] = []
                 for rq in rescue_queries:
                     logger.info("[RETRIEVAL RESCUE QUERY] %s", rq)
-                    rescue_collected.extend(_search_fast_minimal(rq, top_k=8) or [])
+                    rescue_collected.extend(await _search_fast_minimal_async(rq, top_k=8) or [])
                 if rescue_collected:
                     doc_dicts = _merge_rescue_docs_and_rerank(text, doc_dicts, rescue_collected, top_k=max(12, total_docs + 8))
                     logger.info("[RETRIEVAL RESCUE MERGED] count=%d", len(doc_dicts or []))
@@ -35553,7 +35683,7 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
         if _is_metric_fact_query(text) and doc_dicts and not _skip_deterministic_rag_shortcuts(text, doc_router_mode):
             metric_pool = list(doc_dicts or [])
             if re.search(r"\battrition rate\b", text, flags=re.IGNORECASE):
-                kpi_rescue = _search_fast_minimal("16.12% attrition rate IBM HR KPI summary", top_k=8) or []
+                kpi_rescue = await _search_fast_minimal_async("16.12% attrition rate IBM HR KPI summary", top_k=8) or []
                 if kpi_rescue:
                     metric_pool = _merge_rescue_docs_and_rerank(text, metric_pool, kpi_rescue, top_k=12)
             metric_answer = _extract_metric_fact_answer(text, metric_pool)
@@ -37802,7 +37932,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     seen_docs: set[tuple[str, str, str]] = set()
                     native_queries = _native_arabic_retrieval_queries(original_arabic_text)
                     for idx, native_query in enumerate(native_queries):
-                        found_docs = _active_rag().search(
+                        found_docs = await _active_rag_search_async(
                             native_query,
                             top_k=10 if idx == 0 else 6,
                             distance_threshold=_distance_threshold_for_query(native_query),
@@ -37887,7 +38017,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
 
                 t_ar_retrieval_start = time.perf_counter()
                 t_meta["retrieval_after_translation_start"] = t_ar_retrieval_start
-                rag_docs_check = _search_fast_minimal(text_for_rag, top_k=10) or []
+                rag_docs_check = await _search_fast_minimal_async(text_for_rag, top_k=10) or []
                 if protected_terms:
                     rag_docs_check = _filter_docs_by_protected_terms(rag_docs_check or [], protected_terms)
                 t_ar_retrieval_end = time.perf_counter()
@@ -37921,7 +38051,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     external_retrieval_weak = True
                     if external_text_for_rag:
                         t_external_retrieval_start = time.perf_counter()
-                        external_rag_docs_check = _search_fast_minimal(external_text_for_rag, top_k=10) or []
+                        external_rag_docs_check = await _search_fast_minimal_async(external_text_for_rag, top_k=10) or []
                         if protected_terms:
                             external_rag_docs_check = _filter_docs_by_protected_terms(external_rag_docs_check or [], protected_terms)
                         t_external_retrieval_end = time.perf_counter()
@@ -37984,7 +38114,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
 
                         t_llm_retrieval_start = time.perf_counter()
                         t_meta["retrieval_after_translation_start"] = t_llm_retrieval_start
-                        llm_rag_docs_check = _search_fast_minimal(llm_text_for_rag, top_k=10) or []
+                        llm_rag_docs_check = await _search_fast_minimal_async(llm_text_for_rag, top_k=10) or []
                         if protected_terms:
                             llm_rag_docs_check = _filter_docs_by_protected_terms(llm_rag_docs_check or [], protected_terms)
                         t_llm_retrieval_end = time.perf_counter()
@@ -38043,7 +38173,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 exact_query = " ".join(protected_terms)
                 exact_docs: list[dict] = []
                 try:
-                    exact_docs = _active_rag().search(
+                    exact_docs = await _active_rag_search_async(
                         exact_query,
                         top_k=5,
                         distance_threshold=max(_distance_threshold_for_query(exact_query), 1.10),
@@ -38183,7 +38313,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 if protected_terms:
                     rag_docs_check = _filter_docs_by_protected_terms(rag_docs_check or [], protected_terms)
                 if (not rag_docs_check) and _is_overview_query(text_for_rag):
-                    rag_docs_check = _active_rag().search(
+                    rag_docs_check = await _active_rag_search_async(
                         _overview_seed_query(),
                         top_k=5,
                         distance_threshold=max(_distance_threshold_for_query(text_for_rag), 1.50),
@@ -38277,11 +38407,11 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
         print("[DEBUG] FINAL QUERY:", text)
         print("[DEBUG] TOP_K:", top_k_req)
         if family_v2 != "fact_entity" and _is_safe_definition_fast_path_query(text):
-            relevant_docs = _search_fast_definition_minimal(text)
+            relevant_docs = await _search_fast_definition_minimal_async(text)
         else:
-            relevant_docs = _search_fast_minimal(text, top_k=top_k_req)
+            relevant_docs = await _search_fast_minimal_async(text, top_k=top_k_req)
         if (not relevant_docs) and _is_overview_query(text):
-            relevant_docs = _active_rag().search(
+            relevant_docs = await _active_rag_search_async(
                 _overview_seed_query(),
                 top_k=5,
                 distance_threshold=max(_distance_threshold_for_query(text), 1.50),
@@ -38315,7 +38445,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
             for retry_count, rq in enumerate((fact_rescue_queries or [])[:MAX_FACT_RETRIES], start=1):
                 logger.info("[FACT RETRY] count=%s", retry_count)
                 logger.info("[FACT RESCUE QUERY] %s", rq)
-                rescue_collected.extend(_search_fast_minimal(rq, top_k=8) or [])
+                rescue_collected.extend(await _search_fast_minimal_async(rq, top_k=8) or [])
             if len(fact_rescue_queries or []) >= MAX_FACT_RETRIES:
                 logger.info("[FACT RETRY] max_reached=True")
             if rescue_collected:
@@ -38368,7 +38498,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
     if (not is_greeting) and (not relevant_docs):
         rescue_family = _classify_query_family_v2(text)
         if rescue_family in {"definition_entity", "definition_comparison"}:
-            relevant_docs = _search_fast_definition_minimal(text) or []
+            relevant_docs = await _search_fast_definition_minimal_async(text) or []
 
     if (not is_greeting) and (not relevant_docs) and not _skip_deterministic_rag_shortcuts(text):
         logger.info(
@@ -38583,7 +38713,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 rescue_collected: list[dict] = []
                 for rq in rescue_queries:
                     logger.info("[RETRIEVAL RESCUE QUERY] %s", rq)
-                    rescue_collected.extend(_search_fast_minimal(rq, top_k=8) or [])
+                    rescue_collected.extend(await _search_fast_minimal_async(rq, top_k=8) or [])
                 if rescue_collected:
                     doc_dicts = _merge_rescue_docs_and_rerank(text, doc_dicts, rescue_collected, top_k=max(12, total_docs + 8))
                     logger.info("[RETRIEVAL RESCUE MERGED] count=%d", len(doc_dicts or []))
@@ -38935,7 +39065,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     external_text_for_rag, external_query_provider = "", "failed"
                 if external_text_for_rag:
                     try:
-                        external_docs_raw = _search_fast_minimal(external_text_for_rag, top_k=10) or []
+                        external_docs_raw = await _search_fast_minimal_async(external_text_for_rag, top_k=10) or []
                         if "protected_terms" in locals() and protected_terms:
                             external_docs_raw = _filter_docs_by_protected_terms(external_docs_raw or [], protected_terms)
                         external_docs_raw = _filter_results_to_active_sources(external_docs_raw or [])
@@ -39325,7 +39455,7 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
         if _is_metric_fact_query(text) and doc_dicts and not _skip_deterministic_rag_shortcuts(text, doc_router_mode):
             metric_pool = list(doc_dicts or [])
             if re.search(r"\battrition rate\b", text, flags=re.IGNORECASE):
-                kpi_rescue = _search_fast_minimal("16.12% attrition rate IBM HR KPI summary", top_k=8) or []
+                kpi_rescue = await _search_fast_minimal_async("16.12% attrition rate IBM HR KPI summary", top_k=8) or []
                 if kpi_rescue:
                     metric_pool = _merge_rescue_docs_and_rerank(text, metric_pool, kpi_rescue, top_k=12)
             metric_answer = _extract_metric_fact_answer(text, metric_pool)
@@ -41513,17 +41643,19 @@ class QueryRequest(BaseModel):
 
 @app.get("/conversations")
 async def get_conversations(user=Depends(require_login())):
-    tenant_id = resolve_request_tenant(user)
+    tenant_id = require_request_tenant(user)
     owner = _coerce_owner(user)
     return {"conversations": list_conversations_summary(tenant_id=tenant_id, owner=owner)}
 
 
 @app.get("/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str, user=Depends(require_login())):
-    tenant_id = resolve_request_tenant(user)
+    tenant_id = require_request_tenant(user)
     owner = _coerce_owner(user)
     data = _load_conversation_store()
     conversation = _find_conversation(data, conversation_id)
+    if conversation is not None and _try_claim_ownerless_conversation(conversation, tenant_id, owner):
+        _save_conversation_store(data)
     if conversation is None or not _conversation_in_scope(conversation, tenant_id, owner):
         raise HTTPException(status_code=404, detail="Conversation not found.")
     logger.info("[CONV] loaded id=%s", conversation_id)
@@ -41532,7 +41664,7 @@ async def get_conversation(conversation_id: str, user=Depends(require_login())):
 
 @app.post("/conversations")
 async def post_conversation(user=Depends(require_login())):
-    tenant_id = resolve_request_tenant(user)
+    tenant_id = require_request_tenant(user)
     owner = _coerce_owner(user)
     return create_conversation(tenant_id=tenant_id, owner=owner)
 
@@ -41543,7 +41675,7 @@ async def patch_conversation(
     data: ConversationRenameRequest,
     user=Depends(require_login()),
 ):
-    tenant_id = resolve_request_tenant(user)
+    tenant_id = require_request_tenant(user)
     owner = _coerce_owner(user)
     try:
         return rename_conversation(conversation_id, data.title, tenant_id=tenant_id, owner=owner)
@@ -41555,7 +41687,7 @@ async def patch_conversation(
 
 @app.delete("/conversations")
 async def delete_all_conversations_endpoint(user=Depends(require_login())):
-    tenant_id = resolve_request_tenant(user)
+    tenant_id = require_request_tenant(user)
     owner = _coerce_owner(user)
     deleted_count = delete_all_conversations(tenant_id=tenant_id, owner=owner)
     return {"success": True, "deleted_count": deleted_count}
@@ -41563,7 +41695,7 @@ async def delete_all_conversations_endpoint(user=Depends(require_login())):
 
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation_endpoint(conversation_id: str, user=Depends(require_login())):
-    tenant_id = resolve_request_tenant(user)
+    tenant_id = require_request_tenant(user)
     owner = _coerce_owner(user)
     try:
         delete_conversation(conversation_id, tenant_id=tenant_id, owner=owner)
@@ -41578,7 +41710,7 @@ async def post_conversation_message(
     data: ConversationMessageRequest,
     user=Depends(require_login()),
 ):
-    tenant_id = resolve_request_tenant(user)
+    tenant_id = require_request_tenant(user)
     owner = _coerce_owner(user)
     try:
         conversation = append_conversation_message(
@@ -41786,6 +41918,8 @@ def debug_runtime_rag(query: str | None = None, user=Depends(require_tenant_staf
     Returns JSON with process info, inspected source for key functions, runtime constants,
     and an optional live retrieval probe when a query parameter is supplied.
     """
+    _kb_admin_scope_tenant(user)
+    _request_tenant_id.set(require_request_tenant(user))
     import os as _os
     import sys as _sys
     import inspect as _inspect
@@ -41993,6 +42127,8 @@ def favicon():
     return Response(status_code=204)
 
 # ========== ROOT & STATUS PAGES ==========
+# Chat UI is served by the Login server at /frontend/ (React build in assistify-ui-design/out/).
+# This RAG server exposes API + WebSocket only; no HTML chat shell here.
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     error = request.query_params.get("error")
@@ -42066,27 +42202,36 @@ async def statistics():
 
 
 @app.get("/kb_status")
-async def kb_status():
-    """Public KB pipeline state for admin upload polling.
+async def kb_status(user=Depends(require_login())):
+    """KB pipeline state for admin upload polling (tenant-scoped).
 
     Returns the lifecycle state (uploading | processing | ready | failed),
     the current filename being processed (if any), per-stage timings, and
-    the cumulative upload-to-ready duration. This is the single source of
-    truth the admin UI must consult before showing an upload as 'success'.
+    the cumulative upload-to-ready duration. Scoped to the caller's business.
     """
+    tenant_id = require_request_tenant(user)
+    _request_tenant_id.set(tenant_id)
+    scope_tid = None if int(tenant_id) == int(DEFAULT_TENANT_ID) else int(tenant_id)
+    assets_dir = ASSETS_DIR if scope_tid is None else tenant_assets_dir(scope_tid)
     snapshot = dict(_kb_pipeline_state)
     snapshot["stage_timings"] = dict(_kb_pipeline_state.get("stage_timings") or {})
     snapshot["active_sources"] = sorted(_get_active_sources())
     snapshot["doc_mode"] = _active_doc_registry.get("mode", RAG_DOC_MODE)
+    snapshot["tenant_id"] = int(tenant_id)
     try:
         from backend.knowledge_base import find_orphan_asset_files, get_or_create_collection
 
-        kb_col = get_or_create_collection(allow_empty=True)
+        kb_col = get_or_create_collection(allow_empty=True, tenant_id=scope_tid)
         snapshot["active_collection"] = getattr(kb_col, "name", None) if kb_col else None
         snapshot["indexed_chunks"] = kb_col.count() if kb_col else 0
-        retrieval_col = getattr(getattr(live_rag, "vs", None), "collection", None)
-        snapshot["retrieval_collection"] = getattr(retrieval_col, "name", None) if retrieval_col else None
-        snapshot["orphan_files"] = find_orphan_asset_files(ASSETS_DIR)
+        if int(tenant_id) == int(DEFAULT_TENANT_ID):
+            retrieval_col = getattr(getattr(live_rag, "vs", None), "collection", None)
+            snapshot["retrieval_collection"] = getattr(retrieval_col, "name", None) if retrieval_col else None
+        else:
+            tenant_mgr = get_tenant_rag(tenant_id)
+            retrieval_col = getattr(getattr(tenant_mgr, "vs", None), "collection", None)
+            snapshot["retrieval_collection"] = getattr(retrieval_col, "name", None) if retrieval_col else None
+        snapshot["orphan_files"] = find_orphan_asset_files(assets_dir)
     except Exception as status_err:
         snapshot["status_error"] = str(status_err)
     return snapshot
@@ -42095,11 +42240,25 @@ async def kb_status():
 
 
 @app.get("/assets/{filename}")
-async def get_audio(filename: str):
-    file_path = ASSETS_DIR / filename
+async def get_audio(filename: str, user=Depends(require_login())):
+    tenant_id = require_request_tenant(user)
+    scope_tid = None if int(tenant_id) == int(DEFAULT_TENANT_ID) else int(tenant_id)
+    assets_dir = ASSETS_DIR if scope_tid is None else tenant_assets_dir(scope_tid)
+    safe_name = Path(filename).name
+    if not safe_name or safe_name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    file_path = assets_dir / safe_name
+    try:
+        resolved = file_path.resolve()
+        if not str(resolved).startswith(str(assets_dir.resolve())):
+            raise HTTPException(status_code=403, detail="Access denied")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=404, detail="File not found")
     if file_path.exists():
         return FileResponse(str(file_path), media_type="audio/wav")
-    return {"error": "File not found"}
+    raise HTTPException(status_code=404, detail="File not found")
 
 # ========== FILE UPLOAD ENDPOINT ==========
 # Background tasks currently in flight, keyed by filename. Used to avoid
@@ -42914,15 +43073,17 @@ async def rag_update(req: dict, request: Request, user=Depends(require_tenant_st
 
 @app.put("/rag/files/{filename}")
 async def rag_update_asset_file(filename: str, request: Request, user=Depends(require_tenant_staff())):
-    """Update a text asset and reindex it inside the RAG server only."""
+    """Update a text asset and reindex it inside the RAG server only (tenant-scoped)."""
     verify_csrf(request)
     if not filename:
         raise HTTPException(status_code=400, detail="filename is required")
 
-    save_path = ASSETS_DIR / Path(filename).name
+    scope_tid = _kb_admin_scope_tenant(user)
+    req_assets_dir = ASSETS_DIR if scope_tid is None else tenant_assets_dir(scope_tid)
+    save_path = req_assets_dir / Path(filename).name
     try:
         resolved_path = save_path.resolve()
-        if not str(resolved_path).startswith(str(ASSETS_DIR.resolve())):
+        if not str(resolved_path).startswith(str(req_assets_dir.resolve())):
             raise HTTPException(status_code=403, detail="Access denied")
     except HTTPException:
         raise
@@ -42963,6 +43124,7 @@ async def rag_update_asset_file(filename: str, request: Request, user=Depends(re
                 stored_filename=str(metadata.get("stored_filename") or save_path.name),
                 normalized_filename=str(metadata.get("normalized_filename") or ""),
                 doc_prefix=doc_id,
+                tenant_id=scope_tid,
             )
             _raw_chunks = await asyncio.to_thread(
                 chunk_and_add_document,
@@ -42973,13 +43135,18 @@ async def rag_update_asset_file(filename: str, request: Request, user=Depends(re
                 False,
                 "",
                 lambda event: _on_ingest_progress(event, save_path.name),
+                scope_tid,
             )
         chunks = int(_raw_chunks) if isinstance(_raw_chunks, int) else 0
         if chunks <= 0:
             _set_kb_pipeline_state("failed", message="Update produced no chunks", filename=save_path.name)
             raise HTTPException(status_code=500, detail="Update produced no chunks")
         _set_kb_pipeline_stage("activating", message="Activating updated text", filename=save_path.name)
-        active_collection = _sync_live_retrieval_collection()
+        if scope_tid is None:
+            active_collection = _sync_live_retrieval_collection(tenant_id=require_request_tenant(user))
+        else:
+            get_tenant_rag(scope_tid).vs = None
+            active_collection = tenant_collection_name(scope_tid)
         _register_active_source(str(metadata.get("normalized_filename") or save_path.name))
         await invalidate_all_caches(
             action="update",
@@ -42987,6 +43154,7 @@ async def rag_update_asset_file(filename: str, request: Request, user=Depends(re
             chunks_added=chunks,
             chunks_deleted=int(delete_report.get("deleted_count") or 0),
             triggered_by="admin",
+            tenant_id=require_request_tenant(user),
         )
         _set_kb_pipeline_state("ready", message="Text file updated and active", filename=save_path.name)
         return {
@@ -43110,6 +43278,7 @@ async def rag_reindex_all(request: Request, user=Depends(require_tenant_staff())
             continue
         filename = p.name
         try:
+            _set_kb_pipeline_stage("extracting", message="Reindexing file", filename=filename)
             text = _extract_text_from_asset(p)
             if not text.strip():
                 raise RuntimeError("Extraction produced no usable text")
@@ -43131,8 +43300,10 @@ async def rag_reindex_all(request: Request, user=Depends(require_tenant_staff())
                 tenant_id=scope_tid,
             )
             deleted = int(delete_report.get("deleted_count") or 0)
+            _set_kb_pipeline_stage("chunking", message="Chunking document", filename=filename)
             _raw_cad = chunk_and_add_document(doc_id=doc_id, text=text, metadata=metadata,
                                             kb_version=_kb_global_version + 1,
+                                            progress_callback=lambda event, fn=filename: _on_ingest_progress(event, fn),
                                             tenant_id=scope_tid)
             chunks: int = _raw_cad if isinstance(_raw_cad, int) else 0
             results.append({"filename": filename, "chunks": chunks, "deleted_old": deleted, "delete_verification": delete_report, "status": "ok"})
@@ -43710,6 +43881,12 @@ async def _process_ws_text_message(
         )
         persist_runtime_memory(connection_id, conversation_id_for_text)
 
+def _on_ws_disconnect(connection_id: str) -> None:
+    """Drop per-connection RAG follow-up state when the WebSocket closes."""
+    last_answer_state.pop(connection_id, None)
+    recent_grounded_definition_concepts.pop(connection_id, None)
+
+
 def _build_voice_ws_deps():
     return VoiceWebSocketDeps(
         resolve_request_tenant=resolve_request_tenant,
@@ -43727,9 +43904,11 @@ def _build_voice_ws_deps():
         set_request_tenant_id=_request_tenant_id.set,
         get_memory_snapshot=_get_memory_snapshot,
         get_stable_memory_snapshot=_get_stable_memory_snapshot,
+        on_ws_disconnect=_on_ws_disconnect,
         conversation_history=conversation_history,
         conversation_timestamps=conversation_timestamps,
         active_ws_connections=_active_ws_connections,
+        active_ws_tenants=_active_ws_tenants,
     )
 
 _rag_ws_handler = create_rag_ws_handler(_build_voice_ws_deps())
@@ -43747,18 +43926,24 @@ async def kb_events_ws(websocket: WebSocket):
     The admin monitoring page subscribes here to receive a live event feed.
     """
     await websocket.accept()
-    try:
-        token = websocket.cookies.get(SESSION_COOKIE)
-        user = serializer.loads(token) if token else None
-    except Exception:
-        user = None
+    token = websocket.cookies.get(SESSION_COOKIE)
+    user = None
+    if token:
+        user, _err = load_and_validate_session_token(serializer, token)
     if not user or user.get("role") not in ("admin", "master_admin", "superadmin"):
         await websocket.send_json({"type": "error", "message": "Unauthorized"})
         await websocket.close(code=4003)
         return
 
-    _kb_event_subscribers.add(websocket)
-    logger.info(f"KB-events subscriber connected ({len(_kb_event_subscribers)} total)")
+    try:
+        sub_tenant_id = require_request_tenant(user)
+    except HTTPException:
+        await websocket.send_json({"type": "error", "message": "No business assigned"})
+        await websocket.close(code=4003)
+        return
+
+    _kb_event_subscribers[websocket] = int(sub_tenant_id)
+    logger.info(f"KB-events subscriber connected for tenant={sub_tenant_id} ({len(_kb_event_subscribers)} total)")
     await websocket.send_json({
         "type": "connected",
         "kb_version": _kb_global_version,
@@ -43775,7 +43960,7 @@ async def kb_events_ws(websocket: WebSocket):
     except Exception:
         pass
     finally:
-        _kb_event_subscribers.discard(websocket)
+        _kb_event_subscribers.pop(websocket, None)
         logger.info(f"KB-events subscriber disconnected ({len(_kb_event_subscribers)} remaining)")
 
 

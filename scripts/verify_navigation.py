@@ -1,4 +1,4 @@
-"""Verify unified navigation shell is present on authenticated pages."""
+"""Verify React app shell is served on authenticated dashboard routes."""
 import re
 import sys
 
@@ -15,9 +15,11 @@ USERS = [
 
 def login(username: str, password: str) -> requests.Session:
     s = requests.Session()
-    r = s.get(f"{BASE}/login")
+    r = s.get(f"{BASE}/login", allow_redirects=True)
     csrf = ""
-    m = re.search(r'name="csrf-token" content="([^"]*)"', r.text)
+    m = re.search(r'name="csrf-token" content="([^"]*)"', r.text) or re.search(
+        r'name="csrf_token"[^>]*value="([^"]*)"', r.text
+    )
     if m:
         csrf = m.group(1)
     headers = {"X-CSRF-Token": csrf} if csrf else {}
@@ -42,27 +44,18 @@ def main() -> int:
             errors.append(f"{username}: expected role {role}, got {probe.json().get('role')}")
 
         for path in paths:
-            r = s.get(f"{BASE}{path}")
+            r = s.get(f"{BASE}{path}", allow_redirects=True)
             if r.status_code != 200:
                 errors.append(f"{username}{path}: status {r.status_code}")
                 continue
+            if "/frontend/" not in r.url:
+                errors.append(f"{username}{path}: expected React URL under /frontend/, got {r.url}")
+            if "Assistify" not in r.text:
+                errors.append(f"{username}{path}: missing React shell branding")
             if "menu-btn" in r.text:
                 errors.append(f"{username}{path}: legacy menu-btn still present")
-            if f'assistify-role" content="{role}"' not in r.text:
-                errors.append(f"{username}{path}: missing assistify-role meta for {role}")
-            if "/static/navigation.css" not in r.text:
-                errors.append(f"{username}{path}: missing navigation.css")
-            if "/static/navigation.js" not in r.text:
-                errors.append(f"{username}{path}: missing navigation.js")
-
-        if role == "superadmin":
-            r = s.get(f"{BASE}/profile")
-            m = re.search(r'href="([^"]+)"[^>]*class="back-link"', r.text) or re.search(
-                r'class="back-link"[^>]*href="([^"]+)"', r.text
-            )
-            back = m.group(1) if m else None
-            if back != "/superadmin":
-                errors.append(f"superadmin/profile: expected back /superadmin, got {back!r}")
+            if "/static/navigation.css" in r.text:
+                errors.append(f"{username}{path}: legacy navigation.css still referenced")
 
     if errors:
         print("FAILURES:")
@@ -70,7 +63,7 @@ def main() -> int:
             print(" -", e)
         return 1
 
-    print("All navigation shell checks passed for 4 roles.")
+    print("All React navigation shell checks passed for 4 roles.")
     return 0
 
 

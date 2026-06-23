@@ -84,7 +84,6 @@ KEEP_PREFIXES = (
     "scripts/migrate_to_multitenant.py",
     "scripts/launch_windows/write_launch_scripts.py",
     "tts_service/",
-    "frontend/",
     "tests/test_",
 )
 
@@ -181,9 +180,7 @@ def _is_keep(rel: str) -> bool:
             return True
     if rel.startswith("tests/test_") and rel.endswith(".py"):
         return True
-    if rel.startswith("Login_system/templates/"):
-        return True
-    if rel.startswith("Login_system/static/"):
+    if rel.startswith("assistify-ui-design/"):
         return True
     if rel.startswith("docs/") and "UNNECESSARY" not in rel and "unnecessary_files" not in rel:
         return True

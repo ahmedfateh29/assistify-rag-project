@@ -62,6 +62,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.ollama_bootstrap import ensure_ollama  # noqa: E402
+from scripts.react_ui_build import ensure_react_ui_built  # noqa: E402
 
 PORT_LLM = 8010
 PORT_RAG = 7000
@@ -174,6 +175,8 @@ def parse_args():
     # Reliability / diagnostics
     p.add_argument("--restart-attempts", type=int, default=0, help="Number of automatic restart attempts for a crashed service (default 0)")
     p.add_argument("--log-dir", default="logs", help="Directory to write per-service log files (default 'logs')")
+    p.add_argument("--skip-ui-build", action="store_true", help="Skip npm build; require existing assistify-ui-design/out/")
+    p.add_argument("--ui-build-only", action="store_true", help="Build React UI and exit without starting services")
     return p.parse_args()
 
 
@@ -395,6 +398,11 @@ async def restart_service_if_needed(args, name: str, meta: dict, attempt: int) -
 async def main():
     args = parse_args()
     ensure_cwd_and_path()
+
+    if args.ui_build_only:
+        ok = ensure_react_ui_built(skip=args.skip_ui_build)
+        return 0 if ok else 1
+
     print(f"Python: {PYTHON_EXE}  (sys.executable={sys.executable})")
     print(f"Repo root: {REPO_ROOT}")
 
@@ -523,23 +531,36 @@ async def main():
         else:
             print("Skipping RAG startup (--no-rag)")
 
+        # React UI static export (must complete before Login imports assistify-ui-design/out/)
+        ui_build_ok = True
+        if not args.no_login:
+            print("[LAUNCHER] Building React UI for /frontend/ ...")
+            ui_build_ok = ensure_react_ui_built(skip=args.skip_ui_build)
+            if not ui_build_ok:
+                print("[LAUNCHER] React UI build failed — Login will serve 503 for /frontend/ until built.")
+        elif args.skip_ui_build:
+            ensure_react_ui_built(skip=True)
+
         # LOGIN
         if not args.no_login:
-            SERVICE_LOG_FILES['LOGIN'] = open(log_dir / 'login.log', 'a', encoding='utf-8')
-            proc, ok = await start_service(
-                "LOGIN",
-                SERVICES[2]["module"],
-                SERVICES[2]["host"],
-                SERVICES[2]["port"],
-                SERVICES[2]["ready_path"],
-                args.reload,
-                SERVICES[2]["log_level"],
-                keep_alive=SERVICES[2]["keep_alive"],
-                env_overrides=None,
-            )
-            running.append(("LOGIN", proc))
-            if not ok:
-                print("Login server failed to become ready. Check logs above.")
+            if not ui_build_ok:
+                print("[SKIPPED] Login startup blocked — React UI build failed (use --skip-ui-build with existing out/)")
+            else:
+                SERVICE_LOG_FILES['LOGIN'] = open(log_dir / 'login.log', 'a', encoding='utf-8')
+                proc, ok = await start_service(
+                    "LOGIN",
+                    SERVICES[2]["module"],
+                    SERVICES[2]["host"],
+                    SERVICES[2]["port"],
+                    SERVICES[2]["ready_path"],
+                    args.reload,
+                    SERVICES[2]["log_level"],
+                    keep_alive=SERVICES[2]["keep_alive"],
+                    env_overrides=None,
+                )
+                running.append(("LOGIN", proc))
+                if not ok:
+                    print("Login server failed to become ready. Check logs above.")
         else:
             print("Skipping Login startup (--no-login)")
 
