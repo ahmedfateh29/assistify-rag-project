@@ -29,39 +29,15 @@ from scripts.react_ui_build import ensure_react_ui_built  # noqa: E402
 PROJECT_ROOT = Path(__file__).resolve().parent
 SPLIT_SCRIPT = PROJECT_ROOT / "scripts" / "project_start_split.py"
 SINGLE_SCRIPT = PROJECT_ROOT / "scripts" / "project_start_server.py"
-CONDA_ENV_NAME = "assistify_main"
+from scripts.python_env import CONDA_ENV_NAME, active_venv_missing_deps, python_env_label, resolve_project_python  # noqa: E402
 
 DEFAULT_ARGS = ["--kill-ports", "--llm-port", "8010"]
 
 
-def _candidate_conda_roots() -> list[Path]:
-    roots: list[Path] = []
-    user_profile = Path(os.environ.get("USERPROFILE", str(Path.home())))
-    for name in ("miniconda3", "anaconda3", "Miniconda3", "Anaconda3"):
-        roots.append(user_profile / name)
-    program_data = os.environ.get("PROGRAMDATA")
-    if program_data:
-        for name in ("miniconda3", "anaconda3", "Miniconda3", "Anaconda3"):
-            roots.append(Path(program_data) / name)
-    for key in ("CONDA_PREFIX", "CONDA_ROOT", "_CONDA_ROOT"):
-        val = os.environ.get(key)
-        if val:
-            p = Path(val)
-            roots.append(p)
-            roots.append(p.parent.parent)
-    return roots
-
-
 def find_env_python() -> Path | None:
-    is_windows = os.name == "nt"
-    python_name = "python.exe" if is_windows else "python"
-    for base in _candidate_conda_roots():
-        if is_windows:
-            candidate = base / "envs" / CONDA_ENV_NAME / python_name
-        else:
-            candidate = base / "envs" / CONDA_ENV_NAME / "bin" / python_name
-        if candidate.exists():
-            return candidate
+    resolved = resolve_project_python(PROJECT_ROOT)
+    if resolved.exists():
+        return resolved
     return None
 
 
@@ -73,7 +49,7 @@ def _resolve_target_script(extra_args: list[str]) -> Path:
     return SINGLE_SCRIPT
 
 
-def print_startup_banner(*, single_console: bool, status_only: bool) -> None:
+def print_startup_banner(*, single_console: bool, status_only: bool, public_tunnel: bool) -> None:
     print("====================================")
     print("  Assistify Main Server Launcher")
     print("====================================")
@@ -83,6 +59,8 @@ def print_startup_banner(*, single_console: bool, status_only: bool) -> None:
         print("Mode: single-console (merged logs)")
     else:
         print("Mode: multi-terminal (one window per service + this coordinator)")
+    if public_tunnel:
+        print("Public: HTTPS tunnel via cloudflared/ngrok (--public)")
     print()
     print("Services:")
     print("  Ollama      -> http://127.0.0.1:11434")
@@ -93,15 +71,21 @@ def print_startup_banner(*, single_console: bool, status_only: bool) -> None:
     print("  Chat UI     -> http://127.0.0.1:7001/frontend/  (after login)")
     if not status_only and not single_console:
         print()
-        print("Open when Ready: http://127.0.0.1:7001/login")
-        print("  Chat UI:     http://127.0.0.1:7001/frontend/")
+        if public_tunnel:
+            print("When Ready: local + public URLs printed below (install cloudflared or ngrok)")
+            print("  Service logs: mirrored to logs/*.log + /internal/service-logs (login required)")
+        else:
+            print("Open when Ready: http://127.0.0.1:7001/login")
+            print("  Chat UI:     http://127.0.0.1:7001/frontend/")
         print("  Dev login: admin / admin  or  superadmin / superadmin")
         print()
+        print("Public internet access: python start_main_servers.py --public")
         print("Fast backend-only restart: python start_main_servers.py --skip-ui-build")
         print("If Ollama bind errors: python start_main_servers.py --restart-ollama")
         print("After startup:           python scripts/verify_stack.py")
         print()
         print("Coordinator opens five windows every run: Ollama, Piper, LLM, RAG, Login.")
+        print("With --kill-ports, old Assistify * windows are closed before restart.")
         print("Ollama window shows status/models if the tray app already owns port 11434.")
         print("Close each service window to stop that service.")
         print("First RAG boot may take several minutes (Whisper model load).")
@@ -141,13 +125,18 @@ def main() -> int:
     extra_args = sys.argv[1:]
     status_only = "--status" in extra_args
     single_console = "--single-console" in extra_args
+    public_tunnel = "--public" in extra_args
     target = _resolve_target_script(extra_args)
 
     if not target.exists():
         print(f"[ERROR] Target script not found: {target}", file=sys.stderr)
         return 1
 
-    print_startup_banner(single_console=single_console, status_only=status_only)
+    print_startup_banner(
+        single_console=single_console,
+        status_only=status_only,
+        public_tunnel=public_tunnel,
+    )
 
     skip_ui_build = "--skip-ui-build" in extra_args
     ui_build_only = "--ui-build-only" in extra_args
@@ -168,8 +157,15 @@ def main() -> int:
     if env_python is None:
         return run_via_conda(target, extra_args, ui_built=ui_built)
 
+    python_label = python_env_label(env_python)
+    if active_venv_missing_deps(PROJECT_ROOT):
+        print(
+            "[LAUNCHER] Note: .venv is active but missing packages (e.g. fastapi) — "
+            "using conda:assistify_main for services.",
+            file=sys.stderr,
+        )
     print(f"[LAUNCHER] Repo root : {PROJECT_ROOT}")
-    print(f"[LAUNCHER] Conda env : {CONDA_ENV_NAME}")
+    print(f"[LAUNCHER] Python env: {python_label}")
     print(f"[LAUNCHER] Python    : {env_python}")
     print(f"[LAUNCHER] Script    : {target.name}")
     print(f"[LAUNCHER] KMP_DUPLICATE_LIB_OK = {os.environ['KMP_DUPLICATE_LIB_OK']}")

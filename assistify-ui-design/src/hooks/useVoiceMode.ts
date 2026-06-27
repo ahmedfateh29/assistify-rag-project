@@ -80,7 +80,9 @@ export function useVoiceMode({
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const capturePollRef = useRef<ReturnType<typeof setInterval> | number | null>(null);
+  const captureBufferRef = useRef<Float32Array | null>(null);
 
   const ttsCtxRef = useRef<AudioContext | null>(null);
   const ttsGainRef = useRef<GainNode | null>(null);
@@ -218,10 +220,15 @@ export function useVoiceMode({
   const releaseCapture = useCallback(() => {
     isRecordingRef.current = false;
     pauseSendRef.current = false;
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
+    if (capturePollRef.current) {
+      clearInterval(capturePollRef.current);
+      capturePollRef.current = null;
     }
+    if (analyserRef.current) {
+      analyserRef.current.disconnect();
+      analyserRef.current = null;
+    }
+    captureBufferRef.current = null;
     if (audioContextRef.current) {
       void audioContextRef.current.close();
       audioContextRef.current = null;
@@ -310,24 +317,26 @@ export function useVoiceMode({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       const source = ctx.createMediaStreamSource(stream);
-      const processor = ctx.createScriptProcessor(4096, 1, 1);
-      processor.onaudioprocess = (e) => {
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 4096;
+      source.connect(analyser);
+      const buffer = new Float32Array(analyser.fftSize);
+      captureBufferRef.current = buffer;
+      capturePollRef.current = window.setInterval(() => {
         if (!isRecordingRef.current) return;
-        const input = e.inputBuffer.getChannelData(0);
+        analyser.getFloatTimeDomainData(buffer);
         if (pauseSendRef.current) {
-          if (computeEnergy(input) > 0.09) bargeIn();
+          if (computeEnergy(buffer) > 0.09) bargeIn();
           return;
         }
-        const resampled = resample(input, ctx.sampleRate, CAPTURE_SAMPLE_RATE);
+        const resampled = resample(buffer, ctx.sampleRate, CAPTURE_SAMPLE_RATE);
         if (resampled && wsApiRef.current.connected) {
           wsApiRef.current.sendBinary(convertToPCM16(resampled));
         }
-      };
-      source.connect(processor);
-      processor.connect(ctx.destination);
+      }, 50);
       audioContextRef.current = ctx;
       mediaStreamRef.current = stream;
-      processorRef.current = processor;
+      analyserRef.current = analyser;
       isRecordingRef.current = true;
       pauseSendRef.current = false;
       setVoiceState("listening");

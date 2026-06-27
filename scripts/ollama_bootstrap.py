@@ -198,3 +198,20 @@ async def ensure_ollama(skip: bool, skip_pull: bool) -> Optional[subprocess.Pope
 
 def ollama_port_ready() -> bool:
     return port_is_open(OLLAMA_HOST, PORT_OLLAMA)
+
+
+def ollama_http_ready(timeout: float = 3.0) -> bool:
+    """True when Ollama answers HTTP on /api/tags (not just an open TCP port)."""
+    if not port_is_open(OLLAMA_HOST, PORT_OLLAMA):
+        return False
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(
+            f"http://{OLLAMA_HOST}:{PORT_OLLAMA}/api/tags",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= int(resp.status) < 300
+    except Exception:
+        return False

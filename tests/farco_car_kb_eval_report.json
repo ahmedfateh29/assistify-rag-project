@@ -1,0 +1,625 @@
+{
+  "tenant_id": 3,
+  "tenant_name": "Farco",
+  "collection_count": 48,
+  "rag_strict_distance_threshold": 1.0,
+  "not_found_sentinel": "Not found in the document.",
+  "passed": 7,
+  "answer_passed": 4,
+  "retrieval_passed": 14,
+  "total": 18,
+  "pass_rate": 0.389,
+  "answer_pass_rate": 0.222,
+  "retrieval_pass_rate": 0.778,
+  "elapsed_s": 11.68,
+  "results": [
+    {
+      "id": "Q1",
+      "tier": "A",
+      "question": "What are the four phases of the four-stroke engine cycle?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 2,
+      "search_count": 2,
+      "top_distance": 0.14798825979232788,
+      "distance_threshold": 1.1,
+      "answer": "Not found in the document.",
+      "answer_type": "list_llm_required",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "intake",
+          "compression",
+          "power",
+          "combustion"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "intake",
+          "compression",
+          "power",
+          "combustion"
+        ],
+        "missing_all": [],
+        "answer_preview": "Not found in the document.",
+        "not_found": true
+      },
+      "context_summary": "1.1 The Four-Stroke Cycle (cid:127) Intake: The intake valve opens, and the piston moves down, drawing a fuel-airmixture (or air 1.1 The Four-Stroke Cycle alone, in direct-injection engines) into the  | 1. Internal Combustion Engines An internal combustion engine (ICE) generates mechanical power by burning a fuel-airmixture inside a 1. Internal Combustion Engines closed cylinder. The rapid combustion",
+      "top_retrieval_preview": "1.1 The Four-Stroke Cycle (cid:127) Intake: The intake valve opens, and the piston moves down, drawing a fuel-airmixture (or air 1.1 The Four-Stroke Cycle alone, in direct-injection engines) into the cylinder. 1.1 The Four-Stroke Cycle (cid:127) Compression: Both valves close, and the piston moves u"
+    },
+    {
+      "id": "Q2",
+      "tier": "A",
+      "question": "What ignites the fuel-air mixture in a diesel engine?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 2,
+      "search_count": 2,
+      "top_distance": 0.1528199315071106,
+      "distance_threshold": 1.0,
+      "answer": "Not found in the document.",
+      "answer_type": "list_llm_required",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "compression",
+          "inject",
+          "14:1"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "compression",
+          "inject",
+          "14:1"
+        ],
+        "missing_all": [],
+        "answer_preview": "Not found in the document.",
+        "not_found": true
+      },
+      "context_summary": "1.2 Gasoline vs. Diesel Combustion Gasoline engines rely on spark ignition: a precisely timed electrical spark ignites a pre-mixed fuel-aircharge. Diesel engines use compression ignition instead — air | 1.1 The Four-Stroke Cycle (cid:127) Intake: The intake valve opens, and the piston moves down, drawing a fuel-airmixture (or air 1.1 The Four-Stroke Cycle alone, in direct-injection engines) into the ",
+      "top_retrieval_preview": "1.2 Gasoline vs. Diesel Combustion Gasoline engines rely on spark ignition: a precisely timed electrical spark ignites a pre-mixed fuel-aircharge. Diesel engines use compression ignition instead — airalone is compressed to a much higher 1.2 Gasoline vs. Diesel Combustion ratio (typically 14:1 to 23:"
+    },
+    {
+      "id": "Q3",
+      "tier": "A",
+      "question": "What does the \"5W\" in \"5W-30\" engine oil mean?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 1,
+      "search_count": 1,
+      "top_distance": 0.14661589321659063,
+      "distance_threshold": 1.0,
+      "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+      "answer_type": "definition_candidate_rejected",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "winter",
+          "cold",
+          "flows"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "winter",
+          "cold",
+          "flows"
+        ],
+        "missing_all": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "not_found": true
+      },
+      "context_summary": "5.1 OilViscosity Grades Oil is rated using a two-number system such as 5W-30, defined by the Society of Automotive Engineers 5.1 OilViscosity Grades (SAE). The number before the \"W\" (which stands for ",
+      "top_retrieval_preview": "5.1 OilViscosity Grades Oil is rated using a two-number system such as 5W-30, defined by the Society of Automotive Engineers 5.1 OilViscosity Grades (SAE). The number before the \"W\" (which stands for Winter) describes cold-flow performance — a lower 5.1 OilViscosity Grades number flows more easily a"
+    },
+    {
+      "id": "Q4",
+      "tier": "A",
+      "question": "What is the recommended brake fluid replacement interval?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 5,
+      "search_count": 1,
+      "top_distance": 0.15086770685648232,
+      "distance_threshold": 1.0,
+      "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+      "answer_type": "definition_not_found_strict",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "2-3 year",
+          "every 2",
+          "hygroscopic",
+          "moisture"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "2-3 year",
+          "every 2",
+          "hygroscopic",
+          "moisture"
+        ],
+        "missing_all": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "not_found": true
+      },
+      "context_summary": "arettqeuryir ienlge cntori cm vuelthi-igclee Type | How It Works | Common Trait 3 Brake Fluid: Hygroscopic (absorbs moisture over time), which lowers itsboiling point; Type | How It Works | Common Tra | System 2 Water Pump: Circulates coolant through the engine block and radiator, typically driven by a belt 4. The Cooling System connected to the crankshaft. 4. The Cooling System 3 Thermostat: A valve | | Typical Change Interval | Notes enough to begin the combustion cycle when the key or start b",
+      "top_retrieval_preview": "arettqeuryir ienlge cntori cm vuelthi-igclee Type | How It Works | Common Trait 3 Brake Fluid: Hygroscopic (absorbs moisture over time), which lowers itsboiling point; Type | How It Works | Common Trait manufacturers typically recommend replacement every 2-3 years regardless of mileage. Type | How I"
+    },
+    {
+      "id": "Q5",
+      "tier": "A",
+      "question": "What does the number \"45\" mean in the tire size 225/45R17?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 1,
+      "search_count": 1,
+      "top_distance": 0.12335980115770562,
+      "distance_threshold": 1.0,
+      "answer": "9.1 Reading Tire Size Asize like 225 / 45R17 breaks down as: 225 = tread width in millimeters; 45 = aspect ratio, meaning 9.1 Reading Tire Size sidewall height as a percentage of tread width; R = radial construction (standard on virtually all modern",
+      "answer_type": "generic_route_grounded",
+      "score": {
+        "passed": true,
+        "answer_pass": true,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "aspect ratio",
+          "sidewall",
+          "percentage",
+          "225"
+        ],
+        "answer_hits": [
+          "aspect ratio",
+          "sidewall",
+          "percentage",
+          "225"
+        ],
+        "retrieval_hits": [
+          "aspect ratio",
+          "225"
+        ],
+        "missing_all": [],
+        "answer_preview": "9.1 Reading Tire Size Asize like 225 / 45R17 breaks down as: 225 = tread width in millimeters; 45 = aspect ratio, meaning 9.1 Reading Tire Size sidewall height as a percentage of tread width; R = radial construction (standard on virtually all modern",
+        "not_found": false
+      },
+      "context_summary": "of contact between a vehicle and the road, affecting handling, braking distance, Type | How It Works | Common Trait ride comfort, and fuel efficiency. 9.1 Reading a Tire Size A size like 225/45R17 bre",
+      "top_retrieval_preview": "of contact between a vehicle and the road, affecting handling, braking distance, Type | How It Works | Common Trait ride comfort, and fuel efficiency. 9.1 Reading a Tire Size A size like 225/45R17 breaks down as: 225 = tread width in millimeters; 45 = aspect ratio, meaning 9.1 Reading a Tire Size si"
+    },
+    {
+      "id": "Q6",
+      "tier": "A",
+      "question": "How long does a typical 12-volt car battery last?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 1,
+      "search_count": 1,
+      "top_distance": 0.12874127360790755,
+      "distance_threshold": 1.0,
+      "answer": "The Electrical and Charging System The 12-volt lead-acid battery (in conventional vehicles) stores energy to power the starter motor, lights, 6. The Electrical and Charging System Most car batteries last 3-5 years, with lifespan reduced by extreme heat, frequent short trips, and leaving 6.",
+      "answer_type": "generic_route_grounded",
+      "score": {
+        "passed": true,
+        "answer_pass": true,
+        "retrieval_pass": false,
+        "mode": "positive",
+        "any_hits": [
+          "3-5 year"
+        ],
+        "answer_hits": [
+          "3-5 year"
+        ],
+        "retrieval_hits": [],
+        "missing_all": [],
+        "answer_preview": "The Electrical and Charging System The 12-volt lead-acid battery (in conventional vehicles) stores energy to power the starter motor, lights, 6. The Electrical and Charging System Most car batteries last 3-5 years, with lifespan reduced by extreme heat, frequent short trips, and leaving 6.",
+        "not_found": false
+      },
+      "context_summary": "6. The Electrical and Charging System The 12-volt lead-acid battery (in conventional vehicles) stores energy to power the starter motor, lights, 6. The Electrical and Charging System and electronics, ",
+      "top_retrieval_preview": "6. The Electrical and Charging System The 12-volt lead-acid battery (in conventional vehicles) stores energy to power the starter motor, lights, 6. The Electrical and Charging System and electronics, especially when the engine is off. It does not power the wheels in a conventional vehicle. 6. The El"
+    },
+    {
+      "id": "Q7",
+      "tier": "B",
+      "question": "Why do turbocharged engines often require premium fuel?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 1,
+      "search_count": 1,
+      "top_distance": 0.15719568729400635,
+      "distance_threshold": 1.0,
+      "answer": "Higher-performance and turbocharged engines often require or recommend premium fuel 3.1 Gasoline (Petrol) because their higher compression ratios are more prone to knock. Common pump ratings are 87 (regular), 89 3.1 Gasoline (Petrol) (mid-grade), and 91-93 (premium) octane in most markets, though numbering conventions vary by 3.1 Gasoline (Petrol) country.",
+      "answer_type": "generic_route_grounded",
+      "score": {
+        "passed": true,
+        "answer_pass": true,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "knock",
+          "octane",
+          "compression",
+          "premium"
+        ],
+        "answer_hits": [
+          "knock",
+          "octane",
+          "compression",
+          "premium"
+        ],
+        "retrieval_hits": [
+          "knock",
+          "octane",
+          "compression",
+          "premium"
+        ],
+        "missing_all": [],
+        "answer_preview": "Higher-performance and turbocharged engines often require or recommend premium fuel 3.1 Gasoline (Petrol) because their higher compression ratios are more prone to knock. Common pump ratings are 87 (regular), 89 3.1 Gasoline (Petrol) (mid-grade), and 91-93 (premium) octane in most markets, though numbering conventions vary by 3.1 Gasoline (Petrol) country.",
+        "not_found": false
+      },
+      "context_summary": "3.1 Gasoline (Petrol) Gasoline is refined from crude oil and is rated by octane number, which measures resistance to 3.1 Gasoline (Petrol) premature ignition (\"knocking\") under compression. Common pum",
+      "top_retrieval_preview": "3.1 Gasoline (Petrol) Gasoline is refined from crude oil and is rated by octane number, which measures resistance to 3.1 Gasoline (Petrol) premature ignition (\"knocking\") under compression. Common pump ratings are 87 (regular), 89 3.1 Gasoline (Petrol) (mid-grade), and 91-93 (premium) octane in most"
+    },
+    {
+      "id": "Q8",
+      "tier": "B",
+      "question": "A driver hears grinding when braking — what does this likely indicate, and how urgent is it?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 3,
+      "search_count": 3,
+      "top_distance": 0.13015922158100313,
+      "distance_threshold": 1.0,
+      "answer": "Not found in the document.",
+      "answer_type": "list_llm_required",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "pad",
+          "rotor",
+          "metal",
+          "worn"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "pad",
+          "rotor",
+          "metal",
+          "worn"
+        ],
+        "missing_all": [],
+        "answer_preview": "Not found in the document.",
+        "not_found": true
+      },
+      "context_summary": "11.2 Unusual Sounds and What They Often Mean 1 Squealing when braking: Often a built-in wear indicator on brake pads signaling they need 11.2 Unusual Sounds and What They Often Mean 2 Grinding when br | worn or loose serpentine/accessory belt. 11.2 Unusual Sounds and What They Often Mean 5 Clicking when turning: Frequently a worn CVjoint, especially common in front-wheel-drive 11.2 Unusual Sounds and | | Typical Change Interval | Notes enough to begin the combustion cycle when the key or start b",
+      "top_retrieval_preview": "11.2 Unusual Sounds and What They Often Mean 1 Squealing when braking: Often a built-in wear indicator on brake pads signaling they need 11.2 Unusual Sounds and What They Often Mean 2 Grinding when braking: May indicate pads worn down to metal, risking rotor damage — address 11.2 Unusual Sounds and "
+    },
+    {
+      "id": "Q9",
+      "tier": "B",
+      "question": "What's the difference between AWD and 4WD as described in the document?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 5,
+      "search_count": 5,
+      "top_distance": 0.16884101685573627,
+      "distance_threshold": 1.0,
+      "answer": "Awd: 7.2 Drivetra in Layouts 3 All-Wheel Drive (AWD: Power is automatically distributed to all four wheels as needed, usually 7.2 Drivetra in Layouts for improved traction rather than off-road capability.",
+      "answer_type": "compare_explanation_fallback",
+      "score": {
+        "passed": true,
+        "answer_pass": true,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "awd",
+          "all-wheel",
+          "off-road",
+          "traction"
+        ],
+        "answer_hits": [
+          "awd",
+          "all-wheel",
+          "off-road",
+          "traction"
+        ],
+        "retrieval_hits": [
+          "traction"
+        ],
+        "missing_all": [],
+        "answer_preview": "Awd: 7.2 Drivetra in Layouts 3 All-Wheel Drive (AWD: Power is automatically distributed to all four wheels as needed, usually 7.2 Drivetra in Layouts for improved traction rather than off-road capability.",
+        "not_found": false
+      },
+      "context_summary": "7.2 Drivetrain Layouts 1 Front-Wheel Drive (FWD): Engine power goes to the front wheels only; common in economy and 7.2 Drivetrain Layouts family cars for cost, packaging, and decent traction in rain/ | 3.3 Alternative and Electrified Powertrains (cid:127) Hybrid (HEV): Combines a gasoline engine with an electric motor and battery; the battery is 3.3 Alternative and Electrified Powertrains recharged  | 1.1 The Four-Stroke Cycle (cid:127) Intake: The intake valve opens, and the piston moves down,",
+      "top_retrieval_preview": "7.2 Drivetrain Layouts 1 Front-Wheel Drive (FWD): Engine power goes to the front wheels only; common in economy and 7.2 Drivetrain Layouts family cars for cost, packaging, and decent traction in rain/snow. 7.2 Drivetrain Layouts 2 Rear-Wheel Drive (RWD): Power goes to the rear wheels; favored in per"
+    },
+    {
+      "id": "Q10",
+      "tier": "B",
+      "question": "Why shouldn't you keep driving if the oil pressure warning light comes on?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 5,
+      "search_count": 5,
+      "top_distance": 0.18081876436362432,
+      "distance_threshold": 1.0,
+      "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+      "answer_type": "generic_low_confidence_blocked",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "pressure"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "pressure"
+        ],
+        "missing_all": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "not_found": true
+      },
+      "context_summary": "into electrical 6. The Electrical and Charging System energy to recharge the battery and power the car's electrical systems while the engine runs. A failing 6. The Electrical and Charging System alter | worn or loose serpentine/accessory belt. 11.2 Unusual Sounds and What They Often Mean 5 Clicking when turning: Frequently a worn CVjoint, especially common in front-wheel-drive 11.2 Unusual Sounds and | [TABLE DATA] Spark plugs | 30,000-100,000 mi depending on plug material (copper vs. iridium [T",
+      "top_retrieval_preview": "into electrical 6. The Electrical and Charging System energy to recharge the battery and power the car's electrical systems while the engine runs. A failing 6. The Electrical and Charging System alternator typically causes dimming lights, a dashboard battery warning light, and eventually a dead 6. T"
+    },
+    {
+      "id": "Q11",
+      "tier": "C",
+      "question": "Compare the typical refuel/charge time and running cost of a battery electric vehicle versus a hydrogen fuel cell vehicle.",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 5,
+      "search_count": 5,
+      "top_distance": 0.12633025101477924,
+      "distance_threshold": 1.0,
+      "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+      "answer_type": "compare_explanation_fallback",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "electric",
+          "fcev",
+          "hydrogen",
+          "minute",
+          "cost",
+          "charg"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "electric",
+          "fcev",
+          "hydrogen",
+          "minute",
+          "cost",
+          "charg"
+        ],
+        "missing_all": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "not_found": true
+      },
+      "context_summary": "Fuel/Powertrain | Typical Range | Refuel/Charge Time | Relative Running Cost Hydrogen FCEV | 300-400 mi (480-640 km) | 5 minutes | High (limited infrastructure) 5. The Lubrication System Engine oilred | Flex-Fuel / E85: Engines designed to run on gasoline blended with up to 85% ethanol, common in [TABLE DATA] parts of the U.S. agricultural Midwest. [TABLE DATA] (cid:127) CNG/LPG: Compressed natural g | every 30,000-60,000 miles (50,000-100,000 km), 4. The Cooling System though intervals vary by ",
+      "top_retrieval_preview": "Fuel/Powertrain | Typical Range | Refuel/Charge Time | Relative Running Cost Hydrogen FCEV | 300-400 mi (480-640 km) | 5 minutes | High (limited infrastructure) 5. The Lubrication System Engine oilreduces friction between moving metal parts, carries away heat, suspends contaminants until 5. The Lubr"
+    },
+    {
+      "id": "Q12",
+      "tier": "C",
+      "question": "If a car has a timing belt instead of a timing chain, why does its maintenance interval matter so much?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 5,
+      "search_count": 5,
+      "top_distance": 0.1625426520542409,
+      "distance_threshold": 1.0,
+      "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+      "answer_type": "generic_low_confidence_blocked",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "timing belt",
+          "60,000",
+          "100,000",
+          "camshaft",
+          "crankshaft"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "timing belt",
+          "60,000",
+          "100,000",
+          "camshaft",
+          "crankshaft"
+        ],
+        "missing_all": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "not_found": true
+      },
+      "context_summary": "harmful ones Light | Typical Meaning | Urgency Timing Belt/Chain Synchronizes the rotation of the crankshaft and camshaft so valves open/close at the correct time [TABLE DATA] RPM | Revolutions per mi | [TABLE DATA] Spark plugs | 30,000-100,000 mi depending on plug material (copper vs. iridium [TABLE DATA] Timing belt (if equipped) | 60,000-100,000 mi (100,000-160,000 km) — critical, can cause s [TAB | 10. Routine Maintenance Schedule drivetrain, and climate. Service Item Typical Interval Engine",
+      "top_retrieval_preview": "harmful ones Light | Typical Meaning | Urgency Timing Belt/Chain Synchronizes the rotation of the crankshaft and camshaft so valves open/close at the correct time [TABLE DATA] RPM | Revolutions per minute; how fast the engine's crankshaft is spinning [TABLE DATA] Torque | Rotational force an engine "
+    },
+    {
+      "id": "Q13",
+      "tier": "C",
+      "question": "Explain why diesel engines tend to get better fuel economy than gasoline engines, referencing both the combustion process and the fuel itself.",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 5,
+      "search_count": 5,
+      "top_distance": 0.11671531200408936,
+      "distance_threshold": 1.35,
+      "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+      "answer_type": "definition_candidate_rejected",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "compression",
+          "gasoline"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "compression",
+          "gasoline"
+        ],
+        "missing_all": [],
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "not_found": true
+      },
+      "context_summary": "1.2 Gasoline vs. Diesel Combustion Gasoline engines rely on spark ignition: a precisely timed electrical spark ignites a pre-mixed fuel-aircharge. Diesel engines use compression ignition instead — air | makes them heavier and historically associated with higher nitrogen oxide and particulate emissions, 1.2 Gasoline vs. Diesel Combustion though modern after-treatment systems substantially reduce this. | 1. Internal Combustion Engines An internal combustion engine (ICE) generates mechanical power ",
+      "top_retrieval_preview": "1.2 Gasoline vs. Diesel Combustion Gasoline engines rely on spark ignition: a precisely timed electrical spark ignites a pre-mixed fuel-aircharge. Diesel engines use compression ignition instead — airalone is compressed to a much higher 1.2 Gasoline vs. Diesel Combustion ratio (typically 14:1 to 23:"
+    },
+    {
+      "id": "Q14",
+      "tier": "C",
+      "question": "A driver wants a vehicle with no multi-speed transmission at all — which powertrain type would that be, and why doesn't it need one?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 5,
+      "search_count": 5,
+      "top_distance": 0.19763624668121338,
+      "distance_threshold": 1.0,
+      "answer": "Not found in the document.",
+      "answer_type": "list_llm_required",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "electric",
+          "motor"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "electric",
+          "motor"
+        ],
+        "missing_all": [],
+        "answer_preview": "Not found in the document.",
+        "not_found": true
+      },
+      "context_summary": "or more electric motors drawing from a 3.3 Alternative and Electrified Powertrains battery pack, with no internal combustion engine at all. Charged viahome outlets, ACwallboxes, 3.3 Alternative and El | 3.3 Alternative and Electrified Powertrains (cid:127) Hybrid (HEV): Combines a gasoline engine with an electric motor and battery; the battery is 3.3 Alternative and Electrified Powertrains recharged  | 7.2 Drivetrain Layouts 1 Front-Wheel Drive (FWD): Engine power goes to the front wheels only; ",
+      "top_retrieval_preview": "or more electric motors drawing from a 3.3 Alternative and Electrified Powertrains battery pack, with no internal combustion engine at all. Charged viahome outlets, ACwallboxes, 3.3 Alternative and Electrified Powertrains (cid:127) Fuel Cell Electric Vehicle (FCEV): Generates electricity onboard by "
+    },
+    {
+      "id": "Q15",
+      "tier": "C",
+      "question": "What two systems both rely on a belt driven by the engine, and what does each one do?",
+      "trap": false,
+      "notes": "",
+      "retrieval_count": 5,
+      "search_count": 5,
+      "top_distance": 0.20404935904104515,
+      "distance_threshold": 1.0,
+      "answer": "Not found in the document.",
+      "answer_type": "list_llm_required",
+      "score": {
+        "passed": false,
+        "answer_pass": false,
+        "retrieval_pass": true,
+        "mode": "positive",
+        "any_hits": [
+          "water pump",
+          "coolant",
+          "electrical"
+        ],
+        "answer_hits": [],
+        "retrieval_hits": [
+          "water pump",
+          "coolant",
+          "electrical"
+        ],
+        "missing_all": [],
+        "answer_preview": "Not found in the document.",
+        "not_found": true
+      },
+      "context_summary": "System 2 Water Pump: Circulates coolant through the engine block and radiator, typically driven by a belt 4. The Cooling System connected to the crankshaft. 4. The Cooling System 3 Thermostat: A valve | 4. The Cooling System Combustion generates intense heat, and the cooling system prevents the engine from overheating and 4. The Cooling System warping or seizing. Liquid-cooled systems, used in nearly | 6. The Electrical and Charging System The 12-volt lead-acid battery (in conventional vehicles)",
+      "top_retrieval_preview": "System 2 Water Pump: Circulates coolant through the engine block and radiator, typically driven by a belt 4. The Cooling System connected to the crankshaft. 4. The Cooling System 3 Thermostat: A valve that stays closed when the engine is cold to allow faster warm-up, then 4. The Cooling System opens"
+    },
+    {
+      "id": "Q16",
+      "tier": "D",
+      "question": "According to the document, what is the recommended tire pressure for a standard sedan?",
+      "trap": true,
+      "notes": "Should refuse specific PSI; mention door jamb sticker",
+      "retrieval_count": 2,
+      "search_count": 1,
+      "top_distance": 0.19838133273817504,
+      "distance_threshold": 1.0,
+      "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+      "answer_type": "generic_low_confidence_blocked",
+      "score": {
+        "passed": true,
+        "mode": "trap",
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "not_found": true
+      },
+      "context_summary": "of contact between a vehicle and the road, affecting handling, braking distance, Type | How It Works | Common Trait ride comfort, and fuel efficiency. 9.1 Reading a Tire Size A size like 225/45R17 bre | [TABLE DATA] Inline (Straight) | 4 or 6 cylinders in a row; common in sedan | s aSnimd pSlUe,V nsarrow, fits transversely; inline-6 [TABLE DATA] V-Type | V6 and V8 in performance cars, trucks, SU | Vs",
+      "top_retrieval_preview": "of contact between a vehicle and the road, affecting handling, braking distance, Type | How It Works | Common Trait ride comfort, and fuel efficiency. 9.1 Reading a Tire Size A size like 225/45R17 breaks down as: 225 = tread width in millimeters; 45 = aspect ratio, meaning 9.1 Reading a Tire Size si"
+    },
+    {
+      "id": "Q17",
+      "tier": "D",
+      "question": "Does the document mention solid-state batteries for electric vehicles?",
+      "trap": true,
+      "notes": "Should say not covered",
+      "retrieval_count": 5,
+      "search_count": 5,
+      "top_distance": 0.1911711671050419,
+      "distance_threshold": 1.0,
+      "answer": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+      "answer_type": "generic_low_confidence_blocked",
+      "score": {
+        "passed": true,
+        "mode": "trap",
+        "answer_preview": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?",
+        "not_found": true
+      },
+      "context_summary": "6. The Electrical and Charging System The 12-volt lead-acid battery (in conventional vehicles) stores energy to power the starter motor, lights, 6. The Electrical and Charging System and electronics,  | or more electric motors drawing from a 3.3 Alternative and Electrified Powertrains battery pack, with no internal combustion engine at all. Charged viahome outlets, ACwallboxes, 3.3 Alternative and El | 3.3 Alternative and Electrified Powertrains (cid:127) Hybrid (HEV): Combines a gasoline engine",
+      "top_retrieval_preview": "6. The Electrical and Charging System The 12-volt lead-acid battery (in conventional vehicles) stores energy to power the starter motor, lights, 6. The Electrical and Charging System and electronics, especially when the engine is off. It does not power the wheels in a conventional vehicle. 6. The El"
+    },
+    {
+      "id": "Q18",
+      "tier": "D",
+      "question": "What is the maintenance interval for spark plugs in an electric vehicle, according to the document?",
+      "trap": true,
+      "notes": "Trap: EVs have no spark plugs",
+      "retrieval_count": 4,
+      "search_count": 4,
+      "top_distance": 0.13995109402868844,
+      "distance_threshold": 1.0,
+      "answer": "Not found in the document.",
+      "answer_type": "list_llm_required",
+      "score": {
+        "passed": true,
+        "mode": "trap",
+        "answer_preview": "Not found in the document.",
+        "not_found": true
+      },
+      "context_summary": "[TABLE DATA] Spark plugs | 30,000-100,000 mi depending on plug material (copper vs. iridium [TABLE DATA] Timing belt (if equipped) | 60,000-100,000 mi (100,000-160,000 km) — critical, can cause s [TAB | 10. Routine Maintenance Schedule drivetrain, and climate. Service Item Typical Interval Engine oil & filter change 5,000-10,000 mi (8,000-16,000 km) or per oil-life monitor Service Item Typical Interv | into electrical 6. The Electrical and Charging System energy to recharge the battery and power",
+      "top_retrieval_preview": "[TABLE DATA] Spark plugs | 30,000-100,000 mi depending on plug material (copper vs. iridium [TABLE DATA] Timing belt (if equipped) | 60,000-100,000 mi (100,000-160,000 km) — critical, can cause s [TABLE DATA] Battery (12V) check/replacement | 3-5 years [TABLE DATA] Wheel alignment | Every 2-3 years "
+    }
+  ]
+}

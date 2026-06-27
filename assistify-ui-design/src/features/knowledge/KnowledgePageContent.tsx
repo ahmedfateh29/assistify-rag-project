@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import {
   Download,
   Edit2,
@@ -18,6 +18,7 @@ import { Modal } from "@/src/components/ui/Modal";
 import { PageHeader } from "@/src/components/ui/PageHeader";
 import { SearchInput } from "@/src/components/ui/SearchInput";
 import { StatCard } from "@/src/components/ui/StatCard";
+import { Toast } from "@/src/components/ui/Toast";
 import { KbPipelineStatusPanel } from "@/src/features/knowledge/KbPipelineStatusPanel";
 import { pipelineStateLabel } from "@/src/types/kbPipeline";
 
@@ -47,6 +48,7 @@ export function KnowledgePageContent({
     remove,
     getFileContent,
     getPdfData,
+    previewUrl,
     updateFileContent,
     downloadUrl,
   } = useKnowledge();
@@ -62,17 +64,43 @@ export function KnowledgePageContent({
   const [previewTitle, setPreviewTitle] = useState("");
   const [previewContent, setPreviewContent] = useState("");
   const [previewPdf, setPreviewPdf] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [editOpen, setEditOpen] = useState(false);
   const [editFilename, setEditFilename] = useState("");
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
+  const [clearingCache, setClearingCache] = useState(false);
+  const [cacheNotice, setCacheNotice] = useState<{ message: string; variant: "success" | "error" } | null>(null);
+
+  const dismissCacheNotice = useCallback(() => setCacheNotice(null), []);
+
+  const handleClearCache = async () => {
+    setClearingCache(true);
+    try {
+      const message = await clearCache();
+      setCacheNotice({ message, variant: "success" });
+    } catch {
+      setCacheNotice({
+        message: "Failed to clear cache. Please try again.",
+        variant: "error",
+      });
+    } finally {
+      setClearingCache(false);
+    }
+  };
 
   const filtered = files.filter((f) =>
+    f.displayName.toLowerCase().includes(searchTerm.toLowerCase()) ||
     f.filename.toLowerCase().includes(searchTerm.toLowerCase()),
   );
 
-  const actionsDisabled = isPipelineBusy || uploading || reindexing;
+  const actionsDisabled = isPipelineBusy || uploading || reindexing || clearingCache;
   const statusLabel = pipelineStateLabel(pipelineStatus?.state);
+  const indexedChunksTotal =
+    pipelineStatus?.collection_chunks ??
+    pipelineStatus?.indexed_chunks ??
+    files.reduce((sum, f) => sum + (f.indexed_chunks ?? 0), 0);
 
   const handleUpload = async (file: File) => {
     setUploading(true);
@@ -92,18 +120,36 @@ export function KnowledgePageContent({
     }
   };
 
-  const openPreview = async (filename: string) => {
-    setPreviewTitle(filename);
+  const openPreview = async (storedName: string, displayName: string) => {
+    setPreviewTitle(displayName);
     setPreviewPdf(null);
     setPreviewContent("");
+    setPreviewError(null);
+    setPreviewLoading(true);
     setPreviewOpen(true);
-    if (filename.toLowerCase().endsWith(".pdf")) {
-      const data = await getPdfData(filename);
-      const b64 = data.data ?? data.base64 ?? "";
-      setPreviewPdf(b64 ? `data:application/pdf;base64,${b64}` : null);
-    } else {
-      const content = await getFileContent(filename);
-      setPreviewContent(content);
+    try {
+      if (storedName.toLowerCase().endsWith(".pdf")) {
+        setPreviewPdf(previewUrl(storedName));
+      } else {
+        const content = await getFileContent(storedName);
+        setPreviewContent(content);
+      }
+    } catch {
+      if (storedName.toLowerCase().endsWith(".pdf")) {
+        try {
+          const data = await getPdfData(storedName);
+          const b64 = data.bytes_b64 ?? data.data ?? data.base64 ?? "";
+          if (b64) {
+            setPreviewPdf(`data:application/pdf;base64,${b64}`);
+            return;
+          }
+        } catch {
+          // fall through to error message
+        }
+      }
+      setPreviewError("Could not load preview. The file may have been moved, renamed, or deleted.");
+    } finally {
+      setPreviewLoading(false);
     }
   };
 
@@ -152,7 +198,7 @@ export function KnowledgePageContent({
         <StatCard
           icon={<FileText className="h-6 w-6" />}
           label="Indexed Chunks"
-          value={String(files.reduce((sum, f) => sum + (f.indexed_chunks ?? 0), 0))}
+          value={String(indexedChunksTotal)}
           colorClass="text-[#f6c33c]"
         />
       </div>
@@ -191,8 +237,9 @@ export function KnowledgePageContent({
             type="button"
             disabled={actionsDisabled}
             className="ml-3 inline-flex items-center gap-2 rounded-lg border border-[#444] px-4 py-2 text-sm text-[#9ca3af] hover:text-[#fafaff] disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={() => clearCache().catch(() => {})}
+            onClick={() => handleClearCache().catch(() => {})}
           >
+            {clearingCache ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
             Clear cache
           </button>
         </Card>
@@ -211,7 +258,7 @@ export function KnowledgePageContent({
               <div className="flex items-center gap-3">
                 <FileText className="h-5 w-5 text-[#10a37f]" />
                 <div>
-                  <span className="font-medium text-[#fafaff]">{f.filename}</span>
+                  <span className="font-medium text-[#fafaff]">{f.displayName}</span>
                   <p className="text-xs text-[#9ca3af]">
                     {formatBytes(f.size)}
                     {typeof f.indexed_chunks === "number" ? ` · ${f.indexed_chunks} chunks` : ""}
@@ -221,7 +268,7 @@ export function KnowledgePageContent({
               <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
-                  onClick={() => openPreview(f.filename).catch(() => {})}
+                  onClick={() => void openPreview(f.filename, f.displayName)}
                   className="flex items-center gap-1 rounded-lg bg-[#333333] px-3 py-1.5 text-xs text-[#fafaff] hover:bg-[#444444]"
                 >
                   <Eye className="h-3 w-3" /> Preview
@@ -272,10 +319,17 @@ export function KnowledgePageContent({
       )}
 
       <Modal open={previewOpen} onClose={() => setPreviewOpen(false)} title={`Preview: ${previewTitle}`}>
-        {previewPdf ? (
-          <iframe src={previewPdf} className="h-96 w-full rounded-lg border border-[#333]" title="PDF preview" />
+        {previewLoading ? (
+          <div className="flex h-48 items-center justify-center text-[#9ca3af]">
+            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+            Loading preview...
+          </div>
+        ) : previewError ? (
+          <p className="rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-200">{previewError}</p>
+        ) : previewPdf ? (
+          <iframe src={previewPdf} className="h-[70vh] w-full rounded-lg border border-[#333]" title="PDF preview" />
         ) : (
-          <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-lg bg-[#232323] p-4 text-sm text-[#fafaff]">
+          <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap rounded-lg bg-[#232323] p-4 text-sm text-[#fafaff]">
             {previewContent || "No preview available"}
           </pre>
         )}
@@ -308,6 +362,14 @@ export function KnowledgePageContent({
           onChange={(e) => setEditContent(e.target.value)}
         />
       </Modal>
+
+      {cacheNotice && (
+        <Toast
+          message={cacheNotice.message}
+          variant={cacheNotice.variant}
+          onDismiss={dismissCacheNotice}
+        />
+      )}
     </div>
   );
 }

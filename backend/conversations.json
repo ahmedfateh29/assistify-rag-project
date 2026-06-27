@@ -1,6 +1,125 @@
 {
   "conversations": [
     {
+      "id": "7fffbe72-4610-4bd8-a68b-0612cd12d41a",
+      "title": "What was the ROC-AUC score of the Logistic...",
+      "messages": [
+        {
+          "role": "user",
+          "text": "What was the ROC-AUC score of the Logistic Regression baseline model at the default 0.50 threshold?"
+        },
+        {
+          "role": "assistant",
+          "text": "The ROC-AUCscore of the Logistic Regression baseline model at the default 0.50 threshold is 0.7272."
+        },
+        {
+          "role": "user",
+          "text": "What are the three parts of the soul according to Plato, and how did he define the 'rational' part?"
+        },
+        {
+          "role": "assistant",
+          "text": "Item 1: According to Plato, the soul has three parts or components which he calls reason, spirit, and appetite. Item 2: The rational (or thinking) part is the highest in order. When a person moves from believing to thinking, he moves from the visible world to the intelligible world, from the realm of opinion to the realm of knowledge. Thinking is particularly the characteristic of the scientist."
+        },
+        {
+          "role": "user",
+          "text": "What are the three ports of Sol according to Plato and how did he define the rational port?"
+        },
+        {
+          "role": "assistant",
+          "text": "Item 1: According to Plato, there are three parts or components in the soul: reason, spirit, and appetite. Item 2: The rational part is defined as the highest in order. When a person moves from believing to thinking, he moves from the visible world to the intelligible world, from the realm of opinion to the realm of knowledge. Thinking is particularly the characteristic of the scientist."
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "Ahmed_Fateh",
+      "created_at": "2026-06-24T12:50:25.487405+00:00",
+      "updated_at": "2026-06-24T12:52:22.753707+00:00"
+    },
+    {
+      "id": "a40b30b2-1fca-485c-8523-dbda05366d3b",
+      "title": "hi",
+      "messages": [
+        {
+          "role": "user",
+          "text": "hi"
+        },
+        {
+          "role": "assistant",
+          "text": "Hello! Thank you for contacting support. How can I help you today?"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "Ahmed_Fateh",
+      "created_at": "2026-06-24T12:09:31.026656+00:00",
+      "updated_at": "2026-06-24T12:09:31.049612+00:00"
+    },
+    {
+      "id": "3e022064-5a6a-41a5-9109-bbdd45988d13",
+      "title": "Hi, how are you doing?",
+      "messages": [
+        {
+          "role": "user",
+          "text": "Hi, how are you doing?"
+        },
+        {
+          "role": "assistant",
+          "text": "I'm doing well, thank you for asking. How can I help you with your support question today?"
+        },
+        {
+          "role": "user",
+          "text": "What are the three parts of the saw according to plateau and how did he define the rational part?"
+        },
+        {
+          "role": "assistant",
+          "text": "Item 1: According to Plato, the soul has three parts or components which he calls reason, spirit, and appetite. Item 2: The rational or thinking part is the highest in order. When a person moves from believing to thinking, he moves from the visible world to the intelligible world, from the realm of opinion to the realm of knowledge."
+        },
+        {
+          "role": "user",
+          "text": "I don't know what to do. Sorry, I don't know what to do."
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "I'm gonna... hold still."
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        },
+        {
+          "role": "user",
+          "text": "Help balloon does does missy head."
+        },
+        {
+          "role": "assistant",
+          "text": "- It helps in setting realistic goals.\n- Mental practice can help overcome this problem.\n- Mental Practice: Helping sportspersons give \"Peak Performance\" Sport psychologists have devised strategies for helping athletes and others in reaching and maintaining peak performance."
+        },
+        {
+          "role": "user",
+          "text": "n-n-n-n-n-n"
+        },
+        {
+          "role": "assistant",
+          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+        }
+      ],
+      "tenant_id": 1,
+      "owner": "ahmed_khaled1",
+      "created_at": "2026-06-24T09:42:16.435471+00:00",
+      "updated_at": "2026-06-24T09:43:59.241652+00:00"
+    },
+    {
+      "id": "fddf8824-de6d-4b0a-94ce-d3f96377a53d",
+      "title": "New chat",
+      "messages": [],
+      "tenant_id": 1,
+      "owner": "Ahmed_Fateh",
+      "created_at": "2026-06-24T09:40:54.447580+00:00",
+      "updated_at": "2026-06-24T09:40:54.447580+00:00"
+    },
+    {
       "id": "31817e26-57fe-44db-9e02-51e3c87e1272",
       "title": "What was the ROC AUC score of the...",
       "messages": [
@@ -267,48 +386,6 @@
       "owner": null,
       "created_at": "2026-06-22T14:58:15.121384+00:00",
       "updated_at": "2026-06-22T14:58:15.121384+00:00"
-    },
-    {
-      "id": "2811a017-2c3e-4864-a5d8-d95d7101a93c",
-      "title": "about psychology.",
-      "messages": [
-        {
-          "role": "user",
-          "text": "about psychology."
-        },
-        {
-          "role": "assistant",
-          "text": "Popular areas of psychology Clinical Psychology Abranch of psychology concerned with the study, diagnosis, and treatment ofabnormal behavior. Introduction to Psychology -PSY101 VUScientific nature of Psychology is a science Itemploys the scientific method for gathering knowledge and information."
-        },
-        {
-          "role": "user",
-          "text": "Tell me about five phases of psychology or four phases. I did not know"
-        },
-        {
-          "role": "assistant",
-          "text": "Four phases of psychology include Introduction to Psychology - Scientific method for gathering knowledge and information, Clinical Psychology focusing on studying, diagnosing, and treating abnormal behavior, Research involving observation, description, control, and replication of phenomena, and Education / teaching where psychological principles are applied in teaching settings."
-        },
-        {
-          "role": "user",
-          "text": "The HR report uses a correlation heatmap to identify drivers of attrition. Referencing the **Research Methods in Psychology** chapter, explain the difference between correlation and causation. Why must IBM HR be careful not to assume that reducing 'OverTime' will *causally* reduce attrition without further experimental or quasi-experimental research?"
-        },
-        {
-          "role": "user",
-          "text": "The HR report uses a correlation heatmap to identify drivers of attrition. Referencing the **Research Methods in Psychology** chapter, explain the difference between correlation and causation. Why must IBM HR be careful not to assume that reducing 'OverTime' will *causally* reduce attrition without further experimental or quasi-experimental research?"
-        },
-        {
-          "role": "assistant",
-          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
-        },
-        {
-          "role": "assistant",
-          "text": "Thanks for your question. I don't have that specific detail in our help materials yet, but I'm here to help with anything covered in your knowledge base. What would you like to know?"
-        }
-      ],
-      "tenant_id": 1,
-      "owner": "Ahmed_Fateh",
-      "created_at": "2026-06-22T10:20:06.013096+00:00",
-      "updated_at": "2026-06-22T15:14:29.783209+00:00"
     },
     {
       "id": "aa49780d-d772-48ba-8371-e0a29d621a62",

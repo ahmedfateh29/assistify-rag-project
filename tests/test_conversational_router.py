@@ -229,6 +229,16 @@ def test_finalize_maps_sentinel_for_thank_you() -> None:
     assert "welcome" in out.lower()
 
 
+def test_repeated_letter_greeting_variants() -> None:
+    variants = ["hi", "hii", "hiii", "hello", "helloo", "hey", "heyy", "thanks", "thankss", "ok", "okk"]
+    for query in variants:
+        assert classify_query_route(query) == "smalltalk", query
+        assert _is_pure_smalltalk_query(query), query
+        response = _smalltalk_response(query)
+        assert response
+        assert "Not found in the document." not in response
+
+
 if __name__ == "__main__":
     test_classify_query_route_conversational()
     test_finalize_maps_sentinel_for_conversational()
@@ -247,4 +257,5 @@ if __name__ == "__main__":
     test_assistant_meta_capability_questions()
     test_thank_you_smalltalk_routing()
     test_finalize_maps_sentinel_for_thank_you()
+    test_repeated_letter_greeting_variants()
     print("All conversational router tests passed.")

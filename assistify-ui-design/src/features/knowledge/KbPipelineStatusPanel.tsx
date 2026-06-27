@@ -62,6 +62,11 @@ export function KbPipelineStatusPanel({ status }: { status: KbPipelineStatus | n
   const percent = status.percent ?? 0;
   const hasPercent = (status.total_chunks ?? 0) > 0 || percent > 0;
   const showIndeterminate = busy && !hasPercent;
+  const totalChunks = status.total_chunks ?? 0;
+  const indexedChunks = Math.min(status.indexed_chunks ?? 0, totalChunks > 0 ? totalChunks : status.indexed_chunks ?? 0);
+  const displayPercent = totalChunks > 0
+    ? Math.max(0, Math.min(100, Math.round((indexedChunks / totalChunks) * 100)))
+    : percent;
 
   return (
     <Card
@@ -93,18 +98,18 @@ export function KbPipelineStatusPanel({ status }: { status: KbPipelineStatus | n
             ) : (
               <div
                 className="h-full rounded-full bg-[#10a37f] transition-all duration-300"
-                style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}
+                style={{ width: `${displayPercent}%` }}
               />
             )}
           </div>
 
           <div className="flex items-center justify-between text-xs text-[#9ca3af]">
             <span>
-              {(status.total_chunks ?? 0) > 0
-                ? `${status.indexed_chunks ?? 0} / ${status.total_chunks} chunks`
+              {totalChunks > 0
+                ? `${indexedChunks} / ${totalChunks} chunks`
                 : status.message || ""}
             </span>
-            {!showIndeterminate && <span>{percent}%</span>}
+            {!showIndeterminate && <span>{displayPercent}%</span>}
           </div>
         </>
       )}

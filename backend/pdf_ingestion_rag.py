@@ -81,7 +81,7 @@ RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM
 # active collection changes (see _rerank_cache_clear) and on KB hot-swap.
 import hashlib as _rc_hashlib
 from collections import OrderedDict as _RC_OrderedDict
-_RERANK_CACHE_MAX = 128
+_RERANK_CACHE_MAX = int(os.environ.get("RERANK_CACHE_MAX", "512"))
 _RERANK_CACHE: "_RC_OrderedDict[str, Dict[str, float]]" = _RC_OrderedDict()
 
 
@@ -107,9 +107,29 @@ def _rerank_cache_put(key: str, scores: Dict[str, float]) -> None:
         _RERANK_CACHE.popitem(last=False)
 
 
+# Query-embedding LRU cache (keyed by collection + normalized E5 query string)
+_QUERY_EMBED_CACHE_MAX = int(os.environ.get("QUERY_EMBED_CACHE_MAX", "256"))
+_QUERY_EMBED_CACHE: "_RC_OrderedDict[str, list[float]]" = _RC_OrderedDict()
+
+
+def _query_embed_cache_get(key: str) -> Optional[list[float]]:
+    val = _QUERY_EMBED_CACHE.get(key)
+    if val is not None:
+        _QUERY_EMBED_CACHE.move_to_end(key)
+    return val
+
+
+def _query_embed_cache_put(key: str, embedding: list[float]) -> None:
+    _QUERY_EMBED_CACHE[key] = embedding
+    _QUERY_EMBED_CACHE.move_to_end(key)
+    while len(_QUERY_EMBED_CACHE) > _QUERY_EMBED_CACHE_MAX:
+        _QUERY_EMBED_CACHE.popitem(last=False)
+
+
 def _rerank_cache_clear(reason: str = "") -> None:
     n = len(_RERANK_CACHE)
     _RERANK_CACHE.clear()
+    _QUERY_EMBED_CACHE.clear()
     logger.info("[RERANK CACHE] cleared entries=%d reason=%s", n, reason or "unspecified")
 
 
@@ -144,9 +164,11 @@ class VectorStore:
         else:
             self.collection_base = self.collection_name
         self.collection = self._resolve_active_collection()
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL} on {DEVICE}")
+        logger.info(f"Reusing shared embedding model: {EMBEDDING_MODEL} on {DEVICE}")
+        from backend.knowledge_base import get_shared_embedder
+
+        self.embedding_model = get_shared_embedder()
         self.embedding_model_name = EMBEDDING_MODEL
-        self.embedding_model = SentenceTransformer(self.embedding_model_name, device=DEVICE)
         self.embedding_dim = int(self.embedding_model.get_sentence_embedding_dimension() or 0)
         # After loading the embedding model, verify compatibility with the
         # selected Chroma collection. If the collection already contains
@@ -540,22 +562,13 @@ class VectorStore:
     def _query_profile(query: str) -> Dict[str, Any]:
         q = (query or "").lower()
         chapter_match = re.search(r"\b(?:chapter|unit|lesson)\s+(\d+)\b", q)
+        # Title hints are derived generically from capitalized noun phrases in the
+        # query (any document's section/topic names), not from a fixed domain list.
         chapter_title_hints: List[str] = []
-        for pattern in (
-            r"industrial[/\s-]*organizational\s+psychology",
-            r"health\s+psychology",
-            r"social\s+psychology",
-            r"research\s+methods(?:\s+in\s+psychology)?",
-            r"\bmemory\b",
-            r"biopsychology",
-            r"operant\s+conditioning",
-            r"cognitive\s+dissonance",
-            r"general\s+adaptation\s+syndrome",
-            r"predictive\s+validity",
-        ):
-            m = re.search(pattern, q)
-            if m:
-                chapter_title_hints.append(m.group(0).strip())
+        for m in re.findall(r"\b[A-Z][A-Za-z]+(?:[\s\-/][A-Z][A-Za-z]+){1,4}\b", str(query or "")):
+            hint = re.sub(r"\s+", " ", m.strip())
+            if hint and hint.lower() not in (h.lower() for h in chapter_title_hints):
+                chapter_title_hints.append(hint)
         numeric_tokens = re.findall(r"\d+\.?\d*%?", q)
         return {
             "chapter_query": bool(chapter_match),
@@ -617,6 +630,12 @@ class VectorStore:
                 heading_like += 1
                 continue
             if re.match(r"^\s*\d+(?:\.\d+)*\s+[A-Za-z\u0600-\u06FF]", line):
+                # Numbered list items with explanatory clauses (e.g. drivetrain bullets)
+                # are content, not bare headings.
+                if ":" in line:
+                    after_colon = line.split(":", 1)[-1]
+                    if len(re.findall(r"[A-Za-z\u0600-\u06FF0-9]+", after_colon)) >= 6:
+                        continue
                 heading_like += 1
 
         return heading_like / float(max(1, len(lines)))
@@ -632,13 +651,10 @@ class VectorStore:
             return True
         if re.search(r"(?m)^\s*[-*•]\s+", raw_text):
             return True
-        if re.search(r"(?i)\b(?:cardio|respiratory|vasomotor|reason|spirit|appetite)\b", raw_text):
-            return True
-        if re.search(r"\d+\.\d+\s*%", raw_text):
-            return True
-        if re.search(r"(?i)\broc[- ]?auc\b", raw_text):
-            return True
-        if re.search(r"\b16\.12\b|\b20\.6\d\b|\b0\.7272\b", raw_text):
+        numbered_colon_items = len(
+            re.findall(r"(?m)^\s*\d+\s+[A-Za-z][^\n]{4,}:", raw_text)
+        )
+        if numbered_colon_items >= 2:
             return True
         return False
 
@@ -655,13 +671,33 @@ class VectorStore:
         numeric_ratio = numeric_tokens / float(max(1, len(tokens)))
         if len(tokens) >= 16 and numeric_ratio >= 0.35 and not structured_short:
             if "[TABLE DATA]" not in raw_text and str(meta.get("chunk_role") or "").lower() != "table":
-                return "number_heavy"
+                try:
+                    from backend.rag_chunk_heuristics import _is_colon_led_definition_chunk
+
+                    if _is_colon_led_definition_chunk(raw_text):
+                        pass
+                    else:
+                        return "number_heavy"
+                except Exception:
+                    return "number_heavy"
 
         if word_count < 40 and not structured_short:
             return "too_short"
 
         heading_ratio = VectorStore._heading_dominance_ratio(raw_text)
         if heading_ratio >= 0.60:
+            try:
+                from backend.rag_chunk_heuristics import _is_colon_led_definition_chunk
+
+                if _is_colon_led_definition_chunk(raw_text):
+                    return None
+            except Exception:
+                pass
+            numbered_explainer = len(
+                re.findall(r"(?m)^\s*\d+\s+[A-Za-z].{4,}:", raw_text)
+            )
+            if numbered_explainer >= 2 and raw_text.count(".") >= 2:
+                return None
             return "heading_dominated"
 
         if VectorStore._ocr_garbage_ratio(raw_text) >= 0.45:
@@ -895,17 +931,20 @@ class VectorStore:
         
         logger.info(f"[RAG] Search: '{normalized_query}' | top_k={top_k}")
 
-        # ── Timing: embedding ─────────────────────────────────────────────
+        # ── Timing: embedding (cached per collection + query) ───────────
         _t_emb0 = _time_vs.perf_counter()
-        query_embedding = self.embedding_model.encode([query_for_embedding], show_progress_bar=False)[0]
+        _embed_key = f"{self.collection_name or 'default'}::{query_for_embedding}"
+        _cached_emb = _query_embed_cache_get(_embed_key)
+        if _cached_emb is not None:
+            query_embedding = _cached_emb
+        else:
+            encoded = self.embedding_model.encode([query_for_embedding], show_progress_bar=False)[0]
+            query_embedding = encoded.tolist() if hasattr(encoded, "tolist") else list(encoded)
+            _query_embed_cache_put(_embed_key, query_embedding)
         _t_emb_ms = (_time_vs.perf_counter() - _t_emb0) * 1000
         logger.info("[RETRIEVAL TIMING] query_embedding=%.0f ms", _t_emb_ms)
         
-        # Lower candidate pool for faster retrieval latency while keeping
-        # enough recall for downstream ranking. Floor reduced from 40 to 24
-        # so small top_k queries (e.g. definition probes with top_k=8) rerank
-        # ~24-32 candidates instead of 40+.
-        candidate_pool = max(24, min(240, top_k * 4))
+        candidate_pool = max(24, min(120, top_k * 4))
 
         results = None
         last_query_exception = None
@@ -916,7 +955,7 @@ class VectorStore:
             try:
                 logger.info(f"[RAG] attempting chroma.query n_results={attempt_pool}")
                 results = self.collection.query(
-                    query_embeddings=[query_embedding.tolist()],
+                    query_embeddings=[query_embedding if isinstance(query_embedding, list) else query_embedding.tolist()],
                     n_results=attempt_pool,
                     where=filter_meta
                 )
@@ -1047,6 +1086,19 @@ class VectorStore:
                     "trace_preview": (chunk_text[:120] if chunk_text else ""),
                 })
         logger.info("[DOC COUNT TRACE] stage=VectorStore.search.candidates_raw count=%s", len(candidates))
+
+        # Skip expensive rerank when the top hit is already a strong semantic match.
+        _top_sim = float(candidates[0].get("similarity", 0.0) or 0.0) if candidates else 0.0
+        _skip_rerank = bool(
+            enable_rerank
+            and candidates
+            and len(candidates) == 1
+            and _top_sim >= 0.92
+            and top_k <= 3
+        )
+        if _skip_rerank:
+            logger.info("[RERANK SKIP] high_confidence_single_hit similarity=%.3f", _top_sim)
+            enable_rerank = False
 
         # --- STEP: RERANKING (optional) ---
         _t_rerank0 = _time_vs.perf_counter()
@@ -1271,7 +1323,13 @@ class VectorStore:
 
         candidates.sort(key=lambda item: item.get("final_score", 0.0), reverse=True)
 
-        max_selected = max(1, min(5, top_k))
+        synthesis_query = bool(
+            query_profile.get("structure_query")
+            or query_profile.get("chapter_query")
+            or requested_top_k > 8
+        )
+        max_cap = 8 if synthesis_query else 5
+        max_selected = max(1, min(max_cap, top_k))
         selected_high_quality = self._select_top_high_quality(
             candidates, max_items=max_selected, query_profile=query_profile
         )
@@ -1379,13 +1437,37 @@ _OCR_MERGE_STOPWORDS = frozenset({
     "such", "no", "only", "own", "same", "too", "very", "just", "also", "now", "here", "there",
     "am", "been", "being", "into", "about", "after", "before", "between", "through", "during",
     "help", "like", "know", "want", "need", "use", "using", "used", "one", "two", "new", "old",
+    "per", "out", "off", "over", "down", "via", "etc",
 })
 
 
 def _repair_split_words(text: str) -> str:
-    """Fix common PDF layout artifacts like 'for mation' or 'at trition'."""
+    """Fix common PDF layout artifacts like 'for mation' or 'at trition'.
+
+    Only applies whitelist-approved OCR repairs (_KNOWN_SPLIT_WORD_REPAIRS) and
+    structural fixes (de-hyphenation, ALL-CAPS collapse, single-char gaps).
+    The broad two-word merge regex was removed because it incorrectly merged
+    valid English phrases such as 'web banking', 'low annual', 'my password'.
+    """
     if not text:
         return ""
+    # --- PDF glyph / encoding artifact cleanup (run before word-level repairs) ---
+    # pdfplumber emits "(cid:NNN)" when a glyph has no ToUnicode mapping. In this
+    # corpus "(cid:127)" is a bullet "•"; that and any other unmapped glyph are
+    # dropped so they never pollute chunk text or get treated as words.
+    if "(cid:" in text:
+        text = re.sub(r"\(cid:\d+\)", " ", text)
+    # Normalize Unicode punctuation that otherwise renders as mojibake ("�")
+    # downstream. These are valid characters, just normalized to ASCII so stored
+    # chunks stay clean and string matching is robust. This does NOT merge or
+    # delete words.
+    text = (
+        text.replace("\u2014", "-")   # em dash —
+            .replace("\u2013", "-")   # en dash –
+            .replace("\u2018", "'").replace("\u2019", "'")   # curly single quotes
+            .replace("\u201c", '"').replace("\u201d", '"')   # curly double quotes
+            .replace("\u00a0", " ")   # non-breaking space
+    )
     for pattern, replacement in _KNOWN_SPLIT_WORD_REPAIRS:
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     # De-hyphenate across line breaks first.
@@ -1398,23 +1480,8 @@ def _repair_split_words(text: str) -> str:
         return match.group(0)
 
     text = re.sub(r"\b(?:[A-Z]{1,3}\s+){2,}[A-Z]{1,3}\b", _collapse_caps_run, text)
-    # Merge obvious two-fragment splits: short prefix + space + short suffix.
-    def _merge_match(match: re.Match) -> str:
-        left, right = match.group(1), match.group(2)
-        left_l, right_l = left.lower(), right.lower()
-        if left_l in _OCR_MERGE_STOPWORDS or right_l in _OCR_MERGE_STOPWORDS:
-            return match.group(0)
-        merged = left + right
-        # Merge only plausible PDF fragment joins (short prefix + longer suffix).
-        if len(left) <= 3 and len(right) >= 4 and 6 <= len(merged) <= 14:
-            return merged
-        return match.group(0)
-
-    text = re.sub(r"\b([a-z]{2,4})\s+([a-z]{3,12})\b", _merge_match, text, flags=re.IGNORECASE)
     # Join single-character gaps (e.g. "P s y c h o l o g y", "C O MPANY").
     text = re.sub(r"(?<=\b[A-Za-z])\s(?=[A-Za-z]\b)", "", text)
-    # Second pass for residual intra-word splits after caps collapse.
-    text = re.sub(r"\b([a-z]{2,4})\s+([a-z]{3,12})\b", _merge_match, text, flags=re.IGNORECASE)
     return text
 
 
@@ -1426,6 +1493,9 @@ def extract_pdf_pages_robust(file_path: str | Path) -> list[dict[str, Any]]:
         with pdfplumber.open(path) as pdf:
             total_pages = len(pdf.pages)
             logger.info("Extracting %s pages using pdfplumber from %s", total_pages, path)
+            # Skip table extraction for large documents — pdfplumber.extract_tables()
+            # is O(n²) on page layout objects and can take seconds per page on dense textbooks.
+            skip_tables = total_pages > 60
 
             for page_num, page in enumerate(pdf.pages, start=1):
                 # layout=False avoids intra-word spaces ("for mation", "at trition").
@@ -1436,7 +1506,7 @@ def extract_pdf_pages_robust(file_path: str | Path) -> list[dict[str, Any]]:
                         text = text_layout
                 text = _repair_split_words(text)
                 try:
-                    tables = page.extract_tables() or []
+                    tables = [] if skip_tables else (page.extract_tables() or [])
                     table_blocks: list[str] = []
                     for table in tables:
                         if not table:
@@ -1934,6 +2004,14 @@ class AdaptiveRAGPipeline:
 
     # --- MAIN INGESTION ---
     def ingest_pdf(self, file_path: str):
+        import warnings
+
+        warnings.warn(
+            "AdaptiveRAGPipeline.ingest_pdf is deprecated; production uploads use "
+            "knowledge_base.chunk_and_add_document instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         t0 = time.time()
         file_name = os.path.basename(file_path)
         logger.info(f"Starting ingestion for {file_name}")

@@ -63,6 +63,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.ollama_bootstrap import ensure_ollama  # noqa: E402
 from scripts.react_ui_build import ensure_react_ui_built  # noqa: E402
+from scripts.public_tunnel import PublicTunnel, print_access_urls  # noqa: E402
 
 PORT_LLM = 8010
 PORT_RAG = 7000
@@ -177,6 +178,22 @@ def parse_args():
     p.add_argument("--log-dir", default="logs", help="Directory to write per-service log files (default 'logs')")
     p.add_argument("--skip-ui-build", action="store_true", help="Skip npm build; require existing assistify-ui-design/out/")
     p.add_argument("--ui-build-only", action="store_true", help="Build React UI and exit without starting services")
+    p.add_argument(
+        "--public",
+        action="store_true",
+        help="After startup, expose Login/UI via cloudflared or ngrok HTTPS tunnel",
+    )
+    p.add_argument(
+        "--tunnel-provider",
+        choices=["auto", "cloudflared", "ngrok"],
+        default="auto",
+        help="Tunnel tool when using --public (default: auto = cloudflared then ngrok)",
+    )
+    p.add_argument(
+        "--service-logs",
+        action="store_true",
+        help="Mirror each split-mode service terminal to logs/*.log and enable /internal/service-logs",
+    )
     return p.parse_args()
 
 
@@ -440,6 +457,7 @@ async def main():
     SERVICE_LOG_FILES = {}
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
+    tunnel: PublicTunnel | None = None
     try:
         # Store quick mode in current task for access in start_service
         if args.quick:
@@ -602,6 +620,21 @@ async def main():
         print("\n" + "="*70)
         print("[SUCCESS] ALL SERVERS RUNNING")
         print("="*70)
+
+        public_url: str | None = None
+        login_port = SERVICES[2]["port"]
+        if args.public and not args.no_login:
+            tunnel = PublicTunnel(port=login_port, provider=args.tunnel_provider)
+            public_url = tunnel.start_sync()
+
+        print_access_urls(
+            login_port=login_port,
+            rag_port=SERVICES[1]["port"],
+            llm_port=SERVICES[0]["port"],
+            public_base=public_url,
+            tunnel_provider=tunnel.resolved_provider if tunnel else None,
+            service_logs=args.service_logs or args.public,
+        )
         print("Press Ctrl+C to stop all servers")
         print("="*70 + "\n")
         
@@ -633,6 +666,9 @@ async def main():
         import traceback
         traceback.print_exc()
     finally:
+        if tunnel is not None:
+            print("[TUNNEL] Stopping tunnel...")
+            tunnel.stop()
         # Cleanup: stop all servers gracefully
         if running:
             print("\n[CLEANUP] Shutting down servers...")

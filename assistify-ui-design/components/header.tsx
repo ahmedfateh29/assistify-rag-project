@@ -4,6 +4,7 @@ import Link from "next/link";
 import { LayoutGrid, Menu } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useRoleNav } from "@/src/hooks/useRoleNav";
+import { fullAppPath } from "@/src/lib/routes";
 import type { AppLanguage } from "@/src/lib/types";
 
 export function Header({
@@ -11,13 +12,15 @@ export function Header({
   language,
   onLanguageChange,
   exitUrl,
+  guestMode = false,
 }: {
   onMenuClick: () => void;
   language: AppLanguage;
   onLanguageChange: (l: AppLanguage) => void;
   exitUrl: string;
+  guestMode?: boolean;
 }) {
-  const { topLinks, homeHref } = useRoleNav();
+  const { topLinks, homeHref } = useRoleNav({ enabled: !guestMode });
   const [navOpen, setNavOpen] = useState(false);
   const navRef = useRef<HTMLDivElement>(null);
 
@@ -32,11 +35,11 @@ export function Header({
   }, []);
 
   return (
-    <header className="flex items-center gap-3 border-b border-[#333] bg-[#2b2b2b] px-4 py-3">
+    <header className="flex shrink-0 items-center gap-3 border-b border-[#333] bg-[#2b2b2b] px-4 py-3">
       <button type="button" className="lg:hidden" onClick={onMenuClick} aria-label="Toggle conversations">
         <Menu className="h-5 w-5" />
       </button>
-      <Link href={homeHref} className="font-semibold text-[#10a37f] hover:text-[#0d8658]">
+      <Link href={guestMode ? fullAppPath("/guest") : homeHref} className="font-semibold text-[#10a37f] hover:text-[#0d8658]">
         Assistify Chat
       </Link>
       <div className="ml-auto flex items-center gap-3">
@@ -50,40 +53,48 @@ export function Header({
           <option value="ar">AR</option>
         </select>
 
-        <div className="relative" ref={navRef}>
-          <button
-            type="button"
-            className="rounded-lg border border-[#444] p-2 text-[#9ca3af] hover:text-white"
-            onClick={() => setNavOpen((o) => !o)}
-            aria-label="System navigation"
-            aria-expanded={navOpen}
-            aria-haspopup="true"
-          >
-            <LayoutGrid className="h-4 w-4" />
-          </button>
-          {navOpen && (
-            <div
-              className="absolute right-0 z-50 mt-2 max-h-[70vh] w-56 overflow-y-auto rounded-lg border border-[#444] bg-[#171717] py-1 shadow-xl"
-              role="menu"
+        {guestMode ? (
+          <a href={fullAppPath("/login")} className="text-sm text-[#10a37f] hover:text-[#0d8658]">
+            Staff login
+          </a>
+        ) : (
+          <div className="relative" ref={navRef}>
+            <button
+              type="button"
+              className="rounded-lg border border-[#444] p-2 text-[#9ca3af] hover:text-white"
+              onClick={() => setNavOpen((o) => !o)}
+              aria-label="System navigation"
+              aria-expanded={navOpen}
+              aria-haspopup="true"
             >
-              {topLinks.map((link) => (
-                <Link
-                  key={link.href}
-                  href={link.href}
-                  className="block px-4 py-2 text-sm text-[#9ca3af] hover:bg-[#2b2b2b] hover:text-white"
-                  role="menuitem"
-                  onClick={() => setNavOpen(false)}
-                >
-                  {link.label}
-                </Link>
-              ))}
-            </div>
-          )}
-        </div>
+              <LayoutGrid className="h-4 w-4" />
+            </button>
+            {navOpen && (
+              <div
+                className="absolute right-0 z-50 mt-2 max-h-[70vh] w-56 overflow-y-auto rounded-lg border border-[#444] bg-[#171717] py-1 shadow-xl"
+                role="menu"
+              >
+                {topLinks.map((link) => (
+                  <Link
+                    key={link.href}
+                    href={link.href}
+                    className="block px-4 py-2 text-sm text-[#9ca3af] hover:bg-[#2b2b2b] hover:text-white"
+                    role="menuitem"
+                    onClick={() => setNavOpen(false)}
+                  >
+                    {link.label}
+                  </Link>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
-        <a href={exitUrl} className="text-sm text-[#9ca3af] hover:text-white">
-          Exit
-        </a>
+        {!guestMode && (
+          <a href={exitUrl} className="text-sm text-[#9ca3af] hover:text-white">
+            Exit
+          </a>
+        )}
       </div>
     </header>
   );

@@ -11,10 +11,23 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from pathlib import Path
 from collections import defaultdict, Counter
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from threading import RLock
 
-print("RUNNING PATCHED VERSION")
+# Force UTF-8 on the Windows console so Unicode chars in retrieved chunks
+# never crash a debug print statement.
+import sys as _sys
+if hasattr(_sys.stdout, "reconfigure"):
+    try:
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(_sys.stderr, "reconfigure"):
+    try:
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Silence a known third-party warning (ctranslate2 imports pkg_resources).
 # This is non-fatal and otherwise spams logs on startup.
 warnings.filterwarnings(
@@ -50,7 +63,7 @@ except Exception:
         def identify(*a, **k):
             return None
     sys.modules['posthog'] = _PosthogStub()  # type: ignore[assignment]
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Request, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Request, UploadFile, File, Body
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -75,6 +88,9 @@ GPU_HIGH_WATER_MB = 4000
 MEMORY_GROWTH_LIMIT = 3
 CPU_GROWTH_DELTA_MB = 500
 CPU_HIGH_WATER_MB = 4000
+INGEST_INDEX_TIMEOUT_S = float(os.environ.get("INGEST_INDEX_TIMEOUT_S", "600"))
+COLLECTION_MUTATION_LOCK_TIMEOUT_S = float(os.environ.get("COLLECTION_MUTATION_LOCK_TIMEOUT_S", "120"))
+KB_PIPELINE_STALE_TIMEOUT_S = float(os.environ.get("KB_PIPELINE_STALE_TIMEOUT_S", "600"))
 
 # Memory snapshot helpers (stub: return dummy values, real impl should use psutil/torch)
 def _get_memory_snapshot():
@@ -490,10 +506,13 @@ def require_request_tenant(user) -> int:
     """Like resolve_request_tenant but rejects callers with no explicit tenant
     so they can never silently fall back to another business's data."""
     role = str((user or {}).get("role") or "").lower()
-    if role in ("customer", "admin", "master_admin", "employee") and not _user_has_explicit_tenant(user):
+    if not _user_has_explicit_tenant(user):
         if role == "customer":
             raise HTTPException(status_code=403, detail="No active business selected.")
-        raise HTTPException(status_code=403, detail="No business assigned to this account.")
+        if role in ("admin", "master_admin", "employee"):
+            raise HTTPException(status_code=403, detail="No business assigned to this account.")
+        if role == "superadmin":
+            raise HTTPException(status_code=403, detail="No target business selected. Switch to a tenant first.")
     return resolve_request_tenant(user)
 
 
@@ -583,6 +602,13 @@ conversation_timestamps = {}  # Track last activity time for cleanup
 
 CONVERSATIONS_FILE = Path(__file__).resolve().parent / "conversations.json"
 _conversation_store_lock = RLock()
+
+from backend import chat_store as _chat_store
+from backend.tenant_access import (
+    assert_chat_tenant_allowed,
+    get_tenant_name,
+    resolve_active_chat_tenant,
+)
 
 
 def _utc_now_iso() -> str:
@@ -678,31 +704,48 @@ def _conv_tenant_of(conversation: dict) -> int:
         return DEFAULT_TENANT_ID
 
 
-def _conversation_in_scope(conversation: dict, tenant_id: int, owner: str | None) -> bool:
-    """Return True if a conversation may be accessed by (tenant_id, owner).
-
-    Tenant must always match. Owner must match when both the caller and the
-    stored conversation declare one; legacy rows without an owner are claimable
-    by the first scoped accessor. This guarantees a customer of one business can
-    never read another business's (or another user's) chat history.
-    """
+def _conversation_in_scope(conversation: dict, tenant_id: int | None = None, owner: str | None = None) -> bool:
+    """Return True if a conversation may be accessed by owner (cross-tenant threads allowed)."""
     if conversation is None:
         return False
-    try:
-        if _conv_tenant_of(conversation) != int(tenant_id):
-            return False
-    except (TypeError, ValueError):
-        return False
     if owner is None:
-        # Caller did not assert an owner (e.g. internal/admin path): tenant
-        # scoping already applied above.
         return True
     c_owner = conversation.get("owner")
     if c_owner is None or str(c_owner) == "":
-        # Legacy unclaimed rows: deny when caller has an owner identity so one
-        # user cannot read another user's orphaned chat within the same tenant.
         return owner is None
     return str(c_owner) == str(owner)
+
+
+def _resolve_chat_tenant_id(request_tenant_id, conversation_id: str | None, owner: str | None) -> int:
+    return resolve_active_chat_tenant(
+        request_tenant_id,
+        conversation_id,
+        owner,
+        _chat_store.get_active_tenant_id,
+    )
+
+
+def set_conversation_active_tenant(
+    conversation_id: str,
+    active_tenant_id,
+    owner: str | None = None,
+    *,
+    from_tenant_id: int | None = None,
+    emit_system_message: bool = True,
+) -> dict:
+    tid = assert_chat_tenant_allowed(None, active_tenant_id)
+    system_msg = None
+    if emit_system_message and from_tenant_id is not None and int(from_tenant_id) != tid:
+        from_name = get_tenant_name(int(from_tenant_id))
+        to_name = get_tenant_name(tid)
+        system_msg = f"Switched from {from_name} to {to_name}"
+    return _chat_store.set_active_tenant(
+        conversation_id,
+        tid,
+        owner=owner,
+        system_message=system_msg,
+        message_tenant_id=tid,
+    )
 
 
 def _try_claim_ownerless_conversation(conversation: dict, tenant_id: int, owner: str | None) -> bool:
@@ -766,93 +809,50 @@ def _create_conversation_unlocked(
     return conversation
 
 
-def create_conversation(title: str | None = None, tenant_id=None, owner: str | None = None) -> dict:
-    with _mutating_conversation_store() as data:
-        return _create_conversation_unlocked(data, title=title, tenant_id=tenant_id, owner=owner)
-
-
-def get_or_create_conversation(conversation_id: str | None = None, tenant_id=None, owner: str | None = None) -> dict:
-    try:
-        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
-    except (TypeError, ValueError):
+def create_conversation(
+    title: str | None = None,
+    tenant_id=None,
+    owner: str | None = None,
+    active_tenant_id=None,
+) -> dict:
+    tid = active_tenant_id if active_tenant_id is not None else tenant_id
+    if tid is None:
         tid = DEFAULT_TENANT_ID
-    with _mutating_conversation_store() as data:
-        if conversation_id:
-            existing = _find_conversation(data, conversation_id)
-            if existing is not None:
-                if _try_claim_ownerless_conversation(existing, tid, owner):
-                    pass
-                if not _conversation_in_scope(existing, tid, owner):
-                    logger.warning(
-                        "[CONV] id=%s out of scope for tenant=%s owner=%s; creating new",
-                        conversation_id,
-                        tid,
-                        owner,
-                    )
-                    return _create_conversation_unlocked(data, tenant_id=tid, owner=owner)
-                _stamp_conversation_scope(existing, tid, owner)
-                logger.info("[CONV] loaded id=%s", conversation_id)
-                return existing
-        return _create_conversation_unlocked(data, tenant_id=tid, owner=owner)
+    return _chat_store.create_conversation(owner=owner, active_tenant_id=tid, title=title)
+
+
+def get_or_create_conversation(
+    conversation_id: str | None = None,
+    tenant_id=None,
+    owner: str | None = None,
+    active_tenant_id=None,
+) -> dict:
+    tid = active_tenant_id if active_tenant_id is not None else tenant_id
+    return _chat_store.get_or_create_conversation(conversation_id, owner=owner, active_tenant_id=tid)
 
 
 def list_conversations_summary(tenant_id=None, owner: str | None = None) -> list[dict]:
-    try:
-        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
-    except (TypeError, ValueError):
-        tid = DEFAULT_TENANT_ID
-    data = _load_conversation_store()
-    conversations = [
-        c for c in data.get("conversations", [])
-        if isinstance(c, dict) and _conversation_in_scope(c, tid, owner)
-    ]
-    conversations.sort(key=lambda c: str(c.get("updated_at") or ""), reverse=True)
-    return [
-        {
-            "id": c.get("id"),
-            "title": c.get("title") or "New chat",
-            "updated_at": c.get("updated_at"),
-        }
-        for c in conversations
-        if c.get("id")
-    ]
+    return _chat_store.list_conversations_summary(owner=owner)
 
 
 def load_conversation_messages(conversation_id: str, tenant_id=None, owner: str | None = None) -> list[dict]:
-    try:
-        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
-    except (TypeError, ValueError):
-        tid = DEFAULT_TENANT_ID
-    data = _load_conversation_store()
-    conversation = _find_conversation(data, conversation_id)
-    if conversation is None or not _conversation_in_scope(conversation, tid, owner):
-        raise KeyError(conversation_id)
-    logger.info("[CONV] loaded id=%s", conversation_id)
-    messages = conversation.get("messages") or []
-    return [m for m in messages if isinstance(m, dict)]
+    return _chat_store.load_conversation_messages(conversation_id, owner=owner)
 
 
-def append_conversation_message(conversation_id: str, role: str, text: str, tenant_id=None, owner: str | None = None) -> dict:
-    role_value = str(role or "").strip().lower()
-    if role_value not in {"user", "assistant"}:
-        raise ValueError("role must be 'user' or 'assistant'")
-    text_value = str(text or "").strip()
-    try:
-        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
-    except (TypeError, ValueError):
+def append_conversation_message(
+    conversation_id: str,
+    role: str,
+    text: str,
+    tenant_id=None,
+    owner: str | None = None,
+) -> dict:
+    tid = tenant_id
+    if tid is None:
+        tid = _chat_store.get_active_tenant_id(conversation_id, owner)
+    if tid is None:
         tid = DEFAULT_TENANT_ID
-    with _mutating_conversation_store() as data:
-        conversation = _find_conversation(data, conversation_id)
-        if conversation is None or not _conversation_in_scope(conversation, tid, owner):
-            raise KeyError(conversation_id)
-        _stamp_conversation_scope(conversation, tid, owner)
-        messages = conversation.setdefault("messages", [])
-        messages.append({"role": role_value, "text": text_value})
-        if role_value == "user" and (not conversation.get("title") or conversation.get("title") == "New chat"):
-            conversation["title"] = _conversation_title_from_text(text_value)
-        conversation["updated_at"] = _utc_now_iso()
-        logger.info("[CONV] message_added role=%s id=%s", role_value, conversation.get("id"))
-        return conversation
+    assert_chat_tenant_allowed(None, tid)
+    return _chat_store.append_message(conversation_id, role, text, tid, owner=owner)
 
 
 def _conversation_summary(conversation: dict) -> dict:
@@ -864,39 +864,11 @@ def _conversation_summary(conversation: dict) -> dict:
 
 
 def rename_conversation(conversation_id: str, title: str, tenant_id=None, owner: str | None = None) -> dict:
-    title_value = re.sub(r"\s+", " ", str(title or "")).strip()
-    if not title_value:
-        raise ValueError("title must not be empty")
-    if len(title_value) > 80:
-        title_value = title_value[:80].rstrip()
-    try:
-        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
-    except (TypeError, ValueError):
-        tid = DEFAULT_TENANT_ID
-    with _mutating_conversation_store() as data:
-        conversation = _find_conversation(data, conversation_id)
-        if conversation is None or not _conversation_in_scope(conversation, tid, owner):
-            raise KeyError(conversation_id)
-        conversation["title"] = title_value
-        conversation["updated_at"] = _utc_now_iso()
-        logger.info("[CONV] renamed id=%s title=%s", conversation_id, title_value)
-        return _conversation_summary(conversation)
+    return _chat_store.rename_conversation(conversation_id, title, owner=owner)
 
 
 def delete_conversation(conversation_id: str, tenant_id=None, owner: str | None = None) -> None:
-    try:
-        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
-    except (TypeError, ValueError):
-        tid = DEFAULT_TENANT_ID
-    with _mutating_conversation_store() as data:
-        conversations = [c for c in data.get("conversations", []) if isinstance(c, dict)]
-        target = _find_conversation(data, conversation_id)
-        if target is None or not _conversation_in_scope(target, tid, owner):
-            raise KeyError(conversation_id)
-        remaining = [c for c in conversations if c.get("id") != conversation_id]
-        if len(remaining) == len(conversations):
-            raise KeyError(conversation_id)
-        data["conversations"] = remaining
+    _chat_store.delete_conversation(conversation_id, owner=owner)
     conversation_history.pop(conversation_id, None)
     last_answer_state.pop(conversation_id, None)
     recent_grounded_definition_concepts.pop(conversation_id, None)
@@ -905,25 +877,13 @@ def delete_conversation(conversation_id: str, tenant_id=None, owner: str | None 
 
 
 def delete_all_conversations(tenant_id=None, owner: str | None = None) -> int:
-    """Delete every persisted conversation for the current tenant/owner scope."""
-    try:
-        tid = int(tenant_id) if tenant_id is not None else current_tenant_id()
-    except (TypeError, ValueError):
-        tid = DEFAULT_TENANT_ID
+    """Delete every persisted conversation for the current owner."""
     deleted_ids: list[str] = []
-    with _mutating_conversation_store() as data:
-        conversations = [c for c in data.get("conversations", []) if isinstance(c, dict)]
-        remaining: list[dict] = []
-        for conversation in conversations:
-            if _conversation_in_scope(conversation, tid, owner):
-                conv_id = str(conversation.get("id") or "").strip()
-                if conv_id:
-                    deleted_ids.append(conv_id)
-                continue
-            remaining.append(conversation)
-        if not deleted_ids:
-            return 0
-        data["conversations"] = remaining
+    summaries = _chat_store.list_conversations_summary(owner=owner)
+    deleted_ids = [str(s["id"]) for s in summaries if s.get("id")]
+    count = _chat_store.delete_all_conversations(owner=owner)
+    if not count:
+        return 0
     for conv_id in deleted_ids:
         conversation_history.pop(conv_id, None)
         last_answer_state.pop(conv_id, None)
@@ -937,7 +897,7 @@ def delete_all_conversations(tenant_id=None, owner: str | None = None) -> int:
             _last_list_state.pop(conv_id, None)
         except Exception:
             pass
-    logger.info("[CONV] deleted_all count=%s tenant=%s owner=%s", len(deleted_ids), tid, owner)
+    logger.info("[CONV] deleted_all count=%s owner=%s", len(deleted_ids), owner)
     return len(deleted_ids)
 
 
@@ -949,7 +909,7 @@ def _history_from_conversation_messages(conversation_id: str) -> list[dict]:
     history: list[dict] = []
     for message in messages:
         role = message.get("role")
-        text = message.get("text")
+        text = message.get("text") or message.get("content")
         if role in {"user", "assistant"}:
             history.append({"role": role, "content": str(text or "")})
     return history
@@ -4262,8 +4222,6 @@ async def _handle_followup_query(text: str, connection_id: str):
     followup_action = _classify_followup_intent(text)
     intent = "explanation"
     is_followup = True
-    print("[FOLLOWUP MODE] list_lock_disabled=True")
-    print("[FOLLOWUP MERGE] enabled=True")
     logger.info("[FOLLOWUP MODE] list_lock_disabled=True")
     logger.info("[FOLLOWUP MERGE] enabled=True")
     last_q = state.get("query", "") or ""
@@ -4412,7 +4370,6 @@ async def _handle_followup_query(text: str, connection_id: str):
                         previous_list_items_all,
                     )
                     _rescue_query = f"{_query_focus_item} explanation".strip()
-                    print(f"[FOLLOWUP QUERY] {_rescue_query}")
                     logger.info("[FOLLOWUP QUERY] %s", _rescue_query)
                     try:
                         _raw_rescue = _active_rag().search(
@@ -5148,6 +5105,29 @@ async def _check_ollama_connectivity() -> None:
             await _sess.close()
 
 
+# ========== IN-MEMORY RATE LIMITER ==========
+import threading as _threading
+from collections import defaultdict as _defaultdict
+
+_rate_buckets: dict = _defaultdict(lambda: {"count": 0, "reset": 0.0})
+_rate_lock = _threading.Lock()
+
+
+def _check_rate_limit(key: str, limit: int, window: int = 60) -> bool:
+    """Return True if allowed, False if rate-limited. Thread-safe, in-memory."""
+    now = time.time()
+    with _rate_lock:
+        bucket = _rate_buckets[key]
+        if now > bucket["reset"]:
+            bucket["count"] = 1
+            bucket["reset"] = now + window
+            return True
+        if bucket["count"] >= limit:
+            return False
+        bucket["count"] += 1
+        return True
+
+
 # ========== REAL-TIME KB EVENT BROADCAST ==========
 # All active user WebSocket connections (keyed by connection_id → WebSocket)
 _active_ws_connections: dict = {}
@@ -5351,6 +5331,11 @@ def _set_kb_pipeline_stage(
         _kb_pipeline_state["indexed_chunks"] = int(indexed)
     if total is not None:
         _kb_pipeline_state["total_chunks"] = int(total)
+    # Keep progress counters consistent during ingestion.
+    _idx = _kb_pipeline_state.get("indexed_chunks")
+    _tot = _kb_pipeline_state.get("total_chunks")
+    if isinstance(_idx, int) and isinstance(_tot, int) and _tot > 0 and _idx > _tot:
+        _kb_pipeline_state["indexed_chunks"] = _tot
     if percent is not None:
         _kb_pipeline_state["percent"] = max(0, min(100, int(percent)))
     _record_kb_stage(normalized_stage)
@@ -5475,42 +5460,47 @@ def _dbg7d3bbb(location, message, data=None, hypothesis=None):
 def _filter_results_to_active_sources(results: List[Dict[Any, Any]]) -> List[Dict[Any, Any]]:
     active_sources = _get_active_sources()
     if not active_sources:
-        # #region agent log
-        _dbg7d3bbb("assistify_rag_server.py:_filter_results_to_active_sources", "no active_sources -> passthrough",
-                   {"in_count": len(results or []), "active_sources_count": 0}, "H-C")
-        # #endregion
-        return results
+        # Attempt to recover active sources from the collection before failing closed.
+        try:
+            _rebuild_active_sources_from_collection()
+            active_sources = _get_active_sources()
+        except Exception:
+            pass
+        if not active_sources:
+            logger.warning(
+                "No active sources configured — failing closed to prevent cross-document leakage. in_count=%s",
+                len(results or []),
+            )
+            _dbg7d3bbb("assistify_rag_server.py:_filter_results_to_active_sources", "no active_sources -> fail closed",
+                       {"in_count": len(results or []), "active_sources_count": 0}, "H-C")
+            return []
     filtered = []
     items_without_source_keys = 0
     for item in results or []:
         md = (item or {}).get("metadata") or {}
         item_keys = _metadata_source_keys(md)
         if not item_keys:
+            # Chunks without any source identity are orphans — never pass them through.
             items_without_source_keys += 1
+            continue
         if item_keys & active_sources:
             filtered.append(item)
-    # #region agent log
     _dbg7d3bbb("assistify_rag_server.py:_filter_results_to_active_sources", "active-source filter result",
                {"in_count": len(results or []), "kept": len(filtered),
                 "active_sources_count": len(active_sources),
                 "active_sources": sorted(active_sources)[:8],
                 "no_key_items": items_without_source_keys}, "H-C")
-    # #endregion
-    if filtered:
-        return filtered
-    if results:
+    if items_without_source_keys:
         logger.warning(
-            "Active-source filter would empty all results; keeping original retrieval set active_sources=%s total=%s",
+            "Active-source filter dropped orphan chunks (no source keys): active_sources=%s orphans=%s",
             sorted(active_sources),
-            len(results),
-        )
-        return list(results or [])
-    if results and items_without_source_keys:
-        logger.warning(
-            "Active-source filter dropped unverifiable result(s): active_sources=%s total=%s missing_source_keys=%s",
-            sorted(active_sources),
-            len(results),
             items_without_source_keys,
+        )
+    if not filtered:
+        logger.warning(
+            "Active-source filter returned nothing — failing closed. active_sources=%s total=%s",
+            sorted(active_sources),
+            len(results or []),
         )
     return filtered
     logger.info("All caches invalidated (conversations + Ollama KV cache)")
@@ -5592,7 +5582,15 @@ def _doc_router_display_source(doc: Dict[str, Any], source_key: str) -> str:
 def _filter_doc_dicts_to_active_sources(doc_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     active_sources = _get_active_sources()
     if not active_sources:
-        return list(doc_dicts or [])
+        # Attempt to recover active sources from the collection before failing closed.
+        try:
+            _rebuild_active_sources_from_collection()
+            active_sources = _get_active_sources()
+        except Exception:
+            pass
+        if not active_sources:
+            logger.warning("[DOC ROUTER] No active sources — failing closed. in_count=%s", len(doc_dicts or []))
+            return []
     kept: List[Dict[str, Any]] = []
     dropped = 0
     unverifiable = 0
@@ -5615,19 +5613,16 @@ def _filter_doc_dicts_to_active_sources(doc_dicts: List[Dict[str, Any]]) -> List
             dropped,
             unverifiable,
         )
-    # #region agent log
     _dbg7d3bbb("assistify_rag_server.py:_filter_doc_dicts_to_active_sources", "doc-dict active-source filter result",
                {"in_count": len(doc_dicts or []), "kept": len(kept), "dropped": dropped,
                 "unverifiable": unverifiable, "active_sources_count": len(active_sources),
                 "active_sources": sorted(active_sources)[:8]}, "H-C")
-    # #endregion
-    if not kept and doc_dicts:
+    if not kept:
         logger.warning(
-            "[DOC ROUTER] active-source filter would empty docs; keeping original set active_sources=%s total=%s",
+            "[DOC ROUTER] active-source filter returned nothing — failing closed. active_sources=%s total=%s",
             sorted(active_sources),
             len(doc_dicts or []),
         )
-        return list(doc_dicts or [])
     return kept
 
 
@@ -6701,52 +6696,31 @@ def _doc_router_explicit_multi_source_request(query_text: str) -> bool:
     )
 
 
-_DOC_ROUTER_HR_SIGNALS = (
-    "ibm", "attrition", "crisp", "crisp-dm", "hr report", "jobsatisfaction", "worklifebalance",
-    "overtime", "logistic regression", "roc-auc", "roc auc", "sales department", "sales rep",
-    "employee", "retention program", "compensation", "heatmap", "correlation", "30/60/90",
-    "deployment plan", "kpi",
-)
-_DOC_ROUTER_PSYCH_SIGNALS = (
-    "psychology", "psychologist", "textbook", "lesson", "chapter", "plato", "skinner",
-    "maslow", "cognitive dissonance", "medulla", "operant conditioning", "gas model",
-    "general adaptation syndrome", "predictive validity", "research methods", "dsm",
-    "health psychology", "social psychology", "memory chapter", "industrial",
-    "organizational psychology",
-)
-
-
-def _doc_router_source_domain(source_key: str, display_source: str = "") -> str:
-    blob = f"{source_key} {display_source}".lower()
-    hr_hits = sum(1 for sig in _DOC_ROUTER_HR_SIGNALS if sig in blob)
-    psych_hits = sum(1 for sig in _DOC_ROUTER_PSYCH_SIGNALS if sig in blob)
-    if hr_hits and not psych_hits:
-        return "hr"
-    if psych_hits and not hr_hits:
-        return "psych"
-    if "ibm" in blob or "attrition" in blob or "crisp" in blob:
-        return "hr"
-    if "psychology" in blob:
-        return "psych"
-    return "unknown"
-
-
 def _doc_router_cross_corpus_bridge(query_text: str) -> bool:
+    """Detect a synthesis/bridge query that should combine evidence from more
+    than one source.
+
+    Uses generic connective phrasing only — never specific domain, company or
+    document names — so it triggers identically for any pair of uploaded PDFs.
+    """
     q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
     if not q:
         return False
-    hr_query = any(sig in q for sig in _DOC_ROUTER_HR_SIGNALS)
-    psych_query = any(sig in q for sig in _DOC_ROUTER_PSYCH_SIGNALS)
-    bridge_phrase = bool(
-        re.search(r"\busing\b.{0,120}\b(?:chapter|lesson|textbook|psychology)\b", q)
-        or re.search(r"\b(?:referencing|according to)\b.{0,120}\b(?:chapter|lesson|textbook|psychology)\b", q)
-        or re.search(r"\b(?:hr report|ibm|crisp-dm|attrition report|hr data|hr model)\b.{0,120}\b(?:psychology|chapter|lesson)\b", q)
-        or re.search(r"\b(?:psychology|chapter|lesson|textbook)\b.{0,120}\b(?:hr report|ibm|crisp-dm|attrition|overtime)\b", q)
-        or re.search(r"\bhow would\b.{0,160}\b(?:chapter|lesson|psychology|skinner|operant|theory|theories)\b", q)
-        or re.search(r"\b(?:act as|write a|draft a)\b.{0,120}\b(?:psychologist|memo|quiz)\b", q)
-        or re.search(r"\bimagine\b.{0,160}\b(?:chapter|psychology|dissonance|overtime|attrition)\b", q)
+    return bool(
+        re.search(
+            r"\b(?:using|based on|drawing on|with reference to|referencing|according to)\b"
+            r".{0,160}\b(?:explain|describe|analy[sz]e|apply|relate|connect|combine|"
+            r"summari[sz]e|compare|contrast|discuss|evaluate)\b",
+            q,
+        )
+        or re.search(
+            r"\b(?:combine|synthesi[sz]e|integrate|connect|link|bridge|reconcile)\b"
+            r".{0,80}\b(?:and|with|across|both|two|multiple|sources?|documents?|reports?|files?)\b",
+            q,
+        )
+        or re.search(r"\bacross\b.{0,40}\b(?:documents?|sources?|reports?|files?|materials?)\b", q)
+        or re.search(r"\b(?:both|two|multiple)\b.{0,40}\b(?:documents?|sources?|reports?|files?)\b", q)
     )
-    return bool((hr_query and psych_query) or bridge_phrase)
 
 
 def _skip_deterministic_rag_shortcuts(query_text: str, doc_router_mode: str = "") -> bool:
@@ -6774,21 +6748,24 @@ def _use_early_generation_shortcut(query_text: str, doc_router_mode: str = "") -
 
 
 def _ensure_bridge_source_signals(query_text: str, answer_text: str) -> str:
+    """Ensure a synthesis answer carries *some* source attribution, without
+    naming any specific document or domain.
+
+    The model is asked in the prompt to cite each source by the name shown in
+    the context; here we only add a neutral, domain-agnostic lead-in when the
+    answer contains no attribution cue at all.
+    """
     ans = str(answer_text or "").strip()
     if not ans or not _doc_router_cross_corpus_bridge(query_text):
         return ans
     low = ans.lower()
-    needs_hr = not any(x in low for x in ("ibm", "hr report", "crisp", "attrition report", "crisp-dm"))
-    needs_psych = not any(x in low for x in ("psychology", "lesson", "chapter", "textbook"))
-    if not needs_hr and not needs_psych:
+    attribution_cues = (
+        "document", "source", "report", "according to", "based on",
+        "chapter", "section", "the uploaded", "the provided",
+    )
+    if any(cue in low for cue in attribution_cues):
         return ans
-    if needs_hr and needs_psych:
-        prefix = "From the IBM HR CRISP-DM report and the Psychology textbook chapter,"
-    elif needs_hr:
-        prefix = "From the IBM HR CRISP-DM report,"
-    else:
-        prefix = "From the Psychology textbook chapter,"
-    return f"{prefix} {ans}".strip()
+    return f"Based on the uploaded documents, {ans}"
 
 
 def _classify_response_format_intent(query_text: str) -> str:
@@ -6811,13 +6788,14 @@ def _is_kb_unanswerable_detail_query(query_text: str) -> bool:
     q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
     if not q:
         return False
-    if re.search(r"\b(?:mathematical\s+)?formula\b", q) and re.search(r"\b(?:coefficient|weight)\b", q):
+    # Generic "precise-detail" shapes that are prone to hallucination when the
+    # exact figure/code is not in the uploaded text. No dataset, model or domain
+    # is named — only the *form* of the request.
+    if re.search(r"\b(?:mathematical\s+)?formula\b", q) and re.search(r"\b(?:coefficient|weight|intercept)\b", q):
         return True
-    if re.search(r"\blogistic\s+regression\b", q) and re.search(r"\b(?:coefficient|weight|formula)\b", q):
+    if re.search(r"\b(?:exact\s+)?(?:coefficient|weight|intercept)\b", q) and re.search(r"\b(?:value|equation|formula)\b", q):
         return True
-    if re.search(r"\bwundt\b", q) and re.search(r"\bcrisp-dm\b", q):
-        return True
-    if re.search(r"\bdsm-5", q) and re.search(r"\b(?:diagnostic\s+code|employee\s+burnout)\b", q):
+    if re.search(r"\b(?:diagnostic|classification)\s+code\b", q):
         return True
     return False
 
@@ -6830,15 +6808,12 @@ def _enforce_unanswerable_detail_refusal(query: str, answer: str, language: str 
     if not ans:
         return _not_found_response(query, "missing_detail")
     ans_l = ans.lower()
+    # Generic fabricated-precision signals (coefficients/intercepts/codes) that
+    # should not appear unless grounded. No specific dataset value is matched.
     forbidden = (
         re.search(r"β\s*\d", ans, re.I),
         re.search(r"coefficient\s*=\s*[-+]?\d\.\d+", ans, re.I),
         re.search(r"intercept\s*=\s*[-+]?\d\.\d+", ans, re.I),
-        re.search(r"wundt.{0,120}crisp-dm", ans_l, re.I | re.DOTALL),
-        re.search(r"1879.{0,120}data mining", ans_l, re.I | re.DOTALL),
-        re.search(r"dsm-5-tr\s*[a-z]\d+", ans_l, re.I),
-        re.search(r"\bf\d{2}\.\d", ans_l, re.I),
-        re.search(r"\bz\d{2}\.\d", ans_l, re.I),
     )
     warm_refusal_markers = (
         "not in the", "not found in", "do not have", "don't have", "does not contain",
@@ -7083,42 +7058,18 @@ def _route_multi_document_evidence(query_text: str, doc_dicts: List[Dict[str, An
 
         bridge_sources_are_strong = False
         if cross_corpus_bridge and len(stats) >= 2:
-            hr_rows = [
-                row for row in stats
-                if _doc_router_source_domain(str(row.get("source") or ""), str(row.get("display_source") or "")) == "hr"
-            ]
-            psych_rows = [
-                row for row in stats
-                if _doc_router_source_domain(str(row.get("source") or ""), str(row.get("display_source") or "")) == "psych"
-            ]
-            if hr_rows and psych_rows:
-                hr_top = max(hr_rows, key=lambda row: float(row.get("router_score") or 0.0))
-                psych_top = max(psych_rows, key=lambda row: float(row.get("router_score") or 0.0))
-                hr_ok = float(hr_top.get("query_coverage") or 0.0) >= 0.10 or float(hr_top.get("top_score") or 0.0) > 0.0
-                psych_ok = float(psych_top.get("query_coverage") or 0.0) >= 0.10 or float(psych_top.get("top_score") or 0.0) > 0.0
-                bridge_sources_are_strong = bool(hr_ok and psych_ok)
+            # The two highest-scoring distinct sources, whatever domains they are.
+            s_top, s_second = stats[0], stats[1]
+            top_ok = float(s_top.get("query_coverage") or 0.0) >= 0.10 or float(s_top.get("top_score") or 0.0) > 0.0
+            second_ok = float(s_second.get("query_coverage") or 0.0) >= 0.10 or float(s_second.get("top_score") or 0.0) > 0.0
+            bridge_sources_are_strong = bool(top_ok and second_ok)
 
         if bridge_sources_are_strong or (cross_corpus_bridge and len(stats) >= 2):
-            hr_rows = [
-                row for row in stats
-                if _doc_router_source_domain(str(row.get("source") or ""), str(row.get("display_source") or "")) == "hr"
-            ]
-            psych_rows = [
-                row for row in stats
-                if _doc_router_source_domain(str(row.get("source") or ""), str(row.get("display_source") or "")) == "psych"
-            ]
-            selected_sources = []
-            if hr_rows:
-                hr_top = max(hr_rows, key=lambda row: float(row.get("router_score") or 0.0))
-                selected_sources.append(str(hr_top.get("source")))
-            if psych_rows:
-                psych_top = max(psych_rows, key=lambda row: float(row.get("router_score") or 0.0))
-                if str(psych_top.get("source")) not in selected_sources:
-                    selected_sources.append(str(psych_top.get("source")))
-            if not selected_sources:
-                selected_sources = [str(row.get("source")) for row in stats[:2]]
+            # Synthesize across the two strongest distinct sources — no document
+            # or domain is assumed, so this works for any pair of PDFs.
+            selected_sources = [str(row.get("source")) for row in stats[:2]]
             mode = "multi_source_synthesis"
-            reason = "cross-corpus bridge query with HR and Psychology evidence"
+            reason = "cross-source synthesis query spanning the two strongest sources"
         elif comparison_sources_are_strong:
             if len(best_sources_for_concepts) >= 2 and union_concept_coverage >= 0.75:
                 selected_sources = best_sources_for_concepts[:3]
@@ -7307,7 +7258,7 @@ class LiveRAGManager:
         
     def search(self, query: str, top_k: int = 5, distance_threshold: float = 1.0, return_dicts: bool = False, enable_rerank: bool = True):
         """High-level search orchestration."""
-        print(f"\n[LiveRAGManager] tenant={self.tenant_id} Query: '{query}'")
+        logger.debug("[LiveRAGManager] tenant=%s Query: %r", self.tenant_id, query)
 
         # Lazy-create VectorStore on first use (safe, idempotent)
         if self.vs is None:
@@ -7488,7 +7439,13 @@ async def startup_event():
     assert_production_config()
     init_database()
     init_analytics_db()
-    _ensure_conversation_store_file()
+    _chat_store.init_chat_store_schema()
+    try:
+        migrated = _chat_store.migrate_from_json(CONVERSATIONS_FILE)
+        if migrated:
+            logger.info("[CHAT] auto-migrated %s conversations from JSON", migrated)
+    except Exception as exc:
+        logger.warning("[CHAT] JSON migration skipped: %s", exc)
     logger.warning(
         "[INGEST OWNER] RAG server is the single ingestion/delete owner; "
         "admin/login servers must proxy upload, update, and delete requests only."
@@ -7638,8 +7595,8 @@ async def startup_event():
         _kb_col = _goc(allow_empty=False)
         if _kb_col is not None:
             _name = getattr(_kb_col, 'name', None) or '<unknown>'
-            print(f"[RAG INIT] Using collection: {_name}")
-            print(f"[RAG INIT] Count: {_kb_col.count()}")
+            logger.info("[RAG INIT] Using collection: %s", _name)
+            logger.info("[RAG INIT] Count: %s", _kb_col.count())
     except Exception:
         pass
 
@@ -7920,7 +7877,16 @@ _assets_reindex_tasks: dict[str, asyncio.Task] = {}
 _assets_recently_indexed_until: dict[str, float] = {}
 _assets_upload_owned_until: dict[str, float] = {}
 _assets_reindex_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-_collection_mutation_lock: asyncio.Lock = asyncio.Lock()
+_collection_mutation_lock_holder: dict[str, asyncio.Lock] = {"lock": asyncio.Lock()}
+
+
+def _get_collection_mutation_lock() -> asyncio.Lock:
+    return _collection_mutation_lock_holder["lock"]
+
+
+def _reset_collection_mutation_lock() -> None:
+    _collection_mutation_lock_holder["lock"] = asyncio.Lock()
+    logger.warning("[KB LOCK] collection mutation lock reset")
 
 # Tombstones for files explicitly deleted via /rag/delete. The watcher and
 # the startup bootstrap MUST consult this set before re-indexing, otherwise
@@ -8135,7 +8101,7 @@ async def _reindex_file_auto(filename: str):
         if not save_path.exists():
             logger.warning(f"Assets watcher: file disappeared before reindex: {filename}")
             return
-        text = _extract_text_from_asset(save_path)
+        text = await asyncio.to_thread(_extract_text_from_asset, save_path)
 
         if not text.strip():
             logger.info(f"Assets watcher: skipping empty/unextractable file: {filename}")
@@ -8153,8 +8119,9 @@ async def _reindex_file_auto(filename: str):
         metadata.update({"file_ext": save_path.suffix.lower(), "ingestion_owner": "rag_server_watcher"})
         doc_id = str(metadata.get("source_doc_id") or canonical_source_doc_id(metadata.get("normalized_filename") or original_filename))
 
-        async with _collection_mutation_lock:
-            delete_report = delete_documents_by_source_identity(
+        async with _collection_mutation():
+            delete_report = await asyncio.to_thread(
+                delete_documents_by_source_identity,
                 source_doc_id=str(metadata.get("source_doc_id") or ""),
                 original_filename=str(metadata.get("original_filename") or ""),
                 stored_filename=str(metadata.get("stored_filename") or filename),
@@ -8164,8 +8131,16 @@ async def _reindex_file_auto(filename: str):
             deleted = int(delete_report.get("deleted_count") or 0)
             logger.info(f"Assets watcher [{filename}]: deleted {deleted} old chunk(s)")
 
-            _cad_result = chunk_and_add_document(doc_id=doc_id, text=text, metadata=metadata,
-                                            kb_version=_kb_global_version + 1)
+            _cad_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    chunk_and_add_document,
+                    doc_id=doc_id,
+                    text=text,
+                    metadata=metadata,
+                    kb_version=_kb_global_version + 1,
+                ),
+                timeout=INGEST_INDEX_TIMEOUT_S,
+            )
             added = int(_cad_result) if isinstance(_cad_result, int) else 0
             active_collection = _sync_live_retrieval_collection()
         if added > 0:
@@ -8362,6 +8337,45 @@ def require_login(role=None):
     return wrapper
 
 
+def _owner_from_chat_request(request: Request, user) -> str | None:
+    logged = _coerce_owner(user)
+    if logged:
+        return logged
+    try:
+        from config import ALLOW_PUBLIC_GUEST_CHAT
+        from Login_system.guest_session import GUEST_OWNER_HEADER, is_valid_guest_id
+    except Exception:
+        return None
+    if not ALLOW_PUBLIC_GUEST_CHAT:
+        return None
+    guest_hdr = request.headers.get(GUEST_OWNER_HEADER) or request.headers.get(
+        str(GUEST_OWNER_HEADER).lower()
+    )
+    if guest_hdr and is_valid_guest_id(guest_hdr):
+        return str(guest_hdr).strip()
+    return None
+
+
+def require_chat_access(role=None):
+    """Authenticated user or anonymous guest (X-Guest-Owner) for chat APIs only."""
+
+    def wrapper(request: Request):
+        token = request.cookies.get(SESSION_COOKIE)
+        user = None
+        if token:
+            user, err = load_and_validate_session_token(serializer, token)
+            if user is None:
+                user = None
+        owner = _owner_from_chat_request(request, user)
+        if not owner:
+            raise HTTPException(status_code=401, detail="Authentication required.")
+        if role and user and user.get("role") != role:
+            raise HTTPException(status_code=403, detail="Forbidden.")
+        return {"user": user, "owner": owner}
+
+    return wrapper
+
+
 def require_roles(*allowed_roles):
     def wrapper(request: Request):
         token = request.cookies.get(SESSION_COOKIE)
@@ -8377,7 +8391,7 @@ def require_roles(*allowed_roles):
 
 
 def require_tenant_staff():
-    return require_roles("admin", "master_admin")
+    return require_roles("admin", "master_admin", "superadmin")
 
 register_voice_routes(app, require_login)
 
@@ -9977,9 +9991,12 @@ _DIRECT_DEFINITION_CUE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _ANY_DEFINITION_CUE_RE = re.compile(
-    r"\b(?:is|are|refers\s+to|means|can\s+be\s+defined\s+as|is\s+defined\s+as|are\s+defined\s+as|defined\s+as|"
+    r"\b(?:is|are|has|have|had|refers\s+to|means|can\s+be\s+defined\s+as|is\s+defined\s+as|are\s+defined\s+as|defined\s+as|"
     r"involves|include|includes|included|consists\s+of|characteri[sz]ed\s+by|focuses\s+on|deals\s+with|"
-    r"considered|classified|regarded|viewed|treated|relies\s+on|depends\s+on|requires)\b",
+    r"considered|classified|regarded|viewed|treated|relies\s+on|depends\s+on|requires|"
+    r"covers|cover|insured|insures|insure|provides|provide|protects|protect|guarantees|guarantee|"
+    r"offers|offer|charges|charge|bills|bill|lets|let|allows|allow|comes\s+with|gives|give|earns|earn|pays|pay|"
+    r"equals|equal|costs|cost|up\s+to|at\s+least|minimum|maximum|per\s+depositor)\b",
     flags=re.IGNORECASE,
 )
 
@@ -10036,7 +10053,11 @@ def _ocr_filter_rejected_reason(text: str, query_text: str = "") -> str | None:
         if re.search(r"\b[a-z]{3,}\s+(?:ves|tion|tions|ment|ments|ing|ed|er|ers|al|ally|ity|ities|es)\b", payload_low):
             return "split_ocr_suffix"
         if len(payload) >= 12:
-            symbol_ratio = len(re.findall(r"[^A-Za-z0-9\s]", payload)) / float(max(1, len(payload)))
+            # Strip runs of 4+ identical separator chars (====, ----, ~~~~) before counting symbols.
+            # These are document section dividers, not OCR noise — without this, a heading like
+            # "Guide\n======\nOptions\n------\n| col | col |" exceeds the 0.28 threshold.
+            payload_for_ratio = re.sub(r"[=\-_~]{4,}", " ", payload)
+            symbol_ratio = len(re.findall(r"[^A-Za-z0-9\s]", payload_for_ratio)) / float(max(1, len(payload_for_ratio)))
             if symbol_ratio > 0.28:
                 return "symbol_dense_fragment"
         if len(alpha_words) == 1:
@@ -10112,7 +10133,15 @@ def _ocr_filter_rejected_reason(text: str, query_text: str = "") -> str | None:
     if len(lines) >= 2 and len(set(lines)) == 1:
         return "repeated_title_text"
     has_sentence_punct = bool(re.search(r"[.!?]$", s))
-    has_predicate = bool(re.search(r"\b(?:is|are|was|were|means|refers\s+to|include|includes|included|involves|describes|explains|contains|consists\s+of|focuses\s+on|considered|classified|regarded|viewed|treated|relies\s+on|depends\s+on|requires)\b", low))
+    has_predicate = bool(re.search(
+        r"\b(?:is|are|was|were|has|have|had|means|refers\s+to|include|includes|included|involves|describes|explains|"
+        r"contains|consists\s+of|focuses\s+on|considered|classified|regarded|viewed|treated|relies\s+on|"
+        r"depends\s+on|requires|covers|cover|insured|insures|insure|provides|provide|protects|protect|"
+        r"guarantees|guarantee|offers|offer|charges|charge|bills|bill|lets|let|allows|allow|gives|give|"
+        r"comes\s+with|equals|equal|costs|cost|up\s+to|at\s+least|minimum|maximum|"
+        r"per\s+depositor)\b",
+        low,
+    ))
     structured_sentence_mode = bool(
         query_low
         and (
@@ -10194,7 +10223,17 @@ def _definition_quality_rejected_reason(sentence: str, entity_l: str = "", requi
         if not re.search(rf"\b{entity_pattern}\b", low):
             entity_tokens = [t for t in re.findall(r"[a-z0-9]{2,}", entity_l) if t not in {"the", "a", "an", "of", "and", "in", "to", "for"}]
             hits = sum(1 for tok in entity_tokens if re.search(rf"\b{re.escape(tok)}\b", low))
-            if hits < max(1, min(2, len(entity_tokens))):
+            min_hits = max(1, min(2, len(entity_tokens)))
+            has_numeric = bool(re.search(r"(?:[\$€£]\s*)?\d", s))
+            if _is_numeric_fact_lookup_query(query_text):
+                min_hits = 1
+                if has_numeric and hits >= 1:
+                    pass
+                elif has_numeric and any(t in low for t in entity_tokens[:2]):
+                    pass
+                elif hits < min_hits:
+                    return "missing_query_entity"
+            elif hits < min_hits:
                 return "missing_query_entity"
     if require_definition_cue and not _ANY_DEFINITION_CUE_RE.search(low):
         return "missing_definition_cue"
@@ -11924,6 +11963,11 @@ def _extract_fact_route_answer(query_text: str, docs: list[dict]) -> str | None:
     if not docs:
         return None
 
+    if _is_numeric_fact_lookup_query(query_text):
+        table_answer = _extract_table_fact_answer(query_text, docs)
+        if table_answer:
+            return table_answer
+
     fact_type = _detect_fact_query_type(query_text)
     compact_docs = _build_compact_fact_context_docs(query_text, docs, max_snippets=FACT_CONTEXT_MAX_SNIPPETS, max_chars=FACT_CONTEXT_MAX_CHARS)
     context_chunks = [
@@ -12051,9 +12095,12 @@ def _build_generation_context(query_text: str, docs: list[dict], max_chars: int 
 
     candidates: list[tuple[float, str]] = []
     for rank, d in enumerate(docs or []):
-        raw = str((d or {}).get("page_content") or (d or {}).get("text") or "").strip()
-        if not raw:
+        raw_chunk = str((d or {}).get("page_content") or (d or {}).get("text") or "").strip()
+        if not raw_chunk:
             continue
+        # Strip ==== / ---- separators and title lines but keep Q:/A: labels so we can
+        # skip Q: question-echo lines and give A: answer lines a scoring bonus below.
+        raw = _strip_doc_structure_separators(raw_chunk)
         doc_score = float((d or {}).get("score", 0.0) or 0.0)
         sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", raw) if s.strip()]
         for sent in sents:
@@ -12062,11 +12109,16 @@ def _build_generation_context(query_text: str, docs: list[dict], max_chars: int 
                 continue
             if re.match(r"^\s*(?:[-•*]|\d+[.)])\s+", sent):
                 continue
+            # Skip Q&A question lines — they echo the question, not the answer
+            if re.match(r"^\s*Q:\s", sent):
+                continue
 
             token_hits = count_token_matches(tokens, low)
             if token_hits <= 0:
                 continue
 
+            # Prefer A: answer lines over bare sentences — they directly answer a question
+            answer_line_bonus = 1.5 if re.match(r"^\s*A:\s", sent) else 0.0
             explain_signal = 1.0 if re.search(r"\b(is|refers\s+to|defined\s+as|means|includes|involves|focuses\s+on)\b", low) else 0.0
             compare_signal = 0.0
             if compare_mode:
@@ -12076,7 +12128,7 @@ def _build_generation_context(query_text: str, docs: list[dict], max_chars: int 
                     compare_signal += 0.8
 
             table_penalty = 0.35 if _looks_table_or_heading_like_chunk(sent[:220]) else 0.0
-            score = (2.2 * float(token_hits)) + explain_signal + compare_signal + (0.25 * doc_score) - (0.02 * rank) - table_penalty
+            score = (2.2 * float(token_hits)) + answer_line_bonus + explain_signal + compare_signal + (0.25 * doc_score) - (0.02 * rank) - table_penalty
             candidates.append((score, sent))
 
     if candidates:
@@ -12085,6 +12137,8 @@ def _build_generation_context(query_text: str, docs: list[dict], max_chars: int 
         seen = set()
         total = 0
         for _, sent in candidates:
+            # Strip any remaining Q:/A: labels from chosen sentences
+            sent = re.sub(r"^\s*[AQ]:\s+", "", sent)
             key = re.sub(r"\s+", " ", sent.strip().lower())
             if key in seen:
                 continue
@@ -12101,7 +12155,7 @@ def _build_generation_context(query_text: str, docs: list[dict], max_chars: int 
             return "\n".join(chosen).strip()
 
     fallback = "\n\n".join(
-        str((d or {}).get("page_content") or (d or {}).get("text") or "").strip()
+        _strip_doc_structure_separators(str((d or {}).get("page_content") or (d or {}).get("text") or "").strip())
         for d in (docs or [])
         if str((d or {}).get("page_content") or (d or {}).get("text") or "").strip()
     ).strip()
@@ -12120,14 +12174,19 @@ def _compose_grounded_generation_answer(query_text: str, context: str) -> str | 
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", ctx) if s.strip()]
     scored: list[tuple[float, str]] = []
     for i, s in enumerate(sents):
+        # Skip Q&A question lines — they echo the question, not the answer
+        if re.match(r"^\s*Q:\s", s):
+            continue
         low = s.lower()
         if len(re.findall(r"[a-z0-9]+", low)) < 6:
             continue
         hits = count_token_matches(tokens, low)
         if hits <= 0:
             continue
+        # Prefer A: answer lines
+        answer_line_bonus = 1.5 if re.match(r"^\s*A:\s", s) else 0.0
         explanatory = 1.0 if re.search(r"\b(is|refers\s+to|defined\s+as|means|includes|involves|association)\b", low) else 0.0
-        score = (2.0 * float(hits)) + explanatory - (0.01 * i)
+        score = (2.0 * float(hits)) + answer_line_bonus + explanatory - (0.01 * i)
         scored.append((score, s))
 
     if not scored:
@@ -12145,12 +12204,15 @@ def _compose_grounded_generation_answer(query_text: str, context: str) -> str | 
             if left_sent and right_sent:
                 return f"- {left.title()}: {left_sent}\n- {right.title()}: {right_sent}"
 
+    def _strip_qa_label(s: str) -> str:
+        return re.sub(r"^\s*[AQ]:\s+", "", s).strip()
+
     if summarize_mode:
-        chosen = [s for _, s in scored[:3]]
+        chosen = [_strip_qa_label(s) for _, s in scored[:3]]
         if chosen:
             return " ".join(chosen)
 
-    chosen = [s for _, s in scored[:2]]
+    chosen = [_strip_qa_label(s) for _, s in scored[:2]]
     if chosen:
         return " ".join(chosen)
     return None
@@ -12698,6 +12760,19 @@ def _is_support_procedural_query(query: str) -> bool:
         r"\bpayment\b",
         r"\b(?:create|delete|update|make)\b.*\baccount\b",
         r"\bcontact\b.*\b(?:hours|support|us)\b",
+        # ---- Support scenario / outcome questions (banking support) ----
+        # "What happens if I report fraud?", "I lost my card. What should I do?",
+        # "My account was hacked." — these are support-handling questions whose
+        # answer is in the KB; without this they fall to the explanatory family
+        # and get blocked by the low-confidence-generic guard.
+        r"^\s*what\s+happens\s+(?:if|when|after)\b",
+        r"\bwhat\s+should\s+i\s+do\b",
+        r"\b(?:report|reporting|reported)\b.*\bfraud\b",
+        r"\bfraud\b",
+        r"\bdispute\b",
+        r"\b(?:lost|stolen|missing|hacked|compromised)\b.*\b(?:card|account)\b",
+        r"\b(?:card|account)\b.*\b(?:lost|stolen|missing|hacked|compromised)\b",
+        r"\bunauthorized\b",
     )
     return any(re.search(p, q) for p in patterns)
 
@@ -14670,9 +14745,12 @@ def _is_valid_definition_sentence(sentence: str, entity: str) -> bool:
             if hits < max(1, len(etoks) - 1):
                 return False
 
-    # 2. Definition cue.
+    # 2. Definition cue (incl. descriptive predicates for product definitions
+    #    like "Everyday Checking has no overdraft fees").
     if not re.search(
-        r"\b(?:is|are|refers\s+to|can\s+be\s+defined|defined\s+as|means)\b",
+        r"\b(?:is|are|has|have|had|refers\s+to|can\s+be\s+defined|defined\s+as|means|covers|cover|insured|insures|"
+        r"include|includes|provides|provide|protects|guarantees|offers|offer|charges|charge|bills|"
+        r"lets|let|allows|allow|comes\s+with|gives|give|earns|earn|pays|pay|equals|up\s+to|at\s+least|minimum|maximum)\b",
         sl,
     ):
         return False
@@ -15328,7 +15406,7 @@ def _compare_answer_from_docs_strict(query: str, docs: list[dict]) -> str | None
     def _entity_tokens(entity: str) -> list[str]:
         return [
             token
-            for token in re.findall(r"[a-z0-9]{3,}", str(entity or "").lower())
+            for token in re.findall(r"[a-z0-9]{2,}", str(entity or "").lower())
             if token not in {"the", "and", "of", "for", "with", "from"}
         ]
 
@@ -15487,10 +15565,18 @@ def _compare_answer_from_docs_strict(query: str, docs: list[dict]) -> str | None
             return False, "dominated_by_other_entity", -1000.0
         has_core_explanation = bool(
             re.search(
-                r"\b(?:is|are|was|were|refers\s+to|defined\s+as|means|involves|focuses\s+on|concerned\s+with|consists\s+of|includes|emphasizes|characterized\s+by|forms\s+an\s+association|associates)\b",
+                r"\b(?:is|are|was|were|refers\s+to|defined\s+as|means|involves|focuses\s+on|concerned\s+with|consists\s+of|includes|emphasizes|characterized\s+by|forms\s+an\s+association|associates|uses|use|goes|distributed|provides|designed|intended)\b",
                 normalized_sentence,
             )
         )
+        if not has_core_explanation:
+            try:
+                from backend.rag_chunk_heuristics import _is_colon_led_definition_prose
+
+                if _is_colon_led_definition_prose(sentence):
+                    has_core_explanation = True
+            except Exception:
+                pass
         if not has_core_explanation:
             return False, "no_core_explanation_signal", -1000.0
 
@@ -15510,8 +15596,18 @@ def _compare_answer_from_docs_strict(query: str, docs: list[dict]) -> str | None
             doc_text = str((entity_doc or {}).get("page_content") or (entity_doc or {}).get("text") or (entity_doc or {}).get("content") or "")
             if not doc_text.strip():
                 continue
-            for raw_sentence in _split_text_into_sentences(doc_text)[:18]:
+            raw_sentences = _split_text_into_sentences(doc_text)[:18]
+            skip_next = False
+            for idx, raw_sentence in enumerate(raw_sentences):
+                if skip_next:
+                    skip_next = False
+                    continue
                 sentence = _clean_definition_like_sentence(raw_sentence)
+                if str(raw_sentence or "").strip().endswith(":") and idx + 1 < len(raw_sentences):
+                    next_part = _clean_definition_like_sentence(raw_sentences[idx + 1])
+                    if next_part:
+                        sentence = f"{sentence.rstrip(':').strip()}: {next_part}".strip()
+                        skip_next = True
                 accepted, reason, score = _sentence_alignment_reason(sentence, entity, other_entity)
                 last_reason = reason
                 if not accepted:
@@ -15660,6 +15756,49 @@ def _compare_answer_from_docs_strict(query: str, docs: list[dict]) -> str | None
         if left_line and right_line and left_line.split(":", 1)[-1].strip().lower() == right_line.split(":", 1)[-1].strip().lower():
             return False, "identical_side_evidence"
         return True, "ok"
+
+    left_tokens = _entity_tokens(left)
+    right_tokens = _entity_tokens(right)
+    for shared_doc in docs or []:
+        shared_text = str(
+            (shared_doc or {}).get("page_content")
+            or (shared_doc or {}).get("text")
+            or (shared_doc or {}).get("content")
+            or ""
+        )
+        if not shared_text.strip():
+            continue
+        if _token_hits(shared_text, left_tokens) < max(1, min(2, len(left_tokens))):
+            continue
+        if _token_hits(shared_text, right_tokens) < max(1, min(2, len(right_tokens))):
+            continue
+        shared_prepared = _prepare_rag_doc_dicts_shared([shared_doc], query)
+        if not shared_prepared:
+            continue
+        shared_doc_dict = shared_prepared[0]
+        left_sentence, _, _ = _extract_aligned_entity_sentence(left, right, [shared_doc_dict])
+        right_sentence, _, _ = _extract_aligned_entity_sentence(right, left, [shared_doc_dict])
+        if left_sentence and right_sentence and left_sentence.lower() != right_sentence.lower():
+            left_sentence = _ensure_sentence_period(left_sentence)
+            right_sentence = _ensure_sentence_period(right_sentence)
+            synthesis_sentence, _ = _build_grounded_synthesis_sentence(left_sentence, right_sentence)
+            synthesis_output = synthesis_sentence or synthesis_fallback
+            shared_answer = "\n".join(
+                [
+                    f"{_display_entity(left)}: {left_sentence}",
+                    f"{_display_entity(right)}: {right_sentence}",
+                    "SYNTHESIS:",
+                    f"- {synthesis_output}",
+                ]
+            )
+            shared_answer = "\n".join(
+                re.sub(r"[ \t]+", " ", line).strip() for line in shared_answer.splitlines() if line.strip()
+            )
+            passed, reason = _compare_output_passes_contamination_guard(shared_answer)
+            if passed:
+                logger.info("[COMPARE SHARED CHUNK] accepted reason=%s", reason)
+                return shared_answer
+            logger.info("[COMPARE SHARED CHUNK] rejected reason=%s", reason)
 
     left_docs = _prepare_entity_compare_docs(left, right)
     right_docs = _prepare_entity_compare_docs(right, left)
@@ -17206,15 +17345,20 @@ def _select_fact_anchor_docs(query_text: str, docs: list[dict], top_k: int = 5, 
                 direct_fact_bonus += 0.35
 
         if _is_metric_fact_query(q_raw):
-            txt_compact = re.sub(r"\s+", "", txt_raw.lower())
-            if re.search(r"\battrition\b", q) and "16.12" in txt_compact:
-                direct_fact_bonus += 3.5
-            if re.search(r"\b(?:department|sales|highest)\b", q) and re.search(r"20\.6", txt_raw):
-                direct_fact_bonus += 3.0
-            if re.search(r"\broc[- ]?auc\b", q) and "0.7272" in txt_compact:
-                direct_fact_bonus += 4.0
-            if re.search(r"\broc[- ]?auc\b", txt, flags=re.IGNORECASE) and re.search(r"\b0\.7272\b", txt_raw):
-                direct_fact_bonus += 2.5
+            # Generic, evidence-driven boost: reward chunks that mention the
+            # question's concept terms AND carry a number of the shape the
+            # question asks for (currency, percent, ratio…). No specific value
+            # is referenced, so this works for any document's metrics.
+            txt_low = txt_raw.lower()
+            metric_concepts = _evidence_concept_tokens(q_raw)
+            concept_hits = sum(1 for tok in metric_concepts if tok in txt_low)
+            has_metric_value = any(
+                _EVIDENCE_VALUE_PATTERNS[t].search(txt_raw)
+                for t in _evidence_value_types_for_query(q_raw)
+                if t in _EVIDENCE_VALUE_PATTERNS
+            )
+            if concept_hits and has_metric_value:
+                direct_fact_bonus += min(4.0, 1.5 + float(concept_hits))
 
         generic_penalty = 0.0
         if fact_type == "who" and critical_terms and not critical_hits:
@@ -18627,13 +18771,15 @@ def _build_fact_rescue_queries(query_text: str, history: list[dict] | None = Non
     subject_terms = _extract_relation_subject_terms(q, fact_type)
     subject_part = " ".join(subject_terms[:4]).strip()
 
-    if re.search(r"\b(?:attrition rate|attrition percentage|highest attrition)\b", q_low):
-        queries.extend([
-            "16.12% attrition rate IBM HR KPI summary",
-            "department highest attrition percentage sales",
-        ])
-    if re.search(r"\broc[- ]?auc\b", q_low):
-        queries.append("ROC-AUC logistic regression baseline 0.7272 threshold")
+    if _is_metric_fact_query(q):
+        # Build the metric rescue query from the question's own concept tokens
+        # plus its subject, so retrieval is steered toward the relevant figures
+        # in *any* corpus rather than one document's known KPIs.
+        metric_terms = " ".join(_evidence_concept_tokens(q)[:6]).strip()
+        for extra in (metric_terms, subject_part):
+            extra = (extra or "").strip()
+            if extra and extra not in queries:
+                queries.append(extra)
 
     has_pronoun = bool(re.search(r"\b(it|this|that|they|he|she)\b", q_low))
     if has_pronoun and history:
@@ -18993,55 +19139,7 @@ def _search_bm25_definition_fallback(query_text: str, top_k: int = 2) -> tuple[l
         return [], (time.perf_counter() - started) * 1000.0
 
 
-def _looks_table_or_heading_like_chunk(text: str) -> bool:
-    src = str(text or "")
-    if not src.strip():
-        return True
-    low = src.lower()
-    if re.search(r"\b(?:table|fig(?:ure)?|fig\.)\b", low[:1600]):
-        return True
-    if re.search(r"\b(table\s*\d+|contributors?|classification|contents?|chapter\s+\d+)\b", low[:1400]):
-        return True
-    # DISABLED_CHEATING_LOGIC: Domain-specific management-ideas table detector.
-    # if re.search(r"\bmanagement\s+ideas\s+contributors\b", low[:1600]):
-    #     return True
-    if re.search(r"\b\d+\.\s*[A-Z][A-Za-z\s\-]{2,50}\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b", src[:1600]):
-        return True
-    # PATCH 4: detect Figure references, numbered row structures, and OCR table remnants
-    if re.search(r"\b(figure\s*\d+|fig\.\s*\d+)\b", low[:1400]):
-        return True
-    # Compact concept-person mapping blocks (e.g. "Scientific Management Taylor")
-    concept_person_pairs = re.findall(r"(?m)^\s*[A-Z][A-Za-z\s\-]{3,40}\s+[A-Z][a-z]+\s+[A-Z][a-z]+\s*$", src[:1400])
-    if len(concept_person_pairs) >= 2:
-        return True
-    lines = [ln.strip() for ln in src.splitlines() if ln.strip()][:40]
-    if not lines:
-        return True
-    strict_def_verb_re = re.compile(r"\b(?:is|refers\s+to|means|defined\s+as)\b", flags=re.IGNORECASE)
-    for ln in lines[:20]:
-        words = re.findall(r"[A-Za-z][A-Za-z\-']*", ln)
-        if not words:
-            continue
-        cap_words = re.findall(r"\b[A-Z][a-z]{2,}\b", ln)
-        has_strict_verb = bool(strict_def_verb_re.search(ln))
-        if len(words) <= 12 and len(cap_words) >= 4 and not has_strict_verb:
-            return True
-        if re.search(r"\S+(?:\s{2,}\S+){2,}", ln):
-            return True
-    short_lines = sum(1 for ln in lines if len(re.findall(r"[A-Za-z][A-Za-z\-']*", ln)) <= 5)
-    bullet_lines = sum(1 for ln in lines if re.match(r"^(?:[-•*]|\d+[.)])\s+", ln))
-    sentence_like = sum(1 for ln in lines if re.search(r"[.!?]$", ln))
-    # PATCH 4: detect numbered row structure ("1." "2." "3." pattern)
-    numbered_row_lines = sum(1 for ln in lines if re.match(r"^\s*\d+\.\s+[A-Z]", ln))
-    if numbered_row_lines >= 3:
-        return True
-    if short_lines / max(1, len(lines)) >= 0.55:
-        return True
-    if bullet_lines / max(1, len(lines)) >= 0.30:
-        return True
-    if sentence_like <= 2 and len(lines) >= 8:
-        return True
-    return False
+from backend.rag_chunk_heuristics import looks_table_or_heading_like_chunk as _looks_table_or_heading_like_chunk
 
 
 def _extract_document_headings(retrieved_docs: list[dict]) -> List[Dict[str, Any]]:
@@ -20474,6 +20572,467 @@ def _is_simple_factual_text_query(text: str) -> bool:
     return cleaned.startswith(factual_starts)
 
 
+def _is_numeric_fact_lookup_query(query_text: str) -> bool:
+    q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    if not q:
+        return False
+    patterns = (
+        # Generic value-lookup vocabulary (no domain/product terms).
+        r"\b(?:coverage|limit|minimum|maximum|balance|fee|fees|rate|amount|price|cost|charge|deposit|insured|insurance|threshold|score)\b",
+        r"\b(?:how much|how many)\b",
+        r"\b(?:requirement|requirements)\b.*\b(?:balance|fee|deposit|amount|limit)\b",
+        r"\b(?:balance|fee|deposit|amount|limit)\b.*\b(?:requirement|requirements)\b",
+        # Fastest/instant *method* questions are value/attribute lookups too.
+        r"\b(?:fastest|quickest|cheapest|lowest|highest)\b.*\b(?:method|option|way|transfer)\b",
+    )
+    return any(re.search(p, q) for p in patterns)
+
+
+_TABLE_FACT_CURRENCY_RE = re.compile(
+    r"(?:[\$€£]\s*)?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?:\s*(?:%|percent|per\s+depositor|per\s+account))?",
+    re.IGNORECASE,
+)
+
+
+def _strip_repeated_kb_headings(text: str) -> str:
+    """Repair common OCR/ingestion pollution before fact extraction.
+
+    The Meridian-style chunks repeat a section heading (e.g. "7. Deposit
+    Insurance", "1. About Meridian Financial Services") before every wrapped
+    line, and glue "per" prepositions to the following word ("perdepositor").
+    Both break sentence splitting and value capture. This repair is generic
+    (no domain values) and only removes duplicate heading occurrences.
+    """
+    s = str(text or "")
+    if not s.strip():
+        return s
+    # Repair glued "per X" prepositions seen in this corpus.
+    s = re.sub(r"\bper(depositor|ownership|account|deposit|month|year|day)\b", r"per \1", s, flags=re.IGNORECASE)
+    # Remove numbered section headings injected mid-sentence (surrounded by
+    # lowercase context), e.g. "...per ownership 7. Deposit Insurance category".
+    # A legitimate heading sits at a boundary, not glued between lowercase words.
+    s = re.sub(
+        r"(?<=[a-z,] )\d+\.\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,4}\s+(?=[a-z])",
+        "",
+        s,
+    )
+    # Detect Title-Case / numbered section headings that repeat, and drop the
+    # 2nd+ occurrences (they are injected mid-sentence by the chunker).
+    heading_re = re.compile(r"(?:\d+\.\s+)?[A-Z][A-Za-z]+(?:[ &/,'\-]+[A-Z][A-Za-z]+){1,5}")
+    counts: dict[str, int] = {}
+    for m in heading_re.finditer(s):
+        h = m.group(0).strip()
+        counts[h] = counts.get(h, 0) + 1
+    repeated = sorted([h for h, c in counts.items() if c >= 2], key=len, reverse=True)
+    for h in repeated:
+        parts = s.split(h)
+        if len(parts) > 2:
+            s = parts[0] + h + "".join(" " + p for p in parts[1:])
+    # Collapse horizontal whitespace only — preserve newlines so table rows
+    # stay on separate lines for downstream pipe-row parsing.
+    s = re.sub(r"[ \t]+", " ", s)
+    s = "\n".join(line.strip() for line in s.splitlines())
+    return s.strip()
+
+
+def _format_table_fact_answer(query_text: str, label: str, value: str) -> str:
+    q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    label_clean = re.sub(r"\s+", " ", str(label or "").strip())
+    value_clean = re.sub(r"\s+", " ", str(value or "").strip())
+    if "minimum balance" in q or ("minimum" in q and "balance" in q) or "min balance" in q:
+        if label_clean:
+            return f"{label_clean} requires a {value_clean} minimum balance."
+        return f"The minimum balance requirement is {value_clean} minimum balance."
+    if label_clean:
+        return f"{label_clean}: {value_clean}."
+    return value_clean
+
+
+def _table_fact_product_phrases(query_text: str) -> list[str]:
+    """Derive the entity/product phrase(s) a fact query is about, from the query
+    itself — no hardcoded product or company names.
+
+    Two generic signals are used:
+      1. Phrases introduced by "for <X>" / "of <X>" before an attribute word
+         (e.g. "minimum balance for everyday checking").
+      2. Capitalized multi-word noun phrases in the original query, which almost
+         always denote a named entity/product (e.g. "High-Yield Savings",
+         "Money Market"). These are detected structurally (Title-Case runs),
+         so any future document's entity names work the same way.
+    """
+    raw = str(query_text or "").strip()
+    q = re.sub(r"\s+", " ", raw.lower())
+    phrases: list[str] = []
+    for pattern in (
+        r"\bfor\s+([a-z][a-z0-9\s\-]{2,40}?)(?:\?|$|\s+(?:minimum|maximum|balance|fee|limit|coverage))",
+        r"\bof\s+([a-z][a-z0-9\s\-]{2,40}?)(?:\?|$|\s+(?:minimum|maximum|balance|fee|limit|coverage))",
+    ):
+        match = re.search(pattern, q)
+        if match:
+            phrase = re.sub(r"\s+", " ", match.group(1).strip())
+            if phrase and phrase not in phrases:
+                phrases.append(phrase)
+    # Capitalized multi-word noun phrases in the query are treated as candidate
+    # entity names, derived purely from the user's wording (handles
+    # "High-Yield Savings minimum balance?" for any corpus).
+    for m in re.findall(r"\b[A-Z][A-Za-z]+(?:[\s\-][A-Z][A-Za-z]+)+\b", raw):
+        ph = re.sub(r"\s+", " ", m.strip().lower())
+        if ph and ph not in phrases:
+            phrases.append(ph)
+    return phrases
+
+
+def _table_fact_focus_tokens(query_text: str) -> list[str]:
+    q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    stop = {
+        "what", "is", "are", "the", "a", "an", "for", "of", "in", "to", "does", "do",
+        "require", "requirement", "requirements", "tell", "me", "about", "please",
+    }
+    return [t for t in re.findall(r"[a-z0-9]{2,}", q) if t not in stop]
+
+
+_MINBAL_HEADER_TOKENS = ("min. balance", "min balance", "minimum balance")
+
+
+def _extract_minbalance_from_pipe_line(line: str, product_phrases: list[str]) -> str | None:
+    """Read the min-balance value for a product from a `|`-delimited table row.
+
+    Handles the real-corpus case where prose, the header row and the data row
+    are concatenated on one physical line. Maps columns by header name so the
+    correct currency cell (Min. balance) is returned rather than Monthly fee.
+    """
+    low = line.lower()
+    if "|" not in low or not any(h in low for h in _MINBAL_HEADER_TOKENS):
+        return None
+    if not any(p in low for p in product_phrases):
+        return None
+    cells = [c.strip() for c in line.split("|")]
+    cells_l = [c.lower() for c in cells]
+
+    # Locate the header columns (ordered) and the index of the min-balance col.
+    account_col = monthly_col = minbal_col = None
+    for i, cl in enumerate(cells_l):
+        if account_col is None and "account" in cl:
+            account_col = i
+        if monthly_col is None and "monthly" in cl:
+            monthly_col = i
+        if minbal_col is None and any(h in cl for h in _MINBAL_HEADER_TOKENS):
+            minbal_col = i
+    if minbal_col is None or account_col is None:
+        return None
+
+    # Find the data cell that carries the product name (it may be glued into the
+    # trailing header cell, e.g. "Highlights Everyday Checking").
+    product_cell = None
+    for i in range(account_col, len(cells_l)):
+        if any(p in cells_l[i] for p in product_phrases):
+            product_cell = i
+            break
+    if product_cell is None:
+        return None
+
+    # Values follow the product cell, one per header column after "account".
+    value_cells = cells[product_cell + 1:]
+    # Offset of min-balance among the value columns (account == product itself).
+    offset = minbal_col - account_col - 1
+    if offset < 0 or offset >= len(value_cells):
+        return None
+    val_match = _TABLE_FACT_CURRENCY_RE.search(value_cells[offset])
+    if not val_match:
+        return None
+    return val_match.group(0)
+
+
+# Value shapes the evidence extractor can recognise. None of these encode a
+# specific amount — they only describe the *form* of a number to read from text.
+_EVIDENCE_VALUE_PATTERNS: dict[str, re.Pattern] = {
+    "per_period": re.compile(
+        r"[\$€£]?\s?\d[\d,]*(?:\.\d{1,2})?\s*(?:/|per)\s*(?:day|month|year|week|hour)",
+        re.IGNORECASE,
+    ),
+    "currency": re.compile(r"[\$€£]\s?\d[\d,]*(?:\.\d{1,2})?", re.IGNORECASE),
+    "percent": re.compile(r"\d+(?:\.\d+)?\s?(?:%|percent)", re.IGNORECASE),
+    "ratio": re.compile(r"\b\d+\.\d{2,}\b"),
+    "number": re.compile(r"\b\d[\d,]*(?:\.\d+)?\b"),
+}
+
+_EVIDENCE_STOPWORDS: frozenset[str] = frozenset({
+    "what", "which", "who", "whom", "whose", "when", "where", "why", "how",
+    "the", "and", "for", "are", "was", "were", "does", "did", "has", "have",
+    "with", "that", "this", "from", "about", "tell", "give", "show", "please",
+    "exact", "much", "many", "value", "amount", "there", "your", "their", "its",
+})
+
+
+def _evidence_value_types_for_query(query_text: str) -> list[str]:
+    """Pick the numeric shape(s) the question is asking for, from its wording."""
+    q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    types: list[str] = []
+    if re.search(r"\b(?:per\s+day|/\s*day|daily|per\s+month|monthly|per\s+year|annual)\b", q) and re.search(
+        r"\b(?:limit|max|maximum|cap|transfer|allowance)\b", q
+    ):
+        types.append("per_period")
+    if re.search(
+        r"\b(?:fee|fees|price|cost|charge|balance|minimum|maximum|coverage|limit|amount|deposit|insured|insurance|premium|payment|salary|budget)\b",
+        q,
+    ):
+        types.append("currency")
+    if re.search(r"\b(?:rate|percentage|percent|apr|apy|yield|interest|discount)\b", q):
+        types.append("percent")
+    if re.search(r"\b(?:score|auc|ratio|coefficient|accuracy|precision|recall|index|threshold|probability)\b", q):
+        types.extend(["ratio", "percent"])
+    seen: set[str] = set()
+    ordered = [t for t in types if not (t in seen or seen.add(t))]
+    return ordered or ["currency", "percent", "ratio", "number"]
+
+
+def _evidence_concept_tokens(query_text: str) -> list[str]:
+    """Content tokens that the answer sentence must overlap with."""
+    q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    return [t for t in re.findall(r"[a-z0-9]{3,}", q) if t not in _EVIDENCE_STOPWORDS]
+
+
+def _evidence_candidate_units(clean_text: str) -> list[str]:
+    """Split a chunk into scoreable units: table rows first, then sentences."""
+    units: list[str] = []
+    for raw_line in str(clean_text or "").splitlines():
+        line = raw_line.strip()
+        if "|" in line and line.count("|") >= 1:
+            units.append(line)
+    for sent in re.split(r"(?<=[.!?])\s+|\n+", str(clean_text or "")):
+        s = re.sub(r"\s+", " ", str(sent or "").strip())
+        if s:
+            units.append(s)
+    return units
+
+
+def _extract_evidence_value_sentence(
+    query_text: str,
+    clean_text: str,
+    value_types: list[str] | None = None,
+    require_value: bool = True,
+    extra_concept_tokens: list[str] | None = None,
+) -> str | None:
+    """Generic, evidence-driven extractor.
+
+    Returns the sentence/row from the retrieved chunk that (a) overlaps the
+    query's concept tokens and (b) contains a number of the requested shape —
+    returned *verbatim* from the source. It contains no product names, company
+    names, dollar amounts, percentages or metrics of its own; everything in the
+    answer comes from the document. Works for any PDF because matching is by
+    query↔evidence overlap, not by known entities or known values.
+    """
+    concept = _evidence_concept_tokens(query_text)
+    if extra_concept_tokens:
+        concept = concept + [t for t in extra_concept_tokens if t and t not in concept]
+    if not concept:
+        return None
+    vtypes = value_types or _evidence_value_types_for_query(query_text)
+    pats = [_EVIDENCE_VALUE_PATTERNS[t] for t in vtypes if t in _EVIDENCE_VALUE_PATTERNS]
+
+    best: str | None = None
+    best_score = -1
+    for unit in _evidence_candidate_units(clean_text):
+        u_low = unit.lower()
+        hits = sum(1 for tok in concept if tok in u_low)
+        if hits == 0:
+            continue
+        value_text: str | None = None
+        for pat in pats:
+            mm = pat.search(unit)
+            if mm:
+                value_text = mm.group(0)
+                break
+        if require_value and not value_text:
+            continue
+        # Prefer high concept overlap and a present value; gently penalise very
+        # long blobs so a focused row/sentence wins over a wall of prose.
+        score = hits * 10 + (len(value_text) if value_text else 0) - min(len(unit) // 40, 4)
+        if score > best_score:
+            best_score = score
+            best = unit
+    if not best:
+        return None
+    answer = re.sub(r"\s+", " ", best).strip().strip("|").strip()
+    if answer and not re.search(r"[.!?]$", answer):
+        answer += "."
+    return answer or None
+
+
+# NOTE: The former concept-keyed extractors (FDIC / ACH / wire / instant /
+# fastest) were removed. All numeric/value fact answers now flow through the
+# single generic `_extract_evidence_value_sentence`, called directly from
+# `_extract_table_fact_answer`. There are no domain-specific extractors left.
+
+
+def _collection_pipe_table_chunks() -> list[str]:
+    """Return active-collection chunk texts that contain a pipe table (`|`).
+
+    Deterministic fallback source for numeric table lookups (min balance, fees,
+    transfer limits). The active collection is small for support KBs, so a direct
+    read is cheap; this is only invoked for numeric-fact-lookup queries.
+    """
+    try:
+        col = None
+        try:
+            rag = _active_rag()
+            col = getattr(getattr(rag, "vs", None), "collection", None)
+        except Exception:
+            col = None
+        if col is None:
+            from backend.knowledge_base import get_or_create_collection
+            col = get_or_create_collection()
+        if col is None:
+            return []
+        data = col.get(include=["documents"]) or {}
+        return [str(d or "") for d in (data.get("documents") or []) if "|" in str(d or "")]
+    except Exception:
+        return []
+
+
+def _extract_table_fact_answer(query_text: str, docs: list[dict]) -> str | None:
+    docs = list(docs or [])
+    if not docs:
+        return None
+    focus_tokens = _table_fact_focus_tokens(query_text)
+    if not focus_tokens:
+        return None
+    product_phrases = _table_fact_product_phrases(query_text)
+    q_low = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    # The only concept-specific flag retained is "minimum balance", because it
+    # selects a *generic* column-mapped table reader (no values, no products).
+    is_minbal_query = ("minimum balance" in q_low) or ("min balance" in q_low) or ("minimum" in q_low and "balance" in q_low)
+    is_value_lookup = _is_numeric_fact_lookup_query(query_text)
+
+    # Pre-clean each doc once (repairs glued tokens + injected headings).
+    cleaned_docs = []
+    for d in docs:
+        raw = str((d or {}).get("page_content") or (d or {}).get("text") or "")
+        if raw.strip():
+            cleaned_docs.append(_strip_repeated_kb_headings(raw))
+
+    # Deterministic fallback: an authoritative table can be out-ranked in
+    # retrieval by a strong prose chunk. For any numeric/value lookup, also
+    # consult the active collection's pipe-table chunks so the correct
+    # row/column value is available regardless of ranking. This is generic — it
+    # is keyed on the query *asking for a value*, not on any domain term.
+    if is_value_lookup:
+        seen_clean = set(cleaned_docs)
+        for raw in _collection_pipe_table_chunks():
+            clean_extra = _strip_repeated_kb_headings(raw)
+            if clean_extra and clean_extra not in seen_clean:
+                cleaned_docs.append(clean_extra)
+                seen_clean.add(clean_extra)
+
+    # --- Generic min-balance-by-entity path (column-mapped, no hardcoded names) ---
+    if is_minbal_query and product_phrases:
+        for clean in cleaned_docs:
+            for line in clean.splitlines():
+                val = _extract_minbalance_from_pipe_line(line, product_phrases)
+                if val is not None:
+                    label = product_phrases[0].title()
+                    return _format_table_fact_answer(query_text, label, val)
+
+    # --- Generic evidence-driven value path: read the value the query asks for
+    #     straight from the matching sentence/row, for any concept or domain. ---
+    if is_value_lookup:
+        for clean in cleaned_docs:
+            ev = _extract_evidence_value_sentence(query_text, clean, require_value=False)
+            if ev:
+                return ev
+
+    best_answer: str | None = None
+    best_score = 0
+
+    for clean in cleaned_docs:
+        text = clean
+
+        for raw_line in text.splitlines():
+            line = str(raw_line or "").strip()
+            if not line or line.upper().startswith("[TABLE DATA]"):
+                continue
+
+            if "|" in line:
+                cells = [c.strip() for c in line.split("|") if c.strip()]
+                if len(cells) < 2:
+                    continue
+                row_text = " ".join(cells).lower()
+                if product_phrases and not any(p in row_text for p in product_phrases):
+                    continue
+                hits = sum(1 for tok in focus_tokens if tok in row_text)
+                if hits == 0:
+                    continue
+                # Choose a clean label: the cell that contains the product phrase,
+                # not a long prose blob glued into cell[0].
+                label_cell = cells[0]
+                if product_phrases:
+                    for c in cells:
+                        if any(p in c.lower() for p in product_phrases):
+                            label_cell = product_phrases[0].title()
+                            break
+                if len(str(label_cell)) > 60 and not product_phrases:
+                    continue
+                for cell in cells[1:]:
+                    match = _TABLE_FACT_CURRENCY_RE.search(cell)
+                    if not match:
+                        continue
+                    score = hits * 10 + len(match.group(0))
+                    if product_phrases:
+                        score += 50
+                    if score > best_score:
+                        best_score = score
+                        best_answer = _format_table_fact_answer(query_text, label_cell, match.group(0))
+                continue
+
+            if ":" in line and not re.search(r"https?://", line, flags=re.IGNORECASE):
+                label, _, value_part = line.partition(":")
+                label = label.strip()
+                value_part = value_part.strip()
+                if not label or not value_part:
+                    continue
+                label_l = label.lower()
+                value_l = value_part.lower()
+                hits = sum(1 for tok in focus_tokens if tok in label_l or tok in value_l)
+                match = _TABLE_FACT_CURRENCY_RE.search(value_part)
+                if hits >= 1 and match:
+                    score = hits * 8
+                    if score > best_score:
+                        best_score = score
+                        best_answer = _format_table_fact_answer(query_text, label, match.group(0))
+
+        for sent in re.split(r"(?<=[.!?])\s+|\n+", text):
+            sent_clean = re.sub(r"\s+", " ", str(sent or "").strip())
+            if not sent_clean:
+                continue
+            sent_l = sent_clean.lower()
+            hits = sum(1 for tok in focus_tokens if tok in sent_l)
+            if hits == 0:
+                continue
+            match = _TABLE_FACT_CURRENCY_RE.search(sent_clean)
+            if not match:
+                continue
+            # Relevance is already enforced by query-token overlap (hits > 0);
+            # no domain-keyword gate is applied, so this works for any corpus.
+            score = hits * 5 + len(match.group(0))
+            if score > best_score:
+                best_score = score
+                if not re.search(r"[.!?]$", sent_clean):
+                    sent_clean += "."
+                best_answer = sent_clean
+
+    if not best_answer:
+        return None
+    try:
+        if _is_answer_grounded_in_docs(best_answer, docs, query_text=query_text):
+            return best_answer
+    except Exception:
+        return best_answer
+    # Built directly from retrieved doc/table lines — accept when match score is strong.
+    if best_score >= 5:
+        return best_answer
+    return None
+
+
 def _detect_fact_query_type(query_text: str) -> str | None:
     q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
     if not q:
@@ -20500,6 +21059,8 @@ def _detect_fact_query_type(query_text: str) -> str | None:
         return "which"
     if _is_metric_fact_query(q):
         return "which"
+    if _is_numeric_fact_lookup_query(q):
+        return "numeric"
     return None
 
 
@@ -21339,7 +21900,8 @@ def _lightweight_spelling_correction(query_text: str, seed_docs: list[dict] | No
         cache_key = None
 
         try:
-            collection = getattr(getattr(live_rag, "vs", None), "collection", None)
+            active_mgr = _active_rag()
+            collection = getattr(getattr(active_mgr, "vs", None), "collection", None)
             if collection is not None:
                 collection_name = str(getattr(collection, "name", "") or "")
                 try:
@@ -21354,7 +21916,7 @@ def _lightweight_spelling_correction(query_text: str, seed_docs: list[dict] | No
                             vocab_counter[tok] += int(freq or 0)
                             source_map.setdefault(tok, "document_vocab")
                 else:
-                    payload = collection.get(include=["documents", "metadatas"], limit=min(max(collection_count, 1), 5000))
+                    payload = collection.get(include=["documents", "metadatas"], limit=min(max(collection_count, 1), 1500))
                     docs_blob = payload.get("documents") if isinstance(payload, dict) else None
                     metas_blob = payload.get("metadatas") if isinstance(payload, dict) else None
                     docs: list[str] = []
@@ -21382,15 +21944,17 @@ def _lightweight_spelling_correction(query_text: str, seed_docs: list[dict] | No
         except Exception:
             pass
 
+        seed_tokens: set[str] = set()
         for d in (seed_docs or [])[:4]:
             txt = str((d or {}).get("page_content") or (d or {}).get("text") or "")[:3000]
             for tok in re.findall(r"[a-z]{4,22}", txt.lower()):
                 vocab_counter[tok] += 1
                 source_map[tok] = "retrieved_terms"
+                seed_tokens.add(tok)
 
         filtered_vocab = {
             tok for tok, freq in vocab_counter.items()
-            if len(tok) >= 4 and (freq >= 2 or tok in query_core_vocab)
+            if len(tok) >= 4 and (freq >= 2 or tok in query_core_vocab or tok in seed_tokens)
         }
         if not filtered_vocab:
             filtered_vocab = set(query_core_vocab)
@@ -21440,6 +22004,14 @@ def _lightweight_spelling_correction(query_text: str, seed_docs: list[dict] | No
                 if stem == original_low:
                     return True
                 if suffix in {"d", "ed", "ing"} and stem + "e" == original_low:
+                    return True
+        # Reverse direction: original is an inflection of candidate (e.g. "ordered"→"order")
+        for suffix in ("ing", "ed", "es", "s", "d"):
+            if original_low.endswith(suffix):
+                stem = original_low[:-len(suffix)]
+                if stem == candidate_low:
+                    return True
+                if suffix in {"d", "ed", "ing"} and stem + "e" == candidate_low:
                     return True
         return False
 
@@ -21495,50 +22067,88 @@ def _lightweight_spelling_correction(query_text: str, seed_docs: list[dict] | No
         if len(low) < 4 or low in query_core_vocab:
             return token
         low_freq = int(freq_map.get(low, 0) or 0)
-        if low in vocab and low_freq >= 1:
+        if low in vocab and low_freq >= 2:
             return token
-        if _looks_like_valid_english_token(low):
+        if low in vocab and low_freq >= 1 and not _token_has_suspicious_typo_shape(low):
+            return token
+        # Pronouns, auxiliaries, conjunctions, and common function words must never be corrected
+        # to a superficially similar document-vocab word (e.g. "they"→"that", "were"→"where").
+        _PROTECTED = frozenset({
+            "they", "them", "their", "these", "those", "then", "than",
+            "this", "that", "with", "have", "from", "will", "were", "been",
+            "when", "what", "which", "who", "how", "its", "your", "our",
+            "you", "the", "and", "but", "for", "not", "are", "was",
+            "can", "may", "might", "should", "would", "could", "must",
+            "does", "did", "has", "had", "being", "also", "more",
+            "into", "over", "under", "about", "other", "some", "such",
+            "each", "both", "many", "much", "same", "very", "just",
+        })
+        if low in _PROTECTED:
             return token
 
-        candidates = [cand for cand in by_initial.get(low[0], []) if abs(len(cand) - len(low)) <= 1]
+        candidates = [
+            cand for cand in vocab
+            if cand and cand[0] == low[0] and abs(len(cand) - len(low)) <= 2
+        ]
+        if not candidates:
+            candidates = [cand for cand in by_initial.get(low[0], []) if abs(len(cand) - len(low)) <= 2]
+        if not candidates:
+            from backend.spelling_fallback import _COMMON_ENGLISH_WORDS
+
+            candidates = [
+                w
+                for w in _COMMON_ENGLISH_WORDS
+                if w and w[0] == low[0] and abs(len(w) - len(low)) <= 2
+            ][:40]
         if not candidates:
             return token
 
         best = token
-        best_dist = 2
+        best_dist = 3
         best_freq = -1
-        second_dist = 2
+        second_best_freq = -1
         for cand in candidates:
             if cand == low:
                 continue
-            dist = _edit_distance_leq(low, cand, cap=1)
-            if dist > 1:
+            dist = _edit_distance_leq(low, cand, cap=2)
+            if dist > 2:
                 continue
             cand_freq = int(freq_map.get(cand, 0))
+            if cand_freq == 0:
+                try:
+                    from backend.spelling_fallback import _COMMON_ENGLISH_WORDS as _dict_words
+                    if cand in _dict_words:
+                        cand_freq = 1
+                except Exception:
+                    pass
             if dist < best_dist or (dist == best_dist and cand_freq > best_freq):
-                second_dist = best_dist
+                if dist == best_dist:
+                    second_best_freq = max(second_best_freq, best_freq)
+                else:
+                    second_best_freq = best_freq
                 best = cand
                 best_dist = dist
                 best_freq = cand_freq
-            elif dist < second_dist:
-                second_dist = dist
+            elif cand_freq > second_best_freq:
+                second_best_freq = cand_freq
 
-        if best_dist > 1:
+        if best_dist > 2 or best == token:
             return token
-        confidence = 1.0 if best_dist == 0 else 0.88
+        confidence = 1.0 if best_dist == 0 else max(0.85, 0.95 - (best_dist - 1) * 0.05)
         if _token_has_suspicious_typo_shape(low):
             confidence += 0.05
         if best_freq >= 8:
             confidence += 0.05
         elif best_freq >= 4:
             confidence += 0.03
-        if best_freq >= 4:
-            confidence = min(0.99, confidence)
-        if second_dist == best_dist and best_freq < 4:
+        if low not in vocab and best_freq >= 2:
+            confidence = min(0.99, confidence + 0.04)
+        if second_best_freq >= best_freq and best_freq < 4:
             _record_block("ambiguous_candidate", token, best, confidence)
             return token
-        if confidence < 0.92:
-            _record_block("confidence_below_extreme_threshold", token, best, confidence)
+        min_confidence = 0.88 if low not in vocab else 0.92
+        if confidence < min_confidence:
+            _record_block("confidence_below_threshold", token, best, confidence)
             return token
         if low in vocab and best_freq < max(low_freq * 5, low_freq + 8):
             _record_block("original_seen_in_document_vocab", token, best, confidence)
@@ -21546,11 +22156,16 @@ def _lightweight_spelling_correction(query_text: str, seed_docs: list[dict] | No
         if _is_inflection_only_variant(low, best):
             _record_block("inflection_only_variant", token, best, confidence)
             return token
-        if _looks_like_valid_english_token(low) and _looks_like_valid_english_token(best):
+        if (
+            _looks_like_valid_english_token(low)
+            and _looks_like_valid_english_token(best)
+            and low in vocab
+            and low_freq >= 2
+        ):
             _record_block("valid_word_semantic_change", token, best, confidence)
             return token
-        if not _token_has_suspicious_typo_shape(low) and best_freq < 4:
-            _record_block("no_typo_evidence", token, best, confidence)
+        if low not in vocab and best_freq < (1 if best_dist == 1 else 2):
+            _record_block("no_kb_vocab_match", token, best, confidence)
             return token
         correction_events.append({
             "before": token,
@@ -22221,7 +22836,9 @@ def _extract_best_scored_concept_sentence_from_docs(query_text: str, docs: list[
         flags=re.IGNORECASE,
     )
     definition_verb_re = re.compile(
-        r"\b(?:is|refers\s+to|means|defined\s+as|includes|involves|consists\s+of|characterized\s+by|focuses\s+on)\b",
+        r"\b(?:is|are|has|have|had|refers\s+to|means|defined\s+as|includes|include|involves|consists\s+of|"
+        r"characterized\s+by|focuses\s+on|offers|offer|provides|provide|charges|charge|comes\s+with|"
+        r"lets|let|allows|allow|requires|require|earns|earn|pays|pay)\b",
         flags=re.IGNORECASE,
     )
 
@@ -22251,7 +22868,18 @@ def _extract_best_scored_concept_sentence_from_docs(query_text: str, docs: list[
                 continue
 
             token_hits = sum(1 for t in entity_tokens if re.search(rf"\b{re.escape(t)}\b", low))
-            if token_hits < max(1, min(2, len(entity_tokens))):
+            min_hits = max(1, min(2, len(entity_tokens)))
+            has_numeric = bool(re.search(r"(?:[\$€£]\s*)?\d", s))
+            if _is_numeric_fact_lookup_query(query_text):
+                min_hits = 1
+                if has_numeric and token_hits >= 1:
+                    pass
+                elif has_numeric and any(t in low for t in entity_tokens[:2]):
+                    pass
+                elif token_hits < min_hits:
+                    _log_definition_quality_rejection(s, "missing_query_entity")
+                    continue
+            elif token_hits < min_hits:
                 _log_definition_quality_rejection(s, "missing_query_entity")
                 continue
 
@@ -25366,16 +25994,6 @@ def _assess_list_coherence(query_text: str, answer_text: str, strict_fast: bool 
     if not noise_ok:
         logger.info("[LIST FINAL DECISION] accepted=False reason=ocr_noise_detected")
         return (False, "ocr_noise_detected", None)
-    if re.search(r"\b(?:function|vital center|centers located)\b", _list_query_norm):
-        functional_markers = (
-            "cardio", "respiratory", "vasomotor", "inhibitory", "regulate", "regulation",
-            "heartbeat", "heart rate", "blood pressure", "breathing", "respiration",
-            "controls", "control", "center responsible", "vital function",
-        )
-        combined_items = " ".join(aligned_items).lower()
-        if not any(marker in combined_items for marker in functional_markers):
-            logger.info("[LIST FINAL DECISION] accepted=False reason=missing_functional_content")
-            return (False, "missing_functional_content", None)
     if len(aligned_items) < min_required_items:
         logger.info("[LIST FINAL DECISION] accepted=False reason=min_quality_failed")
         return (False, "min_quality_failed", None)
@@ -26613,23 +27231,29 @@ def _is_metric_fact_query(query: str) -> bool:
     q = re.sub(r"\s+", " ", str(query or "").strip().lower())
     if not q:
         return False
-    if re.search(r"\b(?:roc-auc|roc auc|attrition rate|attrition percentage)\b", q):
-        return True
     if re.search(r"\bwhat is the exact\b", q):
         return True
-    if re.search(r"\bwhat was the\b.{0,80}\b(?:score|rate|percentage|threshold|auc)\b", q):
+    if re.search(r"\bwhat was the\b.{0,80}\b(?:score|rate|percentage|ratio|threshold|auc|value)\b", q):
         return True
-    if re.search(r"\b(?:exact|overall|baseline)\b.{0,80}\b(?:rate|score|percentage|auc|threshold)\b", q):
+    if re.search(r"\b(?:exact|overall|baseline)\b.{0,80}\b(?:rate|score|percentage|ratio|auc|threshold|value)\b", q):
         return True
-    if re.search(r"\bwhich department\b.{0,80}\b(?:highest|lowest|attrition)\b", q):
+    # Generic superlative-over-a-category lookups ("which X has the highest Y?").
+    if re.search(r"\bwhich\b.{0,40}\b(?:highest|lowest|most|least|largest|smallest|greatest|maximum|minimum)\b", q):
         return True
-    if re.search(r"\b(?:rate|score|percentage|auc|threshold)\b", q) and re.search(r"\b(?:what|which|exact)\b", q):
+    if re.search(r"\b(?:rate|score|percentage|ratio|auc|threshold)\b", q) and re.search(r"\b(?:what|which|exact)\b", q):
         return True
     return False
 
 
 def _extract_metric_fact_answer(query_text: str, docs: list[dict]) -> str | None:
-    """Deterministic extraction for HR numeric fact queries (attrition rate, ROC-AUC)."""
+    """Evidence-driven extraction for numeric/metric fact queries.
+
+    Reads the value the question asks about (rate, score, ratio, threshold, …)
+    straight from the retrieved chunks. No metric, percentage or number is
+    hardcoded: the answer is the source sentence that overlaps the query's
+    concept tokens and carries a number of the requested shape, so it works for
+    any document's metrics — not just one corpus.
+    """
     q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
     if not q or not docs:
         return None
@@ -26643,44 +27267,9 @@ def _extract_metric_fact_answer(query_text: str, docs: list[dict]) -> str | None
         return None
     corpus = _repair_split_words(re.sub(r"\s+", " ", " ".join(corpus_parts)))
 
-    if re.search(r"\b(?:attrition rate|attrition percentage|highest attrition)\b", q):
-        overall_rate = (
-            re.search(r"\b16\.12\s*%", corpus)
-            or re.search(r"\b16\.12\b", corpus)
-            or re.search(r"\b16\s*\.\s*12\s*%", corpus)
-        )
-        sales_rate = re.search(r"\b20\.6\d?\s*%", corpus)
-        sales_ctx = re.search(r"\bsales\b[^.]{0,160}\b20\.6\d?\s*%", corpus, flags=re.IGNORECASE)
-        if not sales_ctx:
-            sales_ctx = re.search(r"\b20\.6\d?\s*%[^.]{0,160}\bsales\b", corpus, flags=re.IGNORECASE)
-        parts: list[str] = []
-        if overall_rate:
-            pct = overall_rate.group(0).strip()
-            if not pct.endswith("%"):
-                pct = f"{pct}%"
-            parts.append(f"The exact attrition rate is {pct}.")
-        if sales_rate or sales_ctx:
-            pct = (sales_rate or re.search(r"\b20\.6\d?\s*%", sales_ctx.group(0) if sales_ctx else ""))
-            pct_txt = pct.group(0).strip() if pct else "20.63%"
-            parts.append(f"Sales has the highest attrition percentage at {pct_txt}.")
-        if parts:
-            return _repair_split_words(" ".join(parts))
-
-    if re.search(r"\broc[- ]?auc\b", q):
-        roc_line = None
-        for segment in re.split(r"(?<=[.!?])\s+|\n+", corpus):
-            seg = str(segment or "").strip()
-            if not seg:
-                continue
-            if re.search(r"\broc[- ]?auc\b", seg, flags=re.IGNORECASE) and re.search(r"\b0\.7272\b", seg):
-                roc_line = seg
-                break
-        if roc_line or re.search(r"\b0\.7272\b", corpus):
-            return (
-                "The ROC-AUC score of the Logistic Regression baseline model "
-                "at the default 0.50 threshold is 0.7272."
-            )
-
+    answer = _extract_evidence_value_sentence(query_text, corpus, require_value=True)
+    if answer:
+        return _repair_split_words(answer)
     return None
 
 
@@ -26689,6 +27278,12 @@ def _is_targeted_list_question(query: str) -> bool:
     if not q:
         return False
     if _is_metric_fact_query(q):
+        return False
+    # Numeric attribute lookups ("minimum balance for High-Yield Savings?") are
+    # NOT list questions even though the product name ends in a plural-looking
+    # token ("savings"). Without this guard they route to list extraction, fail
+    # alignment, and fall back to a wrong/not-found LLM answer.
+    if _is_numeric_fact_lookup_query(q):
         return False
     if _is_support_procedural_query(q):
         return False
@@ -26704,8 +27299,19 @@ def _is_targeted_list_question(query: str) -> bool:
     # list-coherence sanitizer from rejecting tabular/numeric answers.
     if _is_compare_query(q):
         return False
+    # "what happens if ...", "what does X mean", etc. are explanatory, not list
+    # questions. Common 3rd-person verbs ending in -s must NOT count as plural
+    # list nouns, otherwise "What happens if I report fraud?" is misrouted to
+    # list extraction (which fails) instead of an explanatory answer.
+    _verb_s_stop = {
+        "this", "was", "is", "does", "has", "happens", "means", "includes", "requires",
+        "involves", "offers", "provides", "gives", "gets", "goes", "comes", "needs",
+        "works", "helps", "uses", "looks", "says", "makes", "takes", "keeps", "seems",
+        "appears", "occurs", "applies", "exists", "covers", "charges", "lets", "allows",
+        "its", "us", "as",
+    }
     tokens = re.findall(r"[a-z]{3,}", q)
-    plural_tokens = [tok for tok in tokens if tok.endswith("s") and tok not in {"this", "was", "is", "does"}]
+    plural_tokens = [tok for tok in tokens if tok.endswith("s") and tok not in _verb_s_stop]
     if re.match(r"^\s*(?:name|give|mention|identify)\b", q) and plural_tokens:
         return True
     if re.search(r"\b(?:what|which)\b", q) and plural_tokens and (" and " in q or " or " in q or q.endswith("?")):
@@ -26751,6 +27357,17 @@ def _classify_query_family_v2(query: str) -> str:
     q = re.sub(r"\s+", " ", str(query or "").strip().lower())
     if not q:
         return "explanatory_compare"
+
+    # Numeric/metric fact lookups ("what is the minimum balance / outgoing wire
+    # fee / FDIC coverage limit for X") are FACT questions even when phrased like
+    # a definition ("what is the ..."). They must be classified as fact_entity
+    # BEFORE the definition-style check, otherwise the definition path runs: it
+    # (a) applies an explanation filter that discards the pipe table holding the
+    # answer, and (b) rejects the numeric answer with a strict entity-reference
+    # guard. Pure definitions ("what is Everyday Checking?") do not match the
+    # numeric-lookup patterns and still fall through to definition_entity.
+    if _is_numeric_fact_lookup_query(q) and not _is_support_procedural_query(q):
+        return "fact_entity"
 
     if _is_definition_style_query(q):
         return "definition_entity"
@@ -27966,8 +28583,34 @@ def clean_ocr_noise(text: str) -> str:
     return text
 
 
+def _strip_doc_structure_separators(text: str) -> str:
+    """Remove ====, ---- separators and doc-title lines but KEEP Q:/A: labels.
+    Used during sentence extraction so we can still skip Q: lines and prefer A: lines."""
+    if not text:
+        return text
+    text = re.sub(r"(?m)^[=\-_~|]{4,}\s*$", "", text)
+    text = re.sub(r"(?m)^.{3,80}\n[=\-_~]{4,}\s*$", "", text)
+    text = re.sub(r"(?m)^[A-Z][A-Z0-9 &()/\-]{4,}\n[-=_]{4,}", "", text)
+    text = re.sub(r"\s*[=\-_~]{4,}\s*", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def _strip_doc_structure_artifacts(text: str) -> str:
+    """Remove document-header formatting (====, ----, Q:/A: labels) from answer text."""
+    if not text:
+        return text
+    text = _strip_doc_structure_separators(text)
+    # Strip Q:/A: labels from Q&A-style document chunks; keep the content
+    text = re.sub(r"(?m)^Q:\s+", "", text)
+    text = re.sub(r"(?m)^A:\s+", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
 def _cleanup_final_answer_text(answer_text: str) -> str:
-    txt = clean_ocr_noise(_repair_split_words(re.sub(r"[ \t]+", " ", str(answer_text or "")).strip()))
+    raw = _strip_doc_structure_artifacts(str(answer_text or "").strip())
+    txt = clean_ocr_noise(_repair_split_words(re.sub(r"[ \t]+", " ", raw).strip()))
     if not txt:
         return txt
 
@@ -28005,7 +28648,6 @@ def _cleanup_final_answer_text(answer_text: str) -> str:
         (r"\bme\s*mory\b", "memory"),
         (r"\bin\s*dividuals?\b", "individual"),
         (r"\bfor\s*mulas?\b", "formula"),
-        (r"\bat\s+trition\b", "attrition"),
     ]
     for patt, repl in fixes:
         txt = re.sub(patt, repl, txt, flags=re.IGNORECASE)
@@ -28393,7 +29035,13 @@ def _is_current_world_or_personal_query(query_text: str) -> bool:
         return True
     if re.search(r"\b(?:my name|my age|my location|my address|where do i|who am i|what am i doing)\b", query_norm):
         return True
-    if re.search(r"\b(?:your opinion|do you think|should i)\b", query_norm):
+    # Only flag opinion / subjective queries — NOT procedural "What should I do if..." support questions
+    if re.search(r"\b(?:your opinion|do you think)\b", query_norm):
+        return True
+    if re.search(r"\bshould i\b", query_norm) and not re.search(
+        r"\b(?:do|return|exchange|cancel|contact|report|use|pay|order|track|ship|get|check|request|claim|apply|submit)\b",
+        query_norm,
+    ):
         return True
     return False
 
@@ -28591,6 +29239,20 @@ def _normalize_query_for_router(query: str) -> str:
     q = re.sub(r"ة", "ه", q)
     q = re.sub(r"[^0-9a-z\u0600-\u06FF]+", " ", q)
     q = re.sub(r"\s+", " ", q).strip()
+    # Normalize repeated-letter greeting variants (hii, heyy, helloo, thankss, okk).
+    if q and " " not in q and q.isalpha() and len(q) <= 14:
+        if re.fullmatch(r"h+i+", q):
+            q = "hi"
+        elif re.fullmatch(r"he+y+", q):
+            q = "hey"
+        elif re.fullmatch(r"hello+", q):
+            q = "hello"
+        elif re.fullmatch(r"thank+s+", q):
+            q = "thanks"
+        elif re.fullmatch(r"ok+k*", q) or re.fullmatch(r"okay+", q):
+            q = "ok"
+        elif re.fullmatch(r"yo+", q):
+            q = "yo"
     for phrase in ("tell me what you can do", "what can you do"):
         if phrase in q and q.count(phrase) >= 2:
             return phrase
@@ -28638,15 +29300,16 @@ def _classify_smalltalk_intent(text: str) -> str:
 
     if re.fullmatch(
         r"(?:thanks|thank you|thx|thank u|ok thanks|okay thanks|ok thank you|okay thank you|"
-        r"thanks a lot|thank you very much|much appreciated|appreciate it|thanks okay|thank you okay)",
+        r"thanks a lot|thank you very much|much appreciated|appreciate it|thanks okay|thank you okay|"
+        r"thank+s+|thank\s+you+)",
         q,
     ):
         return "thanks"
-    if re.fullmatch(r"(?:(?:hi|hello|hey)\s+)?(?:how\s+(?:are\s+)?you(?:\s+doing)?|how\s+are\s+u|how\s+r\s+u|how\s+you\s+doing|how\s+are\s+things|how\s+(?:is|s)\s+it\s+going)(?:\s+today)?", q):
+    if re.fullmatch(r"(?:(?:hi|hello|hey|h+i+|he+y+|hello+)\s+)?(?:how\s+(?:are\s+)?you(?:\s+doing)?|how\s+are\s+u|how\s+r\s+u|how\s+you\s+doing|how\s+are\s+things|how\s+(?:is|s)\s+it\s+going)(?:\s+today)?", q):
         return "wellbeing"
-    if re.fullmatch(r"(?:ok|okay|alright|all right|got it|sure|fine)", q):
+    if re.fullmatch(r"(?:ok|okay|alright|all right|got it|sure|fine|ok+k*|okay+)", q):
         return "ack"
-    if re.fullmatch(r"(?:hi|hello|hey|good morning|good afternoon|good evening)(?:\s+there)?", q):
+    if re.fullmatch(r"(?:hi|hello|hey|h+i+|he+y+|hello+|good morning|good afternoon|good evening)(?:\s+there)?", q):
         return "greeting"
     if re.search(r"\b(?:thanks?|thank\s+you|thx|appreciate(?:\s+it)?|appreciated)\b", q):
         if len(q.split()) <= 5 and not _looks_like_document_question(text):
@@ -29029,12 +29692,23 @@ def _should_allow_generic_answer(query: str, docs: list[dict], family_v2: str, a
     generic_type = str(answer_type or "").lower()
     family = str(family_v2 or _classify_query_family_v2(query) or "")
     top_score_early = _max_doc_similarity(docs or [])
-    if _is_support_procedural_query(query) and docs and top_score_early >= -2.0:
-        logger.info(
-            "[ANSWER PERMISSION] allowed=True reason=support_procedural_retrieval top_score=%.3f",
-            top_score_early,
-        )
-        return True
+    if _is_support_procedural_query(query) and docs:
+        # Support/scenario questions ("what happens if I report fraud?") are often
+        # scored low by the cross-encoder even when the handling steps are present
+        # in the retrieved chunks. Allow when either the rerank score clears the
+        # floor OR the retrieved docs share meaningful topic tokens with the query
+        # (so relevant-but-low-scored support evidence is not discarded).
+        sp_metrics = _retrieval_evidence_metrics(query, docs or [])
+        sp_focus = float(sp_metrics.get("focus_ratio", 0.0) or 0.0)
+        sp_coverage = float(sp_metrics.get("coverage", 0.0) or 0.0)
+        if top_score_early >= -2.0 or sp_focus > 0.0 or sp_coverage >= 0.34:
+            logger.info(
+                "[ANSWER PERMISSION] allowed=True reason=support_procedural_retrieval top_score=%.3f focus=%.3f coverage=%.3f",
+                top_score_early,
+                sp_focus,
+                sp_coverage,
+            )
+            return True
     if _is_weak_generic_request(query):
         logger.info("[ANSWER PERMISSION] allowed=False reason=weak_generic_request")
         return False
@@ -29210,7 +29884,7 @@ def _apply_not_found_ux(
             cleaned = _polish_final_response_text(query, cleaned)
         if cleaned != raw:
             logger.info("[OCR CLEANUP APPLIED] before=%s | after=%s", raw[:180], cleaned[:180])
-        return cleaned
+        return _apply_customer_support_tone(query, cleaned, language, doc_dicts or None)
 
     ans = _finalize(ans)
     if ans.lower() != RAG_NO_MATCH_RESPONSE.lower():
@@ -29656,6 +30330,11 @@ def _normalize_compare_entity_term(term: str) -> str:
         "",
         value,
     )
+    value = re.sub(
+        r"\s+as\s+(?:described|mentioned|noted|stated)(?:\s+in\s+the\s+document)?\b.*$",
+        "",
+        value,
+    )
     value = re.sub(r"\s+(?:please|kindly)\s*$", "", value)
     value = re.sub(r"\s+", " ", value).strip(" .?!,;:'\"")
     if value in {"it", "this", "that", "these", "those", "they", "them"}:
@@ -29708,7 +30387,7 @@ def _contains_compare_terms(text: str, term1: str, term2: str) -> bool:
         return False
 
     def _term_ok(term: str) -> bool:
-        toks = [t for t in re.findall(r"[a-z0-9]{3,}", term.lower()) if t not in {"the", "and", "of"}]
+        toks = [t for t in re.findall(r"[a-z0-9]{2,}", term.lower()) if t not in {"the", "and", "of"}]
         if not toks:
             return False
         hits = sum(1 for t in toks if re.search(rf"\b{re.escape(t)}\b", low))
@@ -30848,7 +31527,16 @@ def _enforce_runtime_answer_acceptance(query: str, decision: Dict[str, Any], ret
             return dec
         dec["answer"] = shaped
 
-    if is_definition_mode:
+    if is_definition_mode and not fact_type:
+        # Fact/metric questions phrased as "what is the X fee/limit/coverage/
+        # minimum ..." also match is_definition_mode (they start with "what is"),
+        # but the answer is a number/value that legitimately does NOT echo the
+        # full entity phrase (e.g. "FDIC-insured up to $250,000 per depositor"
+        # for "What is the FDIC coverage limit?"). Those answers are already
+        # validated by the fact guard above, so skip the definition
+        # entity-reference rejection for them (it was the root cause of valid
+        # Meridian fact evidence being rejected as "not found").
+        #
         # MP-C15: definition_structure_recovery answers were already
         # built and grounded against a wider corpus pool by the
         # structure-aware route. Skip re-validation against the narrow
@@ -31944,7 +32632,7 @@ def _shared_rag_final_answer_decision( # type: ignore
                 answer_source_mode = "not_found_guard"
             elif list_shaped and list_shaped != cleaned_ans:
                 cleaned_ans = list_shaped
-        if cleaned_ans is not None and cleaned_ans != RAG_NO_MATCH_RESPONSE and family_v2 != "fact_entity" and str(answer_type or "") != "definition_structure_recovery":
+        if cleaned_ans is not None and cleaned_ans != RAG_NO_MATCH_RESPONSE and family_v2 != "fact_entity" and str(answer_type or "") != "definition_structure_recovery" and not str(answer_type or "").startswith("fact_") and str(answer_type or "") != "definition_table_fact":
             if not _is_definition_answer_valid(str(cleaned_ans)):
                 rescued = False
                 if family_v2 in {"definition_entity", "definition_comparison"}:
@@ -32240,6 +32928,14 @@ def _shared_rag_final_answer_decision( # type: ignore
                     _struct_ans[:220],
                 )
                 return _result(_struct_ans, used_llm=False, answer_type="definition_structure_recovery", items_count=1)
+
+            _table_fact = _extract_table_fact_answer(query, doc_dicts)
+            if _table_fact:
+                logger.info(
+                    "[ANSWER ROUTE] mode=definition deterministic=table_fact answer=%s",
+                    _table_fact[:220],
+                )
+                return _result(_table_fact, used_llm=False, answer_type="definition_table_fact", items_count=1)
 
             logger.info(
                 "[ANSWER ROUTE] mode=definition deterministic=false action=not_found_strict entity=%s preview=%s",
@@ -32618,11 +33314,11 @@ def _shared_rag_final_answer_decision( # type: ignore
         if _is_metric_fact_query(query):
             metric_docs = list(doc_dicts or route_docs or [])
             metric_answer = _extract_metric_fact_answer(query, metric_docs)
-            if metric_answer and "16.12" not in metric_answer and re.search(r"\battrition rate\b", query, flags=re.IGNORECASE):
+            if not metric_answer:
                 metric_answer_retry = _extract_metric_fact_answer(query, list(doc_dicts or [])[:25])
                 if metric_answer_retry:
                     metric_answer = metric_answer_retry
-            if metric_docs and not (metric_answer and "16.12" in metric_answer):
+            if metric_docs and not metric_answer:
                 anchored = _select_fact_anchor_docs(
                     query,
                     metric_docs,
@@ -32746,14 +33442,13 @@ def _shared_rag_final_answer_decision( # type: ignore
         # #region agent log
         try:
             _joined = " ".join(fact_context_chunks).lower()
-            _joined_nospace = re.sub(r"\s+", "", _joined)
             _dbg7d3bbb("assistify_rag_server.py:_shared_rag_final_answer_decision.fact", "fact context built", {
                 "fact_type": fact_type,
                 "n_chunks": len(fact_context_chunks),
                 "llm_text_present": llm_text is not None,
-                "has_16_12": ("16.12" in _joined_nospace),
-                "has_20_63": ("20.63" in _joined_nospace),
-                "has_sales": ("sales" in _joined),
+                "has_currency": bool(_EVIDENCE_VALUE_PATTERNS["currency"].search(_joined)),
+                "has_percent": bool(_EVIDENCE_VALUE_PATTERNS["percent"].search(_joined)),
+                "has_ratio": bool(_EVIDENCE_VALUE_PATTERNS["ratio"].search(_joined)),
                 "chunk_previews": [c[:220] for c in fact_context_chunks[:3]],
             }, "H-D1")
         except Exception:
@@ -34666,6 +35361,34 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
     if not _is_memory_rewrite_query(text) and not _is_marked_arabic_resolved_followup(connection_id, text):
         text = _maybe_rewrite_about_entity_question(text)
 
+    from backend.rag_query_prep import prepare_query_for_rag
+
+    prepared = await prepare_query_for_rag(text)
+    if prepared.direct_response:
+        direct_answer = prepared.direct_response
+        try:
+            _append_conversation_turn(connection_id, prepared.original, direct_answer)
+        except Exception:
+            pass
+        response_time = int((time.time() - start_time) * 1000)
+        try:
+            log_usage(
+                username=(user or {}).get("username", "unknown"),
+                user_role=(user or {}).get("role", "unknown"),
+                query_text=prepared.original,
+                response_status="success",
+                error_message=None,
+                response_time_ms=response_time,
+                rag_docs_found=0,
+                query_length=len(prepared.original),
+                response_length=len(direct_answer or ""),
+            )
+        except Exception:
+            pass
+        return (direct_answer, [])
+    if prepared.rag_query:
+        text = prepared.rag_query
+
     route = classify_query_route(text)
     if route in _ROUTER_DIRECT_ROUTES:
         route_lang = _route_response_language(text)
@@ -34881,8 +35604,6 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
         else:
             top_k_req = 3
         logger.info("[TOPK TRACE] requested=%s actual=%s function=call_llm_with_rag", top_k_req, top_k_req)
-        print("[DEBUG] FINAL QUERY:", text)
-        print("[DEBUG] TOP_K:", top_k_req)
         if is_definition_fast:
             relevant_docs = await _search_fast_definition_minimal_async(text)
         else:
@@ -35156,10 +35877,6 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
                     "metadata": meta,
                     "score": float(meta.get("_score", 0.0) or 0.0),
                 })
-                try:
-                    print(f"[RAG DEBUG] doc[{idx}] len_raw={len(raw_text)} len_final={len(final)}")
-                except Exception:
-                    pass
 
             # Fail-safe: if filtering removed everything (shouldn't happen because top is forced),
             # fall back to returning the original retrieved_docs without filtering.
@@ -35197,26 +35914,10 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
             except Exception:
                 logger.exception("RAG PREPARE: error while logging prepared docs")
 
-            # Additional debug checks for doc_dicts prior to TOON formatting
-            try:
-                for i, d in enumerate(out[:10]):
-                    print(
-                        f"[DOC_DICT CHECK] idx={i} "
-                        f"len={len(d.get('page_content',''))} "
-                        f"page={d.get('metadata', {}).get('page')} "
-                        f"preview={d.get('page_content','')[:120]}"
-                    )
-            except Exception:
-                pass
-
             if out:
                 try:
                     assert out[0].get('page_content'), "doc_dicts[0] lost content before TOON"
                 except AssertionError:
-                    try:
-                        print("[DOC_DICT ASSERT FAIL] out[0]:", out[0])
-                    except Exception:
-                        pass
                     raise
 
             return out
@@ -35592,22 +36293,21 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
                 return (answer, doc_dicts)
 
             generation_system_prompt = (
-                "You are a helpful AI assistant.\n\n"
+                f"{CUSTOMER_SUPPORT_AGENT_SYSTEM_PROMPT}\n\n"
                 "Use ONLY the provided context.\n\n"
-                "Your task:\n\n"
-                "* explain clearly\n"
+                "Your task:\n"
+                "* explain clearly in a friendly support tone\n"
                 "* summarize key ideas\n"
                 "* compare concepts when asked\n\n"
-                "Guidelines:\n\n"
+                "Guidelines:\n"
                 "* Use full sentences\n"
                 "* Be clear and structured\n"
                 "* Use bullet points for comparisons\n"
                 "* Summaries should be 2–5 sentences\n\n"
-                "IMPORTANT:\n\n"
-                "* Do NOT invent information\n"
-                "* Do NOT use outside knowledge\n"
-                "* If the answer cannot be derived from context, say:\n"
-                "  Not found in the document."
+                "IMPORTANT:\n"
+                "* Do NOT invent information or use outside knowledge\n"
+                "* If the answer cannot be derived from context, say warmly that the detail "
+                "is not in the uploaded help materials\n"
             )
             generation_query = _rewrite_generation_query_for_grounded_llm(generation_source_query)
             llm_t0_generation = time.perf_counter()
@@ -35682,12 +36382,13 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
         # Fast and simple early selector: avoid heavy downstream processing.
         if _is_metric_fact_query(text) and doc_dicts and not _skip_deterministic_rag_shortcuts(text, doc_router_mode):
             metric_pool = list(doc_dicts or [])
-            if re.search(r"\battrition rate\b", text, flags=re.IGNORECASE):
-                kpi_rescue = await _search_fast_minimal_async("16.12% attrition rate IBM HR KPI summary", top_k=8) or []
+            rescue_q = " ".join(_evidence_concept_tokens(text)[:6]).strip()
+            if rescue_q:
+                kpi_rescue = await _search_fast_minimal_async(rescue_q, top_k=8) or []
                 if kpi_rescue:
                     metric_pool = _merge_rescue_docs_and_rerank(text, metric_pool, kpi_rescue, top_k=12)
             metric_answer = _extract_metric_fact_answer(text, metric_pool)
-            if metric_answer and "16.12" not in metric_answer and re.search(r"\battrition rate\b", text, flags=re.IGNORECASE):
+            if not metric_answer and metric_pool:
                 anchored = _select_fact_anchor_docs(
                     text,
                     metric_pool,
@@ -36298,12 +36999,12 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
             doc_router_context_rules = (
                 "\nDOC ROUTER MODE: MULTI_SOURCE_SYNTHESIS\n"
                 "- Use only the selected active source documents in the context.\n"
-                "- Explicitly cite both corpora using phrases like 'IBM HR CRISP-DM report' and 'Psychology textbook/chapter'.\n"
-                "- Label sections by source (e.g., 'From the IBM HR report...' / 'From the Psychology chapter...').\n"
+                "- Cite each source by the document name/title exactly as it appears in the context.\n"
+                "- Label sections by their source document (e.g., 'From <document name>: ...').\n"
                 "- Combine facts only when each fact is directly supported by the context.\n"
-                "- For comparison or bridge questions, connect business metrics to psychological concepts only when both are in context.\n"
-                "- When the query names a model or framework (e.g., General Adaptation Syndrome/GAS, cognitive dissonance, operant conditioning), name and apply it explicitly.\n"
-                "- Do not invent unstated contrasts, formulas, diagnostic codes, or historical links.\n"
+                "- For comparison or bridge questions, connect concepts across sources only when both are present in the context.\n"
+                "- When the query names a model, framework or concept, name and apply it explicitly if it appears in the context.\n"
+                "- Do not invent unstated contrasts, formulas, codes, figures, or historical links.\n"
                 "- If a requested detail is missing from context, say clearly that it is not in the uploaded materials.\n"
             )
         format_rules = ""
@@ -36311,21 +37012,21 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
             format_rules = (
                 "\nFORMAT: EXECUTIVE MEMO\n"
                 "- Write a professional memo with TO/FROM/DATE/SUBJECT headers.\n"
-                "- Translate data-driven findings into actionable psychological interventions.\n"
+                "- Translate the findings in the context into clear, actionable recommendations.\n"
             )
         elif http_format_intent == "quiz_generation":
             format_rules = (
                 "\nFORMAT: QUIZ GENERATION\n"
                 "- Create exactly 5 numbered multiple-choice questions.\n"
                 "- Each question MUST include four labeled options: A) B) C) D)\n"
-                "- Questions 1-3 from Memory chapter context; questions 4-5 from IBM HR attrition deployment/KPI context.\n"
+                "- Base every question only on facts present in the provided context.\n"
                 "- End with a section titled 'Answer Key' listing the correct letter for each question.\n"
             )
         elif http_format_intent == "extreme_summary":
             format_rules = (
                 "\nFORMAT: EXTREME SUMMARY\n"
                 "- Respond with exactly 5 bullet points, each on its own line starting with '- '.\n"
-                "- Mention both psychology and HR/IBM attrition concepts.\n"
+                "- Cover the main points present in the context.\n"
             )
         context_block = f"""
 ===== KNOWLEDGE BASE CONTEXT =====
@@ -36361,12 +37062,10 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
             )
         else:
             system_prompt = (
-                "أنت Assistify، مساعد خدمات أمازون. "
+                "أنت Assistify، مساعد دعم عملاء ودود لهذا العمل. "
                 "القواعد الصارمة:\n"
                 "1. أجب بالعربية فقط — يُمنع منعاً باتاً استخدام أي كلمة بالإنجليزية أو الصينية أو أي لغة غير العربية.\n"
-                "2. احتفظ بأسماء الخدمات والمنتجات كما هي بالإنجليزية: Amazon, Prime, "
-                "'Prime badge', FBA, FBM, Kindle, Alexa — لا تترجمها أبداً. "
-                "مثلاً: 'شارة Prime' وليس 'التوتر الأزرق'.\n"
+                "2. احتفظ بأسماء العلامات التجارية والمنتجات التقنية كما هي بالإنجليزية عند الحاجة.\n"
                 "3. لا تبدأ إجابتك بـ 'حسناً' أو 'حسنا' أو 'بالتأكيد'. ابدأ بالإجابة مباشرة.\n"
                 "4. أجب في جملة واحدة أو جملتين فقط (أقل من 35 كلمة). "
                 "يُحظر تمامًا استخدام القوائم المرقّمة أو النقطية أو أي ترقيم (1. 2. 3. \u2022 -). "
@@ -36390,17 +37089,8 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
                 format_extra_rules += "\nOUTPUT FORMAT: Return ONLY list items, no intro sentence."
             if "one sentence" in user_text_l:
                 format_extra_rules += "\nOUTPUT FORMAT: Return exactly one sentence."
-            # Relaxed system prompt that encourages list reconstruction and OCR tolerance
-            system_prompt = (
-                "You MUST answer ONLY using the provided KNOWLEDGE BASE CONTEXT. NEVER use outside knowledge. Response must be in English.\n"
-                "When the user asks for structured list output (including figure/table-adjacent content):\n"
-                "- Extract list items even if the text contains minor OCR noise or formatting issues.\n"
-                "- Reconstruct lists from captions, semi-structured paragraphs, figures, or tables when necessary.\n"
-                "- Clean items into readable form (remove obvious OCR artifacts) but do NOT invent facts.\n"
-                "- If evidence is weak, mixed, or missing for the asked items, return exactly 'Not found in the document.'.\n"
-                "- Avoid obvious garbage; omit incoherent items.\n"
-                f"{context_block}{format_extra_rules}"
-            )
+            # Friendly customer-support persona with strict grounding
+            system_prompt = build_english_support_system_prompt(format_extra_rules) + f"\n{context_block}"
     effective_temperature = 0.0 if is_fact_llm_query else (0.1 if is_simple_factual_query else (0.2 if relevant_docs else 0.6))
     if http_format_intent == "executive_memo":
         _http_num_ctx, _http_num_predict = 6144, 900
@@ -38300,8 +38990,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 logger.info(f"Translation (Arabic→English): '{text[:60]}' → '{text_for_rag[:60]}'")
 
                 rag_docs_check = None
-                print("[DEBUG] FINAL QUERY:", text_for_rag)
-                print("[DEBUG] TOP_K:", 10)
                 t_ar_retrieval_start = time.perf_counter()
                 t_meta["retrieval_after_translation_start"] = t_ar_retrieval_start
                 rag_docs_check = _search_with_query_expansion(
@@ -38404,8 +39092,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
             top_k_req = 10
         else:
             top_k_req = 6
-        print("[DEBUG] FINAL QUERY:", text)
-        print("[DEBUG] TOP_K:", top_k_req)
         if family_v2 != "fact_entity" and _is_safe_definition_fast_path_query(text):
             relevant_docs = await _search_fast_definition_minimal_async(text)
         else:
@@ -38952,14 +39638,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
             logger.exception("RAG FINAL SELECTED logging failed (ws)")
         _log_selected_doc_markers(doc_dicts)
         
-        # Hard debug prints
-        print("[PRE-TOON ACTIVE PATH] relevant_docs len:", len(relevant_docs) if relevant_docs else 0)
-        print("[PRE-TOON ACTIVE PATH] doc_dicts len:", len(doc_dicts) if doc_dicts else 0)
-        if doc_dicts:
-            print("[PRE-TOON ACTIVE PATH] doc[0] page:", doc_dicts[0].get("metadata", {}).get("page"))
-            print("[PRE-TOON ACTIVE PATH] doc[0] len:", len(doc_dicts[0].get("page_content", "")))
-            print("[PRE-TOON ACTIVE PATH] doc[0] preview:", doc_dicts[0].get("page_content", "")[:200])
-
         # Guard against empty/malformed retrieval output in streaming mode.
         docs_valid = bool(
             isinstance(doc_dicts, list)
@@ -39303,29 +39981,27 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
             if _doc_router_cross_corpus_bridge(generation_source_query):
                 bridge_rules = (
                     "\nBRIDGE SYNTHESIS:\n"
-                    "- Cite the IBM HR CRISP-DM report for business metrics/features.\n"
-                    "- Cite the Psychology textbook/chapter for psychological definitions and theories.\n"
-                    "- Name requested frameworks explicitly (e.g., GAS, operant conditioning, cognitive dissonance).\n"
-                    "- Synthesize across both sources when the question spans HR and psychology.\n"
+                    "- Cite each source by the document name/title exactly as it appears in the context.\n"
+                    "- Name requested models, frameworks or concepts explicitly when they appear in the context.\n"
+                    "- Synthesize across sources only when each fact is supported by the provided context.\n"
                 )
             generation_system_prompt = (
-                "You are a helpful AI assistant.\n\n"
+                f"{CUSTOMER_SUPPORT_AGENT_SYSTEM_PROMPT}\n\n"
                 "Use ONLY the provided context.\n\n"
-                "Your task:\n\n"
-                "* explain clearly\n"
+                "Your task:\n"
+                "* explain clearly in a friendly support tone\n"
                 "* summarize key ideas\n"
                 "* compare concepts when asked\n\n"
-                "Guidelines:\n\n"
+                "Guidelines:\n"
                 "* Use full sentences\n"
                 "* Be clear and structured\n"
                 "* Use bullet points for comparisons\n"
                 "* Summaries should be 2–5 sentences\n"
                 f"{bridge_rules}\n"
-                "IMPORTANT:\n\n"
-                "* Do NOT invent information\n"
-                "* Do NOT use outside knowledge\n"
-                "* If the answer cannot be derived from context, say:\n"
-                "  Not found in the document."
+                "IMPORTANT:\n"
+                "* Do NOT invent information or use outside knowledge\n"
+                "* If the answer cannot be derived from context, say warmly that the detail "
+                "is not in the uploaded help materials\n"
             )
             generation_query = _rewrite_generation_query_for_grounded_llm(generation_source_query)
             generation_answer = await call_llm_with_context(
@@ -39454,12 +40130,13 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
         # Fast/simple early selector for definition/list/overview queries.
         if _is_metric_fact_query(text) and doc_dicts and not _skip_deterministic_rag_shortcuts(text, doc_router_mode):
             metric_pool = list(doc_dicts or [])
-            if re.search(r"\battrition rate\b", text, flags=re.IGNORECASE):
-                kpi_rescue = await _search_fast_minimal_async("16.12% attrition rate IBM HR KPI summary", top_k=8) or []
+            rescue_q = " ".join(_evidence_concept_tokens(text)[:6]).strip()
+            if rescue_q:
+                kpi_rescue = await _search_fast_minimal_async(rescue_q, top_k=8) or []
                 if kpi_rescue:
                     metric_pool = _merge_rescue_docs_and_rerank(text, metric_pool, kpi_rescue, top_k=12)
             metric_answer = _extract_metric_fact_answer(text, metric_pool)
-            if metric_answer and "16.12" not in metric_answer and re.search(r"\battrition rate\b", text, flags=re.IGNORECASE):
+            if not metric_answer and metric_pool:
                 anchored = _select_fact_anchor_docs(
                     text,
                     metric_pool,
@@ -39540,7 +40217,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
 
         # Safe relevant_docs check
         if not relevant_docs or not isinstance(relevant_docs, list):
-            print("[MERGE DEBUG] relevant_docs invalid or empty; skipping merge")
             relevant_docs_safe = []
         else:
             relevant_docs_safe = relevant_docs
@@ -39559,10 +40235,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
             top_concept_hits = 0
 
         skip_merge = top_exact or top_concept_hits >= 3
-        print("[MERGE DEBUG] skip_merge:", skip_merge)
-        print("[MERGE DEBUG] top page:", top_meta.get("page"))
-        print("[MERGE DEBUG] top exact:", top_exact)
-        print("[MERGE DEBUG] top concept_hits:", top_concept_hits)
 
         if is_list_query and len(doc_dicts) > 1 and not skip_merge and relevant_docs_safe:
             # Only consider top few candidates
@@ -39685,12 +40357,9 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     else:
                         doc_dicts = [merged_doc] + new_doc_list
                     merged_created = True
-                    print("[MERGE DEBUG] merged page:", page)
-                    print("[MERGE DEBUG] merged chunk_indexes:", merged_indexes)
                     break
         else:
-            if is_list_query:
-                print("[MERGE DEBUG] merge skipped; keeping ranked doc[0]")
+            pass
 
         # Generic list-style adjacent-chunk merging and focused span selection
         is_list_query = _is_targeted_list_question(text)
@@ -39728,15 +40397,13 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                         best_start = start
 
                 return str(txt[best_start: min(txt_len, best_start + window)])
-            except Exception as e:
-                print("[GENERIC FOCUS ERROR]", str(e))
+            except Exception:
                 try:
                     return str(txt)[:1200]
                 except Exception:
                     return ""
 
         if is_list_query and doc_dicts:
-            print("[GENERIC MERGE] is_list_query:", is_list_query)
             # Preserve the top-ranked chunk prior to any merge modifications
             top_doc = doc_dicts[0]
             top_rank_idx = 0
@@ -39747,7 +40414,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 top_ci = 0
             top_source = top_meta_doc.get("source")
             top_page = top_meta_doc.get("page")
-            print("[MERGE FIX] top source/page/chunk:", top_source, top_page, top_ci)
             top_n = min(3, len(doc_dicts))
             top_candidates = doc_dicts[:top_n]
 
@@ -39843,8 +40509,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     and best_cluster.get("page") == top_page
                     and top_ci in best_cluster.get("merged_indexes", [])
                 )
-                print("[MERGE FIX] cluster_contains_top:", cluster_contains_top)
-
                 # Ensure top-1 is NEVER replaced when cluster_contains_top is False
                 replace_top = False
                 try:
@@ -39947,16 +40611,15 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     # Safety cap
                     expanded = expanded[:4000]
                     doc_dicts[0]["page_content"] = expanded
-                    print("[CONTEXT EXPAND] list query context length:", len(expanded))
-                except Exception as e:
-                    print("[CONTEXT EXPAND ERROR]", str(e))
+                except Exception:
+                    pass
 
                 # --- GENERIC STRUCTURE FOCUS ---
                 try:
                     section_detected = None
                     doc_dicts[0]["page_content"] = _focus_doc_to_query_window(text, doc_dicts[0].get("page_content", ""), window=1800)
-                except Exception as e:
-                    print("[STRUCTURE FOCUS ERROR]", str(e))
+                except Exception:
+                    pass
 
                 # Ensure list completeness: if the extracted block looks like a list, extend until next heading or no more list lines
                 try:
@@ -39990,8 +40653,8 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                                         break
                                     cont.append(L)
                             doc_dicts[0]["page_content"] = "\n".join(lines[:first_idx] + cont)
-                except Exception as e:
-                    print("[LIST_COMPLETENESS_ERROR]", str(e))
+                except Exception:
+                    pass
 
                 # Final focus: ensure generous window for list queries (2000 chars)
                 try:
@@ -40013,12 +40676,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                     )
                 except Exception:
                     pass
-
-                print("[GENERIC MERGE] is_list_query:", is_list_query)
-                print("[GENERIC MERGE] selected page:", selected_page)
-                print("[GENERIC MERGE] selected indexes:", selected_indexes)
-                print("[GENERIC MERGE] focused len:", len(doc_dicts[0].get("page_content", "")))
-                print("[GENERIC MERGE] focused preview:", doc_dicts[0].get("page_content", "")[:350])
 
         # Focus each retrieved doc to a query-centered window to improve relevance
         t_meta["context_focus_start"] = time.perf_counter()
@@ -40044,13 +40701,6 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
                 doc_dicts[0]["page_content"] = str(doc_dicts[0])
             except Exception:
                 doc_dicts[0]["page_content"] = ""
-
-        if doc_dicts:
-            print("[FOCUS WINDOW] doc[0] len:", len(doc_dicts[0].get("page_content", "")))
-            print("[FOCUS WINDOW] doc[0] preview:", doc_dicts[0].get("page_content", "")[:300])
-
-        print("[FINAL SAFE] doc_dicts len:", len(doc_dicts))
-        print("[FINAL SAFE] doc[0] len:", len(doc_dicts[0].get("page_content", "")) if doc_dicts else 0)
 
         # Structured log: record top retrieved vs final selected page and whether top-1 was replaced
         try:
@@ -40100,12 +40750,12 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
             doc_router_context_rules = (
                 "\nDOC ROUTER MODE: MULTI_SOURCE_SYNTHESIS\n"
                 "- Use only the selected active source documents in the context.\n"
-                "- Explicitly cite both corpora using phrases like 'IBM HR CRISP-DM report' and 'Psychology textbook/chapter'.\n"
-                "- Label sections by source (e.g., 'From the IBM HR report...' / 'From the Psychology chapter...').\n"
+                "- Cite each source by the document name/title exactly as it appears in the context.\n"
+                "- Label sections by their source document (e.g., 'From <document name>: ...').\n"
                 "- Combine facts only when each fact is directly supported by the context.\n"
-                "- For comparison or bridge questions, connect business metrics to psychological concepts only when both are in context.\n"
-                "- When the query names a model or framework (e.g., General Adaptation Syndrome/GAS, cognitive dissonance, operant conditioning), name and apply it explicitly.\n"
-                "- Do not invent unstated contrasts, formulas, diagnostic codes, or historical links.\n"
+                "- For comparison or bridge questions, connect concepts across sources only when both are present in the context.\n"
+                "- When the query names a model, framework or concept, name and apply it explicitly if it appears in the context.\n"
+                "- Do not invent unstated contrasts, formulas, codes, figures, or historical links.\n"
                 "- If a requested detail is missing from context, say clearly that it is not in the uploaded materials.\n"
             )
         elif doc_router_mode == "single_source":
@@ -40117,15 +40767,15 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
             format_rules = (
                 "\nFORMAT: EXECUTIVE MEMO\n"
                 "- Write a professional memo with TO/FROM/DATE/SUBJECT headers.\n"
-                "- Translate data-driven findings into actionable psychological interventions.\n"
-                "- Cite theories only when supported by the provided context.\n"
+                "- Translate the findings in the context into clear, actionable recommendations.\n"
+                "- Cite frameworks or theories only when supported by the provided context.\n"
             )
         elif format_intent == "quiz_generation":
             format_rules = (
                 "\nFORMAT: QUIZ GENERATION\n"
                 "- Create exactly 5 numbered multiple-choice questions.\n"
                 "- Each question MUST include four labeled options: A) B) C) D)\n"
-                "- Questions 1-3 from Memory chapter context; questions 4-5 from IBM HR attrition deployment/KPI context.\n"
+                "- Base every question only on facts present in the provided context.\n"
                 "- End with a section titled 'Answer Key' listing the correct letter for each question.\n"
                 "- Do not invent facts not present in the context.\n"
             )
@@ -40133,58 +40783,14 @@ async def call_llm_streaming(websocket: WebSocket, text: str, connection_id: str
             format_rules = (
                 "\nFORMAT: EXTREME SUMMARY\n"
                 "- Respond with exactly 5 bullet points, each on its own line starting with '- '.\n"
-                "- Mention both psychology and HR/IBM attrition concepts.\n"
+                "- Cover the main points present in the context.\n"
             )
             
-        context_block = f"""
-===== KNOWLEDGE BASE CONTEXT =====
-{toon_context}
-==================================
-
-CORE RULES:
-1. You are Assistify, a helpful assistant.
-2. You MUST answer ONLY using the provided KNOWLEDGE BASE CONTEXT.
-3. If the answer is NOT found in the context: say clearly and warmly that the detail is not in the uploaded materials. Do NOT invent formulas, coefficient weights, DSM diagnostic codes, or historical connections.
-4. NEVER use outside knowledge.
-5. NEVER guess or fabricate statistics, quotes, or codes.
-6. Keep answers clear and direct.
-{doc_router_context_rules}
-{format_rules}
-
-LIST HANDLING (VERY IMPORTANT):
-If the question expects a structured list response:
-LIST HANDLING (VERY IMPORTANT):
-If the question expects a structured list response:
-- Extract the most relevant list items EVEN IF the text is slightly noisy or contains OCR artifacts.
-- Clean the items into readable form when possible (fix small OCR mistakes, join broken words).
-- Ignore headings like "Figure", "Table", or obvious labels; focus on meaningful list elements.
-- Return them as a clean list, one item per line.
-- Avoid unnecessary summarization or explanation unless the user explicitly asks for it.
-Example format:
-Item 1
-Item 2
-Item 3
-
-If the answer appears embedded in a semi-structured paragraph or mixed text:
-- You MUST extract and reconstruct the list from that paragraph.
-- If supporting evidence is insufficient or ambiguous after extraction, respond exactly "Not found in the document.".
-
-DEFINITION / PERSON QUESTIONS:
-For "what is" or "who is":
-- Return 1–2 short sentences ONLY.
-
-STRICT BEHAVIOR:
-- DO NOT combine items.
-- DO NOT return partial words.
-- DO NOT cut items.
-- If the question is a greeting, answer naturally.
-STRICT BEHAVIOR:
-- DO NOT combine items.
-- DO NOT return partial words.
-- Avoid obvious noise, but tolerate minor OCR imperfections if the meaning is clear.
-- DO NOT cut items.
-- If the question is a greeting, answer naturally.
-"""
+        context_block = build_english_stream_context_block(
+            toon_context,
+            doc_router_context_rules=doc_router_context_rules,
+            format_rules=format_rules,
+        )
         logger.info(f"{connection_id} RAG: {len(relevant_docs)} docs injected as authoritative context")
         # (Deterministic extraction removed to favor pure RAG pipeline and strict system prompt rules)
 
@@ -40447,12 +41053,10 @@ STRICT BEHAVIOR:
             )
         else:
             system_prompt = (
-                "أنت Assistify، مساعد خدمات أمازون. "
+                "أنت Assistify، مساعد دعم عملاء ودود لهذا العمل. "
                 "القواعد الصارمة:\n"
                 "1. أجب بالعربية فقط — يُمنع منعاً باتاً استخدام أي كلمة بالإنجليزية أو الصينية أو أي لغة غير العربية.\n"
-                "2. احتفظ بأسماء الخدمات والمنتجات كما هي بالإنجليزية: Amazon, Prime, "
-                "'Prime badge', FBA, FBM, Kindle, Alexa — لا تترجمها أبداً. "
-                "مثلاً: 'شارة Prime' وليس 'التوتر الأزرق'.\n"
+                "2. احتفظ بأسماء العلامات التجارية والمنتجات التقنية كما هي بالإنجليزية عند الحاجة.\n"
                 "3. لا تبدأ إجابتك بـ 'حسناً' أو 'حسنا' أو 'بالتأكيد'. ابدأ بالإجابة مباشرة.\n"
                 "4. أجب في جملة واحدة أو جملتين فقط (أقل من 35 كلمة). "
                 "يُحظر تمامًا استخدام القوائم المرقّمة أو النقطية أو أي ترقيم (1. 2. 3. \u2022 -). "
@@ -40482,16 +41086,7 @@ STRICT BEHAVIOR:
                     "name departments when asked which department has the highest/lowest value."
                 )
             # Active runtime prompt: include relaxed list extraction / OCR tolerance rules
-            system_prompt = (
-                "You MUST answer ONLY using the provided KNOWLEDGE BASE CONTEXT. NEVER use outside knowledge. Response must be in English.\n"
-                "When the user asks for structured list output (including figure/table-adjacent content):\n"
-                "- Extract and reconstruct list items from noisy OCR, captions, semi-structured paragraphs, or figure/table-adjacent text.\n"
-                "- Clean obvious OCR artifacts (broken words, stray punctuation) but DO NOT invent facts.\n"
-                "- Return a structured list only when items are clearly grounded in context; otherwise return 'Not found in the document.'.\n"
-                "- Ignore headings like 'Figure' or 'Table' if they are merely labels; focus on substantive list elements.\n"
-                "- Be tolerant of minor OCR imperfections when meaning is clear.\n"
-                f"{context_block}{format_extra_rules}"
-            )
+            system_prompt = build_english_support_system_prompt(format_extra_rules) + f"\n{context_block}"
     # Pick a varied opener phrase for this query (round-robin across the pool)
     prefinal_tts_enabled_for_query = False
     global _arabic_opener_counter
@@ -40515,13 +41110,6 @@ STRICT BEHAVIOR:
     user_message = original_arabic_text.strip() if arabic_mode else text.strip()
     messages.append({"role": "user", "content": user_message})
     
-    # DEBUG: Print the exact final payload sent to Ollama
-    if relevant_docs:
-        print("\n" + "="*50 + " DEBUG RAG PROMPT " + "="*50)
-        print("SYSTEM:", system_prompt)
-        print("USER:", user_message)
-        print("="*120 + "\n")
-        
     # Arabic assistant prefill — steers qwen2.5 (a Chinese-first model) to begin
     # its response in Arabic rather than defaulting to Chinese when the KB context
     # is in English.  Ollama supports the 'assistant' partial-response pattern.
@@ -40708,7 +41296,7 @@ STRICT BEHAVIOR:
           • Hard-max to prevent runaway accumulation.
         """
         nonlocal full_response, sentence_index, first_token_time, first_sentence_time, vram_llm_active
-        nonlocal adaptive_words
+        nonlocal adaptive_words, suppress_sentinel_stream, final_replace_chunk
         word_buffer: list[str] = []
         first_chunk_sent = False
         first_token_wall: float | None = None    # wall-clock of first LLM token
@@ -40807,6 +41395,51 @@ STRICT BEHAVIOR:
             if streaming_tts_enabled_for_query and (not stream_guard_list_mode):
                 await sentence_queue.put(_normalize_digits_for_tts(chunk_text))
             first_chunk_sent = True
+
+        async def _run_non_stream_fallback(*, reset_partial: bool, reason: str) -> bool:
+            """Re-run Ollama without streaming when the producer exits early."""
+            nonlocal full_response
+            if reset_partial:
+                full_response = ""
+            try:
+                fb_payload = dict(payload)
+                fb_payload["stream"] = False
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=LLM_FALLBACK_TOTAL_TIMEOUT_S)
+                ) as fallback_sess:
+                    logger.info(
+                        "[OLLAMA CALL] endpoint=%s model=%s query_type=%s",
+                        OLLAMA_API_URL,
+                        OLLAMA_MODEL,
+                        reason,
+                    )
+                    async with fallback_sess.post(OLLAMA_API_URL, json=fb_payload) as fallback_resp:
+                        logger.info(
+                            "[OLLAMA CALL RESULT] status=%s endpoint=%s",
+                            fallback_resp.status,
+                            OLLAMA_API_URL,
+                        )
+                        if fallback_resp.status != 200:
+                            raise ValueError(f"Fallback API returned {fallback_resp.status}")
+                        data = await fallback_resp.json()
+                        fallback_text = (data.get("message", {}).get("content", "") or "").strip()
+                        if reset_partial:
+                            full_response = fallback_text
+                        else:
+                            full_response += fallback_text
+                        if streaming_tts_enabled_for_query and full_response:
+                            await sentence_queue.put(_normalize_digits_for_tts(full_response))
+                        return bool(full_response.strip())
+            except Exception as fb_err:
+                mem_fb = _get_memory_snapshot()
+                logger.exception(
+                    "%s Fallback LLM failed: %s | GPU=%.0fMB CPU=%.0fMB",
+                    connection_id,
+                    fb_err,
+                    mem_fb["gpu_reserved_mb"],
+                    mem_fb["cpu_rss_mb"],
+                )
+            return False
 
         try:
             timeout = aiohttp.ClientTimeout(total=600, connect=10, sock_read=300)
@@ -40992,27 +41625,31 @@ STRICT BEHAVIOR:
             mem = _get_memory_snapshot()
             if str(e) == "TIMEOUT_FIRST_TOKEN":
                 logger.warning(f"{connection_id} LLM streaming timeout waiting for first token, falling back to non-stream mode...")
-                try:
-                    payload["stream"] = False
-                    # Non-stream timeout
-                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=LLM_FALLBACK_TOTAL_TIMEOUT_S)) as fallback_sess:
-                        logger.info("[OLLAMA CALL] endpoint=%s model=%s query_type=stream_timeout_fallback", OLLAMA_API_URL, OLLAMA_MODEL)
-                        async with fallback_sess.post(OLLAMA_API_URL, json=payload) as fallback_resp:
-                            logger.info("[OLLAMA CALL RESULT] status=%s endpoint=%s", fallback_resp.status, OLLAMA_API_URL)
-                            if fallback_resp.status == 200:
-                                data = await fallback_resp.json()
-                                fallback_text = data.get("message", {}).get("content", "")
-                                full_response += fallback_text
-                                if streaming_tts_enabled_for_query:
-                                    await sentence_queue.put(_normalize_digits_for_tts(full_response))
-                            else:
-                                raise ValueError(f"Fallback API returned {fallback_resp.status}")
-                except Exception as fb_err:
-                    logger.exception(f"{connection_id} Fallback LLM failed: {fb_err} | GPU={mem['gpu_reserved_mb']:.0f}MB CPU={mem['cpu_rss_mb']:.0f}MB")
-                    if not full_response: full_response = "Sorry, I am having trouble processing your query."
+                if not await _run_non_stream_fallback(reset_partial=False, reason="stream_timeout_fallback"):
+                    if not full_response:
+                        full_response = "Sorry, I am having trouble processing your query."
             else:
                 logger.exception(f"LLM producer error: {e} | GPU={mem['gpu_reserved_mb']:.0f}MB CPU={mem['cpu_rss_mb']:.0f}MB")
-                if not full_response: full_response = "Sorry, I encountered an issue."
+                _partial = full_response.strip()
+                _needs_fallback = (
+                    not _partial
+                    or (sentence_index == 0 and len(_partial) < 40)
+                )
+                if _needs_fallback:
+                    logger.warning(
+                        "%s LLM producer incomplete response (chars=%s chunks=%s); non-stream fallback",
+                        connection_id,
+                        len(_partial),
+                        sentence_index,
+                    )
+                    if not await _run_non_stream_fallback(reset_partial=True, reason="producer_error_fallback"):
+                        full_response = (
+                            _partial
+                            if _partial and sentence_index > 0
+                            else "Sorry, I had trouble generating a full answer. Please try again."
+                        )
+                elif not _partial:
+                    full_response = "Sorry, I encountered an issue."
         finally:
             # Signal TTS consumer to stop
             await sentence_queue.put(None)
@@ -41394,8 +42031,8 @@ STRICT BEHAVIOR:
             full_response = replacement_answer
             final_replace_chunk = True
 
-        # Validate the full response (skip for Arabic — validator is not Arabic-aware)
-        if full_response.strip() and not arabic_mode:
+        # Validate the full response (English and Arabic)
+        if full_response.strip():
             validation_result = validate_response(full_response.strip(), text, relevant_docs)
             if not validation_result.is_valid:
                 logger.warning(f"Streaming response validation FAILED - Severity: {validation_result.severity}")
@@ -41630,6 +42267,16 @@ STRICT BEHAVIOR:
 class ConversationMessageRequest(BaseModel):
     role: str
     text: str
+    tenant_id: Optional[int] = None
+
+
+class ConversationCreateRequest(BaseModel):
+    active_tenant_id: Optional[int] = None
+    title: Optional[str] = None
+
+
+class ConversationActiveTenantRequest(BaseModel):
+    active_tenant_id: int
 
 
 class ConversationRenameRequest(BaseModel):
@@ -41639,46 +42286,83 @@ class ConversationRenameRequest(BaseModel):
 class QueryRequest(BaseModel):
     text: str
     conversation_id: Optional[str] = None
+    tenant_id: Optional[int] = None
 
 
 @app.get("/conversations")
-async def get_conversations(user=Depends(require_login())):
-    tenant_id = require_request_tenant(user)
-    owner = _coerce_owner(user)
-    return {"conversations": list_conversations_summary(tenant_id=tenant_id, owner=owner)}
+async def get_conversations(principal=Depends(require_chat_access())):
+    owner = principal["owner"]
+    return {"conversations": list_conversations_summary(owner=owner)}
 
 
 @app.get("/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str, user=Depends(require_login())):
-    tenant_id = require_request_tenant(user)
-    owner = _coerce_owner(user)
-    data = _load_conversation_store()
-    conversation = _find_conversation(data, conversation_id)
-    if conversation is not None and _try_claim_ownerless_conversation(conversation, tenant_id, owner):
-        _save_conversation_store(data)
-    if conversation is None or not _conversation_in_scope(conversation, tenant_id, owner):
+async def get_conversation(conversation_id: str, principal=Depends(require_chat_access())):
+    owner = principal["owner"]
+    conversation = _chat_store.get_conversation(conversation_id, owner)
+    if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
     logger.info("[CONV] loaded id=%s", conversation_id)
     return conversation
 
 
 @app.post("/conversations")
-async def post_conversation(user=Depends(require_login())):
-    tenant_id = require_request_tenant(user)
-    owner = _coerce_owner(user)
-    return create_conversation(tenant_id=tenant_id, owner=owner)
+async def post_conversation(
+    data: ConversationCreateRequest = Body(default_factory=ConversationCreateRequest),
+    principal=Depends(require_chat_access()),
+):
+    owner = principal["owner"]
+    user = principal.get("user")
+    body = data or ConversationCreateRequest()
+    tid = body.active_tenant_id if body.active_tenant_id is not None else DEFAULT_TENANT_ID
+    assert_chat_tenant_allowed(user, tid)
+    return create_conversation(
+        title=body.title,
+        owner=owner,
+        active_tenant_id=tid,
+    )
+
+
+@app.patch("/conversations/{conversation_id}/active-tenant")
+async def patch_conversation_active_tenant(
+    conversation_id: str,
+    data: ConversationActiveTenantRequest,
+    principal=Depends(require_chat_access()),
+):
+    owner = principal["owner"]
+    conv = _chat_store.get_conversation(conversation_id, owner)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    from_tid = conv.get("active_tenant_id")
+    try:
+        updated = set_conversation_active_tenant(
+            conversation_id,
+            data.active_tenant_id,
+            owner=owner,
+            from_tenant_id=from_tid,
+            emit_system_message=True,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from exc
+    new_tid = int(updated.get("active_tenant_id") or data.active_tenant_id)
+    return {
+        "conversation_id": conversation_id,
+        "active_tenant_id": new_tid,
+        "from_tenant_id": from_tid,
+        "to_tenant_id": new_tid,
+        "from_name": get_tenant_name(int(from_tid)) if from_tid is not None else None,
+        "to_name": get_tenant_name(new_tid),
+    }
 
 
 @app.patch("/conversations/{conversation_id}")
 async def patch_conversation(
     conversation_id: str,
     data: ConversationRenameRequest,
-    user=Depends(require_login()),
+    principal=Depends(require_chat_access()),
 ):
-    tenant_id = require_request_tenant(user)
-    owner = _coerce_owner(user)
+    owner = principal["owner"]
     try:
-        return rename_conversation(conversation_id, data.title, tenant_id=tenant_id, owner=owner)
+        return rename_conversation(conversation_id, data.title, owner=owner)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KeyError as exc:
@@ -41686,19 +42370,17 @@ async def patch_conversation(
 
 
 @app.delete("/conversations")
-async def delete_all_conversations_endpoint(user=Depends(require_login())):
-    tenant_id = require_request_tenant(user)
-    owner = _coerce_owner(user)
-    deleted_count = delete_all_conversations(tenant_id=tenant_id, owner=owner)
+async def delete_all_conversations_endpoint(principal=Depends(require_chat_access())):
+    owner = principal["owner"]
+    deleted_count = delete_all_conversations(owner=owner)
     return {"success": True, "deleted_count": deleted_count}
 
 
 @app.delete("/conversations/{conversation_id}")
-async def delete_conversation_endpoint(conversation_id: str, user=Depends(require_login())):
-    tenant_id = require_request_tenant(user)
-    owner = _coerce_owner(user)
+async def delete_conversation_endpoint(conversation_id: str, principal=Depends(require_chat_access())):
+    owner = principal["owner"]
     try:
-        delete_conversation(conversation_id, tenant_id=tenant_id, owner=owner)
+        delete_conversation(conversation_id, owner=owner)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Conversation not found.") from exc
     return {"success": True, "id": conversation_id}
@@ -41708,14 +42390,16 @@ async def delete_conversation_endpoint(conversation_id: str, user=Depends(requir
 async def post_conversation_message(
     conversation_id: str,
     data: ConversationMessageRequest,
-    user=Depends(require_login()),
+    principal=Depends(require_chat_access()),
 ):
-    tenant_id = require_request_tenant(user)
-    owner = _coerce_owner(user)
+    owner = principal["owner"]
     try:
+        chat_tid = _resolve_chat_tenant_id(data.tenant_id, conversation_id, owner)
         conversation = append_conversation_message(
-            conversation_id, data.role, data.text, tenant_id=tenant_id, owner=owner
+            conversation_id, data.role, data.text, tenant_id=chat_tid, owner=owner
         )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KeyError as exc:
@@ -41724,27 +42408,22 @@ async def post_conversation_message(
 
 @app.post("/query")
 async def query_rag(data: QueryRequest, request: Request, user=Depends(require_login())):
-    # Bind this request to the caller's business so every downstream retrieval,
-    # conversation write, and analytics event is scoped to a single tenant.
-    # Starlette runs each request in its own task-local context, so this set()
-    # is isolated to the current request.
-    tenant_id = require_request_tenant(user)
-    _request_tenant_id.set(tenant_id)
     _current_user_query.set(str(data.text or ""))
     _owner = _coerce_owner(user)
-    logger.info("[FLOW] entering query_rag (tenant=%s)", tenant_id)
-    logger.info("[FLOW] query_before = %s", (data.text or "")[:400])
     persistent_conversation_id: str | None = None
     if data.conversation_id:
-        conversation = get_or_create_conversation(data.conversation_id, tenant_id=tenant_id, owner=_owner)
-        persistent_conversation_id = str(conversation["id"])
+        persistent_conversation_id = str(data.conversation_id)
+        chat_tid = _resolve_chat_tenant_id(data.tenant_id, persistent_conversation_id, _owner)
+        get_or_create_conversation(persistent_conversation_id, owner=_owner, active_tenant_id=chat_tid)
         connection_id = persistent_conversation_id
-        append_conversation_message(persistent_conversation_id, "user", data.text, tenant_id=tenant_id, owner=_owner)
+        append_conversation_message(
+            persistent_conversation_id, "user", data.text, tenant_id=chat_tid, owner=_owner
+        )
         bind_conversation_memory(connection_id, persistent_conversation_id)
     else:
-        # Stable per-user connection_id so follow-up state persists across HTTP
-        # requests for the same user (was generating a fresh uuid per request,
-        # which orphaned every saved answer state).
+        chat_tid = assert_chat_tenant_allowed(user, data.tenant_id) if data.tenant_id is not None else DEFAULT_TENANT_ID
+        if data.tenant_id is None:
+            raise HTTPException(status_code=400, detail="tenant_id required when conversation_id is omitted")
         _uname = (user or {}).get("username") if isinstance(user, dict) else None
         if _uname:
             connection_id = f"http_user_{_uname}"
@@ -41758,13 +42437,15 @@ async def query_rag(data: QueryRequest, request: Request, user=Depends(require_l
                 connection_id = "http_sess_" + _hashlib.sha1(_tok.encode("utf-8", errors="ignore")).hexdigest()[:12]
             else:
                 connection_id = "http_anon"
-    # Apply about-entity rewrite up-front so downstream follow-up post-checks
-    # and definition cleanup see the same standalone-question form that
-    # call_llm_with_rag will use internally.
+    logger.info("[FLOW] entering query_rag (tenant=%s)", chat_tid)
+    logger.info("[FLOW] query_before = %s", (data.text or "")[:400])
     _post_text = data.text if _is_memory_rewrite_query(data.text) else _maybe_rewrite_about_entity_question(data.text)
-    ai_response, retrieved_docs = await call_llm_with_rag(_post_text, connection_id, user)
+    with _TenantScope(chat_tid):
+        ai_response, retrieved_docs = await call_llm_with_rag(_post_text, connection_id, user)
     if persistent_conversation_id:
-        append_conversation_message(persistent_conversation_id, "assistant", ai_response, tenant_id=tenant_id, owner=_owner)
+        append_conversation_message(
+            persistent_conversation_id, "assistant", ai_response, tenant_id=chat_tid, owner=_owner
+        )
         persist_runtime_memory(connection_id, persistent_conversation_id)
     # Skip definition/cleanup post-processing for follow-up clarifications:
     # those answers are already finalized inside _handle_followup_query and
@@ -42209,6 +42890,7 @@ async def kb_status(user=Depends(require_login())):
     the current filename being processed (if any), per-stage timings, and
     the cumulative upload-to-ready duration. Scoped to the caller's business.
     """
+    _maybe_recover_stale_kb_pipeline()
     tenant_id = require_request_tenant(user)
     _request_tenant_id.set(tenant_id)
     scope_tid = None if int(tenant_id) == int(DEFAULT_TENANT_ID) else int(tenant_id)
@@ -42218,12 +42900,32 @@ async def kb_status(user=Depends(require_login())):
     snapshot["active_sources"] = sorted(_get_active_sources())
     snapshot["doc_mode"] = _active_doc_registry.get("mode", RAG_DOC_MODE)
     snapshot["tenant_id"] = int(tenant_id)
+    pipeline_state = str(snapshot.get("state") or "ready").lower()
+    if pipeline_state in ("processing", "uploading"):
+        return snapshot
+    if pipeline_state == "ready":
+        snapshot["stage"] = "ready"
+        snapshot["percent"] = 100
     try:
         from backend.knowledge_base import find_orphan_asset_files, get_or_create_collection
 
         kb_col = get_or_create_collection(allow_empty=True, tenant_id=scope_tid)
         snapshot["active_collection"] = getattr(kb_col, "name", None) if kb_col else None
-        snapshot["indexed_chunks"] = kb_col.count() if kb_col else 0
+        collection_count = kb_col.count() if kb_col else 0
+        snapshot["collection_chunks"] = collection_count
+        snapshot["indexed_chunks"] = collection_count
+        prev_total = snapshot.get("total_chunks")
+        if isinstance(prev_total, int) and prev_total > 0:
+            snapshot["total_chunks"] = max(prev_total, collection_count)
+        else:
+            snapshot["total_chunks"] = collection_count
+        if (
+            isinstance(snapshot.get("indexed_chunks"), int)
+            and isinstance(snapshot.get("total_chunks"), int)
+            and snapshot["total_chunks"] > 0
+            and snapshot["indexed_chunks"] > snapshot["total_chunks"]
+        ):
+            snapshot["total_chunks"] = snapshot["indexed_chunks"]
         if int(tenant_id) == int(DEFAULT_TENANT_ID):
             retrieval_col = getattr(getattr(live_rag, "vs", None), "collection", None)
             snapshot["retrieval_collection"] = getattr(retrieval_col, "name", None) if retrieval_col else None
@@ -42267,6 +42969,61 @@ async def get_audio(filename: str, user=Depends(require_login())):
 _pdf_indexing_tasks: dict = {}
 
 
+def _maybe_recover_stale_kb_pipeline() -> bool:
+    """Fail stuck uploads and reset the collection lock so the UI can recover."""
+    state = str(_kb_pipeline_state.get("state") or "ready").lower()
+    if state not in {"uploading", "processing"}:
+        return False
+    updated = float(_kb_pipeline_state.get("updated_at") or 0)
+    if not updated:
+        return False
+    stale_for = time.time() - updated
+    if stale_for < KB_PIPELINE_STALE_TIMEOUT_S:
+        return False
+    filename = _kb_pipeline_state.get("filename")
+    logger.warning(
+        "[KB WATCHDOG] pipeline stale %.0fs | state=%s stage=%s filename=%s — recovering",
+        stale_for,
+        state,
+        _kb_pipeline_state.get("stage"),
+        filename,
+    )
+    for fn, task in list(_pdf_indexing_tasks.items()):
+        if task and not task.done():
+            task.cancel()
+            logger.warning("[KB WATCHDOG] cancelled background task for %s", fn)
+        _pdf_indexing_tasks.pop(fn, None)
+    _reset_collection_mutation_lock()
+    _set_kb_pipeline_state(
+        "failed",
+        message=(
+            f"Ingestion timed out after {int(stale_for)}s "
+            f"(stage={_kb_pipeline_state.get('stage')}). Please retry."
+        ),
+        filename=filename,
+    )
+    return True
+
+
+@asynccontextmanager
+async def _collection_mutation(timeout: Optional[float] = None):
+    """Serialize Chroma mutations with a bounded wait (prevents infinite UI freeze)."""
+    lock_timeout = float(timeout if timeout is not None else COLLECTION_MUTATION_LOCK_TIMEOUT_S)
+    lock = _get_collection_mutation_lock()
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
+    except asyncio.TimeoutError:
+        _maybe_recover_stale_kb_pipeline()
+        raise RuntimeError(
+            f"Timed out waiting {lock_timeout:.0f}s for KB collection lock "
+            f"(another upload may be stuck). Try again shortly."
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 async def _finalize_tenant_pdf_upload_background(
     *,
     tenant_id: int,
@@ -42286,7 +43043,7 @@ async def _finalize_tenant_pdf_upload_background(
     """
     try:
         _set_kb_pipeline_stage("extracting", message="Extracting text", filename=filename)
-        text = _extract_text_from_asset(save_path)
+        text = await asyncio.to_thread(_extract_text_from_asset, save_path)
         if not text.strip():
             _set_kb_pipeline_state("failed", message="No extractable text found", filename=filename)
             return
@@ -42308,26 +43065,52 @@ async def _finalize_tenant_pdf_upload_background(
 
         _set_kb_pipeline_stage("chunking", message="Chunking document", filename=filename)
         deleted = 0
-        async with _collection_mutation_lock:
-            # Remove any prior chunks for this file within THIS tenant only.
-            try:
-                prior_id = find_base_doc_id_by_filename(normalized_filename, tenant_id=tenant_id)
-                if prior_id:
-                    deleted += int(delete_documents_with_prefix(str(prior_id), tenant_id=tenant_id) or 0)
-            except Exception as _del_err:
-                logger.warning("[TENANT UPLOAD] prior-chunk cleanup skipped: %s", _del_err)
-            try:
-                deleted += int(delete_documents_with_prefix(str(doc_id), tenant_id=tenant_id) or 0)
-            except Exception:
-                pass
-            _cad = chunk_and_add_document(
-                doc_id=doc_id,
-                text=text,
-                metadata=metadata,
-                kb_version=_kb_global_version + 1,
-                tenant_id=tenant_id,
+        added = 0
+        try:
+            async with _collection_mutation():
+                # Remove any prior chunks for this file within THIS tenant only.
+                try:
+                    prior_id = await asyncio.to_thread(
+                        find_base_doc_id_by_filename, normalized_filename, tenant_id
+                    )
+                    if prior_id:
+                        deleted += int(
+                            await asyncio.to_thread(
+                                delete_documents_with_prefix, str(prior_id), tenant_id
+                            )
+                            or 0
+                        )
+                except Exception as _del_err:
+                    logger.warning("[TENANT UPLOAD] prior-chunk cleanup skipped: %s", _del_err)
+                try:
+                    deleted += int(
+                        await asyncio.to_thread(delete_documents_with_prefix, str(doc_id), tenant_id)
+                        or 0
+                    )
+                except Exception:
+                    pass
+                _cad = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        chunk_and_add_document,
+                        doc_id=doc_id,
+                        text=text,
+                        metadata=metadata,
+                        kb_version=_kb_global_version + 1,
+                        tenant_id=tenant_id,
+                    ),
+                    timeout=INGEST_INDEX_TIMEOUT_S,
+                )
+                added = int(_cad) if isinstance(_cad, int) else 0
+        except asyncio.TimeoutError:
+            _set_kb_pipeline_state(
+                "failed",
+                message=f"Indexing timed out after {int(INGEST_INDEX_TIMEOUT_S)}s",
+                filename=filename,
             )
-            added = int(_cad) if isinstance(_cad, int) else 0
+            return
+        except RuntimeError as lock_err:
+            _set_kb_pipeline_state("failed", message=str(lock_err), filename=filename)
+            return
 
         # Force the tenant retrieval manager to rebind to its (now populated)
         # collection on the next query so new chunks are immediately visible.
@@ -42426,7 +43209,9 @@ async def _finalize_pdf_upload_background(
             non_empty_pages = 1 if text.strip() else 0
             logger.info(f"  Extracted TXT: {len(text)} chars, ~{len(text.split())} words")
         else:
-            text = _extract_text_from_asset(save_path)
+            # Run the heavy synchronous PDF extraction off the event loop so
+            # WebSocket handlers and status polling remain responsive
+            text = await asyncio.to_thread(_extract_text_from_asset, save_path)
             if not text.strip():
                 logger.warning(
                     "  PDF extraction produced empty text | filename=%s",
@@ -42470,8 +43255,9 @@ async def _finalize_pdf_upload_background(
         gc_report: dict = {}
         indexing_details: dict = {}
         try:
-            async with _collection_mutation_lock:
-                delete_report = delete_documents_by_source_identity(
+            async with _collection_mutation():
+                delete_report = await asyncio.to_thread(
+                    delete_documents_by_source_identity,
                     source_doc_id=str(metadata.get("source_doc_id") or doc_id),
                     original_filename=str(metadata.get("original_filename") or original_filename),
                     stored_filename=str(metadata.get("stored_filename") or filename),
@@ -42489,15 +43275,18 @@ async def _finalize_pdf_upload_background(
                 )
                 # Run the CPU/IO-heavy embedder off the event loop so /ws and
                 # other coroutines (including the KB-ready gate) stay responsive.
-                _raw_indexing = await asyncio.to_thread(
-                    chunk_and_add_document,
-                    doc_id,
-                    text,
-                    metadata,
-                    _kb_global_version + 1,
-                    True,
-                    target_collection_name,
-                    lambda event: _on_ingest_progress(event, filename),
+                _raw_indexing = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        chunk_and_add_document,
+                        doc_id,
+                        text,
+                        metadata,
+                        _kb_global_version + 1,
+                        True,
+                        target_collection_name,
+                        lambda event: _on_ingest_progress(event, filename),
+                    ),
+                    timeout=INGEST_INDEX_TIMEOUT_S,
                 )
                 indexing_details = _raw_indexing if isinstance(_raw_indexing, dict) else {}
                 logger.info("[CHUNKING DONE] filename=%s generated=%s",
@@ -42531,6 +43320,21 @@ async def _finalize_pdf_upload_background(
                             )
                         except Exception as gc_err:
                             logger.warning(f"Blue/Green GC skipped due to error: {gc_err}")
+        except asyncio.TimeoutError:
+            _set_kb_pipeline_state(
+                "failed",
+                message=f"Indexing timed out after {int(INGEST_INDEX_TIMEOUT_S)}s",
+                filename=filename,
+            )
+            logger.error(
+                "[SWAP FAIL] filename=%s reason=ingest_timeout total=%.2fs",
+                filename,
+                time.time() - swap_t0,
+            )
+            return
+        except RuntimeError as lock_err:
+            _set_kb_pipeline_state("failed", message=str(lock_err), filename=filename)
+            return
         except Exception as upsert_err:
             _set_kb_pipeline_state("failed", message=f"Indexing failed: {upsert_err}", filename=filename)
             logger.exception("upload_rag(bg) upsert failure | filename=%s doc_id=%s error=%s",
@@ -42626,11 +43430,15 @@ async def _finalize_pdf_upload_background(
 @app.post("/upload_rag")
 async def upload_rag(request: Request, file: UploadFile = File(...), user=Depends(require_tenant_staff())):
     verify_csrf(request)
+    _maybe_recover_stale_kb_pipeline()
 
     # Scope this upload to the admin's business so documents are indexed into
     # the tenant's own collection and stored under its own assets directory.
     tenant_id = require_request_tenant(user)
     _request_tenant_id.set(tenant_id)
+
+    if not _check_rate_limit(f"upload:{tenant_id}", limit=10, window=60):
+        raise HTTPException(status_code=429, detail="Too many upload requests. Please wait before uploading again.")
 
     upload_id = uuid.uuid4().hex[:8]
     filename = f"{upload_id}_{Path(file.filename or 'upload').name}"
@@ -42695,7 +43503,7 @@ async def upload_rag(request: Request, file: UploadFile = File(...), user=Depend
     dedup_removed_assets = []
 
     try:
-        async with _collection_mutation_lock:
+        async with _collection_mutation():
             delete_report = delete_documents_by_source_identity(
                 source_doc_id=source_doc_id,
                 original_filename=original_filename,
@@ -42882,7 +43690,7 @@ async def rag_delete(doc_prefix: str, request: Request, user=Depends(require_ten
     gc_report: dict = {}
     delete_report: dict = {}
     deleted = 0
-    async with _collection_mutation_lock:
+    async with _collection_mutation():
         try:
             normalized_target = normalize_uploaded_filename(_bare or doc_prefix)
             source_doc_id = canonical_source_doc_id(normalized_target) if normalized_target else ""
@@ -43117,7 +43925,7 @@ async def rag_update_asset_file(filename: str, request: Request, user=Depends(re
         save_path.write_text(content, encoding="utf-8")
         _mark_assets_recently_indexed(save_path.name, seconds=15.0)
         _set_kb_pipeline_stage("chunking", message="Chunking updated text", filename=save_path.name)
-        async with _collection_mutation_lock:
+        async with _collection_mutation():
             delete_report = delete_documents_by_source_identity(
                 source_doc_id=str(metadata.get("source_doc_id") or ""),
                 original_filename=str(metadata.get("original_filename") or ""),
@@ -43173,6 +43981,56 @@ async def rag_update_asset_file(filename: str, request: Request, user=Depends(re
         raise HTTPException(status_code=500, detail=f"Failed to update file: {str(e)}")
 
 
+def _reindex_asset_sync(
+    path: Path,
+    scope_tid,
+    *,
+    upload_id: str = "manual_reindex",
+    ingestion_owner: str = "rag_server_reindex",
+) -> dict:
+    """Sync per-file reindex body — run via asyncio.to_thread to avoid blocking the event loop."""
+    filename = path.name
+    _set_kb_pipeline_stage("extracting", message="Reindexing file", filename=filename)
+    text = _extract_text_from_asset(path)
+    if not text.strip():
+        raise RuntimeError("Extraction produced no usable text")
+
+    original_filename = original_filename_from_stored(filename)
+    metadata = build_canonical_source_metadata(
+        original_filename=original_filename,
+        stored_filename=filename,
+        upload_id=upload_id,
+        document_version=str(int(path.stat().st_mtime)),
+    )
+    metadata.update({"ingestion_owner": ingestion_owner, "file_ext": path.suffix.lower()})
+    doc_id = str(metadata.get("source_doc_id") or canonical_source_doc_id(metadata.get("normalized_filename") or original_filename))
+    delete_report = delete_documents_by_source_identity(
+        source_doc_id=str(metadata.get("source_doc_id") or ""),
+        original_filename=str(metadata.get("original_filename") or ""),
+        stored_filename=str(metadata.get("stored_filename") or filename),
+        normalized_filename=str(metadata.get("normalized_filename") or ""),
+        doc_prefix=doc_id,
+        tenant_id=scope_tid,
+    )
+    deleted = int(delete_report.get("deleted_count") or 0)
+    _set_kb_pipeline_stage("chunking", message="Chunking document", filename=filename)
+    _raw_chunks = chunk_and_add_document(
+        doc_id=doc_id,
+        text=text,
+        metadata=metadata,
+        kb_version=_kb_global_version + 1,
+        progress_callback=lambda event, fn=filename: _on_ingest_progress(event, fn),
+        tenant_id=scope_tid,
+    )
+    chunks = int(_raw_chunks) if isinstance(_raw_chunks, int) else 0
+    return {
+        "filename": filename,
+        "chunks": chunks,
+        "deleted_old": deleted,
+        "delete_verification": delete_report,
+    }
+
+
 @app.post("/rag/reindex-file")
 async def rag_reindex_file(filename: str, request: Request, user=Depends(require_tenant_staff())):
     verify_csrf(request)
@@ -43190,36 +44048,16 @@ async def rag_reindex_file(filename: str, request: Request, user=Depends(require
         raise HTTPException(status_code=404, detail="file not found")
 
     try:
-        _set_kb_pipeline_stage("extracting", message="Reindexing file", filename=filename)
-        text = _extract_text_from_asset(save_path)
-        if not text.strip():
-            _set_kb_pipeline_state("failed", message="Extraction produced no usable text", filename=filename)
-            raise HTTPException(status_code=500, detail="Extraction produced no usable text")
-
-        original_filename = original_filename_from_stored(filename)
-        metadata = build_canonical_source_metadata(
-            original_filename=original_filename,
-            stored_filename=filename,
+        result = await asyncio.to_thread(
+            _reindex_asset_sync,
+            save_path,
+            scope_tid,
             upload_id="manual_reindex",
-            document_version=str(int(save_path.stat().st_mtime)),
+            ingestion_owner="rag_server_reindex",
         )
-        metadata.update({"ingestion_owner": "rag_server_reindex", "file_ext": save_path.suffix.lower()})
-        doc_id = str(metadata.get("source_doc_id") or canonical_source_doc_id(metadata.get("normalized_filename") or original_filename))
-        delete_report = delete_documents_by_source_identity(
-            source_doc_id=str(metadata.get("source_doc_id") or ""),
-            original_filename=str(metadata.get("original_filename") or ""),
-            stored_filename=str(metadata.get("stored_filename") or filename),
-            normalized_filename=str(metadata.get("normalized_filename") or ""),
-            doc_prefix=doc_id,
-            tenant_id=scope_tid,
-        )
-        deleted = int(delete_report.get("deleted_count") or 0)
-        _set_kb_pipeline_stage("chunking", message="Chunking document", filename=filename)
-        _raw_chunks_ri = chunk_and_add_document(doc_id=doc_id, text=text, metadata=metadata,
-                                        kb_version=_kb_global_version + 1,
-                                        progress_callback=lambda event: _on_ingest_progress(event, filename),
-                                        tenant_id=scope_tid)
-        chunks = int(_raw_chunks_ri) if isinstance(_raw_chunks_ri, int) else 0
+        chunks = int(result.get("chunks") or 0)
+        deleted = int(result.get("deleted_old") or 0)
+        delete_report = result.get("delete_verification") or {}
         if chunks:
             _set_kb_pipeline_stage("activating", message="Activating live retrieval", filename=filename)
             if scope_tid is None:
@@ -43233,11 +44071,13 @@ async def rag_reindex_file(filename: str, request: Request, user=Depends(require
                                          triggered_by="admin")
             _set_kb_pipeline_state("ready", message="Reindex complete and active", filename=filename)
             return {"reindexed_chunks": chunks, "deleted_old": deleted, "delete_verification": delete_report, "active_collection": active_collection, "ready_state": dict(_kb_pipeline_state)}
-        else:
-            _set_kb_pipeline_state("failed", message="Reindex produced no chunks", filename=filename)
-            raise HTTPException(status_code=500, detail="Reindex produced no chunks")
+        _set_kb_pipeline_state("failed", message="Reindex produced no chunks", filename=filename)
+        raise HTTPException(status_code=500, detail="Reindex produced no chunks")
     except HTTPException:
         raise
+    except RuntimeError as e:
+        _set_kb_pipeline_state("failed", message=str(e), filename=filename)
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -43278,37 +44118,17 @@ async def rag_reindex_all(request: Request, user=Depends(require_tenant_staff())
             continue
         filename = p.name
         try:
-            _set_kb_pipeline_stage("extracting", message="Reindexing file", filename=filename)
-            text = _extract_text_from_asset(p)
-            if not text.strip():
-                raise RuntimeError("Extraction produced no usable text")
-            original_filename = original_filename_from_stored(filename)
-            metadata = build_canonical_source_metadata(
-                original_filename=original_filename,
-                stored_filename=filename,
+            result = await asyncio.to_thread(
+                _reindex_asset_sync,
+                p,
+                scope_tid,
                 upload_id="manual_reindex_all",
-                document_version=str(int(p.stat().st_mtime)),
+                ingestion_owner="rag_server_reindex_all",
             )
-            metadata.update({"ingestion_owner": "rag_server_reindex_all", "file_ext": p.suffix.lower()})
-            doc_id = str(metadata.get("source_doc_id") or canonical_source_doc_id(metadata.get("normalized_filename") or original_filename))
-            delete_report = delete_documents_by_source_identity(
-                source_doc_id=str(metadata.get("source_doc_id") or ""),
-                original_filename=str(metadata.get("original_filename") or ""),
-                stored_filename=str(metadata.get("stored_filename") or filename),
-                normalized_filename=str(metadata.get("normalized_filename") or ""),
-                doc_prefix=doc_id,
-                tenant_id=scope_tid,
-            )
-            deleted = int(delete_report.get("deleted_count") or 0)
-            _set_kb_pipeline_stage("chunking", message="Chunking document", filename=filename)
-            _raw_cad = chunk_and_add_document(doc_id=doc_id, text=text, metadata=metadata,
-                                            kb_version=_kb_global_version + 1,
-                                            progress_callback=lambda event, fn=filename: _on_ingest_progress(event, fn),
-                                            tenant_id=scope_tid)
-            chunks: int = _raw_cad if isinstance(_raw_cad, int) else 0
-            results.append({"filename": filename, "chunks": chunks, "deleted_old": deleted, "delete_verification": delete_report, "status": "ok"})
+            results.append({**result, "status": "ok"})
         except Exception as e:
             results.append({"filename": filename, "status": "error", "error": str(e)})
+        await asyncio.sleep(0)
     total_added = sum(r.get("chunks", 0) for r in results if r.get("status") == "ok")
     total_deleted = sum(r.get("deleted_old", 0) for r in results if r.get("status") == "ok")
     if scope_tid is None:
@@ -43412,8 +44232,18 @@ async def _process_voice_transcript_ws(
     try:
         conversation_id_for_voice = _activate_conversation(active_conversation_id)
         conversation_ws = _conversation_ws(conversation_id_for_voice)
+        voice_tid = _chat_store.get_active_tenant_id(conversation_id_for_voice, _coerce_owner(user))
+        if voice_tid is None:
+            voice_tid = DEFAULT_TENANT_ID
+        _request_tenant_id.set(voice_tid)
         try:
-            append_conversation_message(conversation_id_for_voice, "user", full_text)
+            append_conversation_message(
+                conversation_id_for_voice,
+                "user",
+                full_text,
+                tenant_id=voice_tid,
+                owner=_coerce_owner(user),
+            )
         except Exception:
             logger.exception("[CONV] failed to persist voice user message id=%s", conversation_id_for_voice)
 
@@ -43524,18 +44354,16 @@ async def _process_ws_text_message(
     payload: dict,
     user,
     session_language_ref: list,
-    ws_tenant_id: int,
+    ws_tenant_ref: list,
     ws_owner,
     activate_conversation,
     conversation_ws_factory,
 ):
     session_language = session_language_ref[0]
-    # Handle typed text queries with streaming
     text = payload["text"].strip()
     stored_user_text = text
     client_tts_enabled = bool(payload.get("tts_enabled", False))
     query_tts = _client_tts_allowed(client_tts_enabled)
-    # Allow per-message language override; fall back to session setting
     msg_lang = str(payload.get("language", session_language) or session_language).strip().lower()
     if msg_lang in ("en", "ar"):
         session_language = msg_lang
@@ -43549,7 +44377,27 @@ async def _process_ws_text_message(
         conversation_id_for_text = activate_conversation(payload.get("conversation_id"))
         conversation_ws = conversation_ws_factory(conversation_id_for_text)
         try:
-            append_conversation_message(conversation_id_for_text, "user", stored_user_text)
+            chat_tid = _resolve_chat_tenant_id(
+                payload.get("tenant_id") if payload.get("tenant_id") is not None else ws_tenant_ref[0],
+                conversation_id_for_text,
+                ws_owner,
+            )
+        except HTTPException as exc:
+            try:
+                await websocket.send_json({"type": "error", "message": str(exc.detail)})
+            except Exception:
+                pass
+            return
+        ws_tenant_ref[0] = chat_tid
+        _request_tenant_id.set(chat_tid)
+        try:
+            append_conversation_message(
+                conversation_id_for_text,
+                "user",
+                stored_user_text,
+                tenant_id=chat_tid,
+                owner=ws_owner,
+            )
         except Exception:
             logger.exception("[CONV] failed to persist user message id=%s", conversation_id_for_text)
 
@@ -43594,6 +44442,51 @@ async def _process_ws_text_message(
         text, ar_reason_pre = _resolve_and_mark_arabic_followup_for_ws(text, connection_id, "pre-router")
         if ar_reason_pre and msg_lang in {"ar", "en"}:
             force_final_language_for_rewrite = msg_lang
+
+        from backend.rag_query_prep import prepare_query_for_rag
+
+        prepared = await prepare_query_for_rag(text)
+        if prepared.direct_response:
+            direct_answer = prepared.direct_response
+            try:
+                _append_conversation_turn(connection_id, stored_user_text, direct_answer)
+            except Exception:
+                pass
+            try:
+                route_t0 = time.perf_counter()
+                route_t_meta = {"request_start": route_t0}
+                await send_final_response(
+                    connection_id,
+                    direct_answer,
+                    "ar" if msg_lang == "ar" else XTTS_LANGUAGE,
+                    query_tts,
+                    websocket=conversation_ws,
+                    sources=0,
+                    arabic_mode=(msg_lang == "ar"),
+                    t_meta=route_t_meta,
+                    branch="query_prep_smalltalk",
+                )
+                _emit_perf_report(route_t_meta, route_t0, text, direct_answer, connection_id)
+            except Exception:
+                pass
+            try:
+                log_usage(
+                    username=(user or {}).get("username", "unknown"),
+                    user_role=(user or {}).get("role", "unknown"),
+                    query_text=stored_user_text,
+                    response_status="success",
+                    error_message=None,
+                    response_time_ms=0,
+                    rag_docs_found=0,
+                    query_length=len(stored_user_text),
+                    response_length=len(direct_answer or ""),
+                )
+            except Exception:
+                pass
+            persist_runtime_memory(connection_id, conversation_id_for_text)
+            return
+        if prepared.rag_query:
+            text = prepared.rag_query
 
         if _is_memory_rewrite_query(text):
             route_t0 = time.perf_counter()
@@ -43902,6 +44795,11 @@ def _build_voice_ws_deps():
         session_cookie=SESSION_COOKIE,
         serializer=serializer,
         set_request_tenant_id=_request_tenant_id.set,
+        resolve_chat_tenant_id=_resolve_chat_tenant_id,
+        set_conversation_active_tenant=set_conversation_active_tenant,
+        assert_chat_tenant_allowed=assert_chat_tenant_allowed,
+        get_tenant_name=get_tenant_name,
+        default_tenant_id=DEFAULT_TENANT_ID,
         get_memory_snapshot=_get_memory_snapshot,
         get_stable_memory_snapshot=_get_stable_memory_snapshot,
         on_ws_disconnect=_on_ws_disconnect,

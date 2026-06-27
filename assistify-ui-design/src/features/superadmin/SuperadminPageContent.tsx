@@ -53,6 +53,7 @@ export function SuperadminPageContent() {
     updateManager,
     deleteManager,
     updateSettings,
+    deleteTenant,
   } = useTenants();
 
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -61,6 +62,11 @@ export function SuperadminPageContent() {
   const [createSlug, setCreateSlug] = useState("");
   const [createError, setCreateError] = useState("");
   const [createSaving, setCreateSaving] = useState(false);
+
+  const [deleteModal, setDeleteModal] = useState<Tenant | null>(null);
+  const [confirmSlug, setConfirmSlug] = useState("");
+  const [deleteError, setDeleteError] = useState("");
+  const [deleteSaving, setDeleteSaving] = useState(false);
 
   const [managerModal, setManagerModal] = useState<{
     mode: "create" | "edit";
@@ -210,6 +216,29 @@ export function SuperadminPageContent() {
       await deactivate(tenantId);
     } catch (err) {
       alert(err instanceof Error ? err.message : "Deactivate failed");
+    }
+  };
+
+  const openDeleteModal = (tenant: Tenant) => {
+    setConfirmSlug("");
+    setDeleteError("");
+    setDeleteModal(tenant);
+  };
+
+  const handleDeleteTenant = async () => {
+    if (!deleteModal) return;
+    setDeleteError("");
+    setDeleteSaving(true);
+    try {
+      await deleteTenant(deleteModal.id, confirmSlug.trim().toLowerCase());
+      if (expandedId === deleteModal.id) {
+        setExpandedId(null);
+      }
+      setDeleteModal(null);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Delete failed");
+    } finally {
+      setDeleteSaving(false);
     }
   };
 
@@ -424,13 +453,24 @@ export function SuperadminPageContent() {
                           Deactivate business
                         </button>
                       ) : (
-                        <button
-                          type="button"
-                          className="text-sm text-[#10a37f] hover:underline"
-                          onClick={() => handleActivate(t.id)}
-                        >
-                          Activate business
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            className="text-sm text-[#10a37f] hover:underline"
+                            onClick={() => handleActivate(t.id)}
+                          >
+                            Activate business
+                          </button>
+                          {t.id !== 1 && (
+                            <button
+                              type="button"
+                              className="text-sm text-red-400 hover:underline"
+                              onClick={() => openDeleteModal(t)}
+                            >
+                              Delete business
+                            </button>
+                          )}
+                        </>
                       )}
                     </div>
                   </div>
@@ -513,6 +553,60 @@ export function SuperadminPageContent() {
             </label>
           )}
         </div>
+      </Modal>
+
+      <Modal
+        open={deleteModal !== null}
+        onClose={() => setDeleteModal(null)}
+        title="Delete business permanently"
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setDeleteModal(null)}
+              className="flex-1 rounded-lg bg-[#333333] px-4 py-2 text-[#fafaff]"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleDeleteTenant}
+              disabled={
+                deleteSaving ||
+                confirmSlug.trim().toLowerCase() !== (deleteModal?.slug ?? "").toLowerCase()
+              }
+              className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-white hover:bg-red-700 disabled:opacity-50"
+            >
+              {deleteSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Permanently delete
+            </button>
+          </>
+        }
+      >
+        {deleteModal && (
+          <>
+            <p className="mb-4 text-sm text-[#9ca3af]">
+              This will permanently remove <strong className="text-[#fafaff]">{deleteModal.name}</strong>{" "}
+              and all associated data: staff accounts, customer memberships, support tickets, knowledge
+              base documents, chat history for this business, and analytics.
+            </p>
+            <p className="mb-3 text-sm text-[#fafaff]">
+              Type <span className="font-mono text-red-400">{deleteModal.slug || `tenant-${deleteModal.id}`}</span>{" "}
+              to confirm:
+            </p>
+            {deleteError && (
+              <p className="mb-3 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-400">
+                {deleteError}
+              </p>
+            )}
+            <input
+              className="w-full rounded-lg border border-[#333333] bg-[#232323] px-4 py-2 text-[#fafaff] focus:border-red-500 focus:outline-none"
+              placeholder="Business slug"
+              value={confirmSlug}
+              onChange={(e) => setConfirmSlug(e.target.value)}
+            />
+          </>
+        )}
       </Modal>
     </div>
   );

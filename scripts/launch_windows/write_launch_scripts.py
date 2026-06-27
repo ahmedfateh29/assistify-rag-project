@@ -103,6 +103,20 @@ def _uvicorn_bat_lines(
     return lines
 
 
+def _maybe_log_wrap(
+    repo_root: Path,
+    python_exe: str,
+    log_name: str,
+    capture_logs: bool,
+    inner_cmd: str,
+) -> str:
+    if not capture_logs:
+        return inner_cmd
+    log_file = repo_root / "logs" / f"{log_name}.log"
+    wrapper = repo_root / "scripts" / "run_with_log.py"
+    return f'"{python_exe}" -u "{wrapper}" "{log_file}" {inner_cmd}'
+
+
 def write_service_bats(
     repo_root: Path,
     python_exe: str,
@@ -113,8 +127,12 @@ def write_service_bats(
     rag_env: dict,
     piper_env: dict,
     reload_flag: bool,
+    capture_logs: bool = False,
 ) -> dict[str, Path]:
     write_env_bat(repo_root, python_exe, {**piper_env, **rag_env})
+
+    if capture_logs:
+        (repo_root / "logs").mkdir(parents=True, exist_ok=True)
 
     bats: dict[str, Path] = {}
 
@@ -145,11 +163,18 @@ def write_service_bats(
                 "echo.",
                 "echo Do NOT run 'ollama serve' while port 11434 is in use.",
                 "echo For a clean restart: python start_main_servers.py --restart-ollama",
-                "pause",
-                "exit /b 0",
+                "echo.",
+                "echo Monitor window — safe to close; does not stop tray Ollama.",
+                "cmd /k",
                 ":run_ollama",
                 "echo Starting Ollama on port 11434...",
-                '"%OLLAMA_EXE%" serve',
+                _maybe_log_wrap(
+                    repo_root,
+                    python_exe,
+                    "ollama",
+                    capture_logs,
+                    '"%OLLAMA_EXE%" serve',
+                ),
                 "if errorlevel 1 (",
                 "  echo.",
                 "  echo [ERROR] ollama serve failed — port 11434 may already be in use.",
@@ -164,15 +189,21 @@ def write_service_bats(
     )
     bats["Ollama"] = ollama_path
 
-    piper_cmd = " ".join(
-        _uvicorn_bat_lines(
-            "tts_service.piper_server:app",
-            "127.0.0.1",
-            5002,
-            "info",
-            300,
-            reload_flag,
-        )
+    piper_cmd = _maybe_log_wrap(
+        repo_root,
+        python_exe,
+        "piper",
+        capture_logs,
+        " ".join(
+            _uvicorn_bat_lines(
+                "tts_service.piper_server:app",
+                "127.0.0.1",
+                5002,
+                "info",
+                300,
+                reload_flag,
+            )
+        ),
     )
     piper_path = LAUNCH_DIR / "run_piper.bat"
     piper_path.write_text(
@@ -189,20 +220,25 @@ def write_service_bats(
     )
     bats["Piper"] = piper_path
 
-    for key, svc, path_name in (
-        ("LLM", llm, "run_llm.bat"),
-        ("RAG", rag, "run_rag.bat"),
-        ("Login", login, "run_login.bat"),
+    for key, svc, path_name, log_name in (
+        ("LLM", llm, "run_llm.bat", "llm"),
+        ("RAG", rag, "run_rag.bat", "rag"),
+        ("Login", login, "run_login.bat", "login"),
     ):
-        cmd = " ".join(
-            _uvicorn_bat_lines(
-                svc["module"],
-                svc["host"],
-                svc["port"],
-                svc["log_level"],
-                svc["keep_alive"],
-                reload_flag,
-            )
+        uvicorn_parts = _uvicorn_bat_lines(
+            svc["module"],
+            svc["host"],
+            svc["port"],
+            svc["log_level"],
+            svc["keep_alive"],
+            reload_flag,
+        )
+        cmd = _maybe_log_wrap(
+            repo_root,
+            python_exe,
+            log_name,
+            capture_logs,
+            " ".join(uvicorn_parts),
         )
         bat_path = LAUNCH_DIR / path_name
         bat_path.write_text(

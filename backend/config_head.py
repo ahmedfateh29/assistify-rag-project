@@ -178,12 +178,14 @@ _active_voice_task = memory_guard.active_voice_task
 RAG_STRICT_DISTANCE_THRESHOLD = float(os.getenv("RAG_STRICT_DISTANCE_THRESHOLD", "1.0"))
 RAG_NO_MATCH_RESPONSE = "Not found in the document."
 CS_NO_MATCH_RESPONSE_EN = (
-    "Thanks for your question. I don't have that specific detail in our help materials yet, "
-    "but I'm here to help with anything covered in your knowledge base. What would you like to know?"
+    "Thanks for reaching out! I couldn't find that specific detail in our help materials just yet. "
+    "Could you rephrase your question, or ask about another topic covered in our knowledge base? "
+    "I'm happy to help."
 )
 CS_NO_MATCH_RESPONSE_AR = (
-    "شكراً لسؤالك. ليس لدي هذا التفصيل المحدد في مواد المساعدة لدينا بعد، "
-    "لكنني هنا للمساعدة في أي موضوع مشمول في قاعدة المعرفة. بماذا تود المساعدة؟"
+    "شكراً لتواصلك! لم أجد هذا التفصيل المحدد في مواد المساعدة لدينا بعد. "
+    "هل يمكنك إعادة صياغة سؤالك، أو السؤال عن موضوع آخر مشمول في قاعدة المعرفة؟ "
+    "يسعدني مساعدتك."
 )
 CUSTOMER_SUPPORT_AGENT_SYSTEM_PROMPT = (
     "You are Assistify, a friendly customer support agent for this business.\n"
@@ -196,6 +198,64 @@ RAG_GROUNDING_REFUSAL_RULE = (
     "If the retrieved documents do not contain the requested formula, coefficient weights, "
     "diagnostic code, or historical connection, say so clearly and do not invent one."
 )
+ENGLISH_WARM_REFUSAL_INSTRUCTION = (
+    "If the answer is NOT in the provided context, respond warmly that the detail is not in the "
+    "uploaded help materials. Do NOT use robotic internal placeholder phrases."
+)
+ENGLISH_LIST_EXTRACTION_RULES = (
+    "When the user asks for structured list output (including figure/table-adjacent content):\n"
+    "- Extract and reconstruct list items from noisy OCR, captions, or semi-structured paragraphs when clearly grounded.\n"
+    "- Clean obvious OCR artifacts but do NOT invent facts.\n"
+    "- Return a structured list only when items are clearly supported by context; otherwise give a warm "
+    "brief note that the detail is not in the help materials.\n"
+    "- Ignore headings like 'Figure' or 'Table' when they are merely labels.\n"
+)
+
+
+def build_english_support_system_prompt(extra_rules: str = "") -> str:
+    """Active English LLM persona: friendly support agent + strict grounding."""
+    parts = [
+        CUSTOMER_SUPPORT_AGENT_SYSTEM_PROMPT.strip(),
+        RAG_GROUNDING_REFUSAL_RULE,
+        "Never use outside knowledge. Respond in clear, friendly English.",
+        ENGLISH_WARM_REFUSAL_INSTRUCTION,
+        ENGLISH_LIST_EXTRACTION_RULES.strip(),
+    ]
+    if extra_rules.strip():
+        parts.append(extra_rules.strip())
+    return "\n".join(parts)
+
+
+def build_english_stream_context_block(
+    toon_context: str,
+    doc_router_context_rules: str = "",
+    format_rules: str = "",
+) -> str:
+    """WebSocket context block with friendly support persona in CORE RULES."""
+    return f"""
+===== KNOWLEDGE BASE CONTEXT =====
+{toon_context}
+==================================
+
+CORE RULES:
+1. You are Assistify, a friendly customer support agent for this business.
+2. You MUST answer ONLY using the provided KNOWLEDGE BASE CONTEXT.
+3. {ENGLISH_WARM_REFUSAL_INSTRUCTION}
+4. {RAG_GROUNDING_REFUSAL_RULE}
+5. NEVER use outside knowledge or fabricate statistics, quotes, or codes.
+6. Keep answers clear, conversational, and helpful—like a real support agent.
+{doc_router_context_rules}
+{format_rules}
+
+LIST HANDLING (VERY IMPORTANT):
+{ENGLISH_LIST_EXTRACTION_RULES}
+- Return clean lists, one item per line, when the context supports them.
+
+DEFINITION / PERSON QUESTIONS:
+For "what is" or "who is": return 1–2 short, friendly sentences ONLY.
+
+If the question is a greeting, respond naturally and warmly.
+"""
 CONVERSATIONAL_REDIRECT_EN = (
     "Thank you for reaching out. I'm here and ready to help with your support questions "
     "based on our knowledge base—for example, password reset, returns, or shipping. "

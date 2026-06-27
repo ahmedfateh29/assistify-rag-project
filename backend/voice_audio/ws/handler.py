@@ -45,45 +45,83 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
         except Exception:
             user = None
 
-        if not user:
-            logger.debug(f"Websocket {connection_id}: no valid session cookie found; continuing as anonymous")
-
-        # Bind this connection to the caller's business. The whole WebSocket session
-        # runs in one task, so retrieval/conversation/analytics for this socket are
-        # scoped to a single tenant for its entire lifetime.
-        ws_tenant_id = deps.resolve_request_tenant(user)
         ws_owner = deps.coerce_owner(user)
-        deps.set_request_tenant_id(ws_tenant_id)
+        if not ws_owner:
+            try:
+                from config import ALLOW_PUBLIC_GUEST_CHAT
+                from Login_system.guest_session import GUEST_OWNER_HEADER, is_valid_guest_id
+
+                if ALLOW_PUBLIC_GUEST_CHAT:
+                    guest_hdr = websocket.headers.get(GUEST_OWNER_HEADER) or websocket.headers.get(
+                        str(GUEST_OWNER_HEADER).lower()
+                    )
+                    if guest_hdr and is_valid_guest_id(guest_hdr):
+                        ws_owner = str(guest_hdr).strip()
+            except Exception:
+                pass
+
+        if not user and not ws_owner:
+            logger.debug(f"Websocket {connection_id}: no valid session cookie found; continuing as anonymous")
+        elif not ws_owner:
+            ws_owner = deps.coerce_owner(user)
+
+        if not ws_owner:
+            ws_owner = None
+
+        # Per-connection active chat tenant (mutable; not session-scoped).
+        # Resolve from the authenticated session immediately so the tenant context
+        # is correct from the first message, not only after set_conversation arrives.
+        _default_tid = int(getattr(deps, "default_tenant_id", 1) or 1)
+        _initial_tid = _default_tid
+        if user is not None and deps.resolve_request_tenant is not None:
+            try:
+                _initial_tid = int(deps.resolve_request_tenant(user))
+            except Exception:
+                _initial_tid = _default_tid
+        session_tenant_ref = [_initial_tid]
+        if deps.set_request_tenant_id is not None:
+            deps.set_request_tenant_id(session_tenant_ref[0])
         if deps.active_ws_tenants is not None:
-            deps.active_ws_tenants[connection_id] = ws_tenant_id
-        logger.info("Websocket %s bound to tenant=%s owner=%s", connection_id, ws_tenant_id, ws_owner)
+            deps.active_ws_tenants[connection_id] = session_tenant_ref[0]
+        logger.info(
+            "Websocket %s initial chat tenant=%s owner=%s",
+            connection_id,
+            session_tenant_ref[0],
+            ws_owner,
+        )
+
+        def _current_chat_tenant() -> int:
+            return int(session_tenant_ref[0])
+
+        def _activate_conversation(requested_id: str | None = None) -> str:
+            nonlocal active_conversation_id
+            clean_requested = str(requested_id or "").strip() or active_conversation_id
+            conversation = deps.get_or_create_conversation(
+                clean_requested,
+                owner=ws_owner,
+                active_tenant_id=_current_chat_tenant(),
+            )
+            conversation_id = str(conversation["id"])
+            active_conversation_id = conversation_id
+            if conversation.get("active_tenant_id") is not None:
+                session_tenant_ref[0] = int(conversation["active_tenant_id"])
+                if deps.set_request_tenant_id is not None:
+                    deps.set_request_tenant_id(session_tenant_ref[0])
+            deps.bind_conversation_memory(connection_id, conversation_id)
+            return conversation_id
 
         # Buffer for accumulating audio chunks
         audio_buffer = bytearray()
-        first_audio_arrival = None  # Timestamp of when the first chunk of a speech segment arrived
-        speech_start_time = None    # When VAD (energy) first detected speech
-        silence_counter = 0  # Count consecutive silent chunks
-        # STABILIZATION Part 6: Silence detection tuned via benchmark.
-        # STT is ultra-fast (32ms on CPU) so we can afford to wait a bit longer
-        # for true silence to avoid splitting multi-word phrases.
-        # 14 chunks × ~50ms each = ~700ms — bridges natural inter-word pauses.
-        silence_chunks_needed = 12           # ~600ms true silence before transcription fires
-        silence_threshold_energy = 0.008    # Strict: only truly quiet audio counts as silence
-        # Per-connection language setting (can be updated by set_language control message)
+        first_audio_arrival = None
+        speech_start_time = None
+        silence_counter = 0
+        silence_chunks_needed = 12
+        silence_threshold_energy = 0.008
         session_language = "en"
         session_language_ref = [session_language]
         active_conversation_id: str | None = None
         current_ws_conversation_id: str | None = None
         stt_disabled_notified = False
-
-        def _activate_conversation(requested_id: str | None = None) -> str:
-            nonlocal active_conversation_id
-            clean_requested = str(requested_id or "").strip() or active_conversation_id
-            conversation = deps.get_or_create_conversation(clean_requested, tenant_id=ws_tenant_id, owner=ws_owner)
-            conversation_id = str(conversation["id"])
-            active_conversation_id = conversation_id
-            deps.bind_conversation_memory(connection_id, conversation_id)
-            return conversation_id
 
         def _conversation_ws(conversation_id: str) -> WebSocket:
             return cast(WebSocket, ConversationCaptureWebSocket(
@@ -111,9 +149,22 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
                 get_stable_memory_snapshot=deps.get_stable_memory_snapshot,
             )
 
+        # Per-connection message rate bucket: max 30 messages per 60s.
+        _ws_msg_bucket = {"count": 0, "reset": time.monotonic() + 60}
+        _WS_MSG_RATE_LIMIT = 30
+
         try:
             while True:
                 msg = await websocket.receive()
+                # Rate-limit incoming messages per connection to prevent flooding.
+                _now_mono = time.monotonic()
+                if _now_mono > _ws_msg_bucket["reset"]:
+                    _ws_msg_bucket["count"] = 0
+                    _ws_msg_bucket["reset"] = _now_mono + 60
+                _ws_msg_bucket["count"] += 1
+                if _ws_msg_bucket["count"] > _WS_MSG_RATE_LIMIT:
+                    await websocket.send_json({"type": "error", "message": "Rate limit exceeded. Please wait before sending more messages."})
+                    continue
                 if msg["type"] == "websocket.receive":
                     if "bytes" in msg and msg["bytes"] is not None:
                         audio = msg["bytes"]
@@ -310,9 +361,66 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
                                         continue
                                     conversation_id = _activate_conversation(requested_conversation_id)
                                     current_ws_conversation_id = conversation_id
+                                    if deps.active_ws_tenants is not None:
+                                        deps.active_ws_tenants[connection_id] = session_tenant_ref[0]
                                     await websocket.send_json({
                                         "type": "conversation",
                                         "conversation_id": conversation_id,
+                                        "active_tenant_id": session_tenant_ref[0],
+                                    })
+
+                                elif action == "set_active_tenant":
+                                    raw_tid = payload.get("tenant_id")
+                                    if raw_tid is None:
+                                        continue
+                                    if deps.assert_chat_tenant_allowed is not None:
+                                        new_tid = deps.assert_chat_tenant_allowed(user, raw_tid)
+                                    else:
+                                        new_tid = int(raw_tid)
+                                    from_tid = session_tenant_ref[0]
+                                    session_tenant_ref[0] = new_tid
+                                    if deps.set_request_tenant_id is not None:
+                                        deps.set_request_tenant_id(new_tid)
+                                    if deps.active_ws_tenants is not None:
+                                        deps.active_ws_tenants[connection_id] = new_tid
+                                    conv_id = active_conversation_id or current_ws_conversation_id
+                                    if conv_id and deps.set_conversation_active_tenant is not None:
+                                        stored_tid = None
+                                        try:
+                                            from backend import chat_store as _chat_store_mod
+
+                                            stored_tid = _chat_store_mod.get_active_tenant_id(conv_id, ws_owner)
+                                        except Exception:
+                                            stored_tid = None
+                                        if stored_tid is not None and int(stored_tid) == int(new_tid):
+                                            logger.info(
+                                                "[CHAT] skip duplicate set_active_tenant id=%s tenant=%s",
+                                                conv_id,
+                                                new_tid,
+                                            )
+                                        else:
+                                            try:
+                                                deps.set_conversation_active_tenant(
+                                                    conv_id,
+                                                    new_tid,
+                                                    ws_owner,
+                                                    from_tenant_id=from_tid,
+                                                    emit_system_message=True,
+                                                )
+                                            except Exception:
+                                                logger.exception("[CHAT] set_active_tenant failed id=%s", conv_id)
+                                    from_name = (
+                                        deps.get_tenant_name(from_tid) if deps.get_tenant_name else str(from_tid)
+                                    )
+                                    to_name = (
+                                        deps.get_tenant_name(new_tid) if deps.get_tenant_name else str(new_tid)
+                                    )
+                                    await websocket.send_json({
+                                        "type": "tenant_switched",
+                                        "from_tenant_id": from_tid,
+                                        "to_tenant_id": new_tid,
+                                        "from_name": from_name,
+                                        "to_name": to_name,
                                     })
 
                             elif "text" in payload:
@@ -322,7 +430,7 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
                                     payload=payload,
                                     user=user,
                                     session_language_ref=session_language_ref,
-                                    ws_tenant_id=ws_tenant_id,
+                                    ws_tenant_ref=session_tenant_ref,
                                     ws_owner=ws_owner,
                                     activate_conversation=_activate_conversation,
                                     conversation_ws_factory=_conversation_ws,

@@ -20,9 +20,10 @@ BLOCKED_WORDS = [
     # Discriminatory terms
     'nigger', 'faggot', 'retard', 'retarded', 'chink', 'kike', 'spic',
     
-    # Sensitive business terms that AI should never promise
-    'refund guaranteed', 'free money', 'lawsuit', 'sue us',
-    'illegal', 'scam', 'fraud',
+    # Risky promises the AI should never make (multi-word phrases only, so
+    # legitimate banking-support topics like "fraud", "scam" and "illegal
+    # activity" are NOT blocked — those are core support content for a bank).
+    'refund guaranteed', 'free money', 'sue us',
 ]
 
 # PII patterns (structured / high-risk only here; email/phone handled in contains_pii)
@@ -167,13 +168,16 @@ def check_relevance(response: str, user_query: str) -> bool:
 
 
 def add_uncertainty_disclaimer(text: str) -> str:
-    """Add disclaimer to uncertain responses."""
-    disclaimer = "\n\n*Note: I'm not completely certain about this. You may want to verify with our support team.*"
-    
+    """Add a soft disclaimer to uncertain responses without sounding robotic."""
+    disclaimer = (
+        "\n\nIf you'd like, I can double-check with our team—or feel free to rephrase "
+        "your question and I'll take another look."
+    )
+
     # Don't add if already has a disclaimer
-    if "not completely certain" in text.lower() or "verify" in text.lower():
+    if "double-check" in text.lower() or "rephrase" in text.lower():
         return text
-    
+
     return text + disclaimer
 
 

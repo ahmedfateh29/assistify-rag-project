@@ -8,7 +8,10 @@ import {
 } from "@/src/types/kbPipeline";
 
 export interface KnowledgeFile {
+  /** Canonical on-disk name used for API calls (may include upload prefix). */
   filename: string;
+  /** Human-friendly label for the UI. */
+  displayName: string;
   size?: number;
   uploaded_at?: string;
   indexed_chunks?: number;
@@ -24,22 +27,33 @@ interface RawKnowledgeFile {
   indexed_chunks?: number;
 }
 
-const POLL_INTERVAL_MS = 1000;
+const STORED_PREFIX_RE = /^[0-9a-f]{8}_(.+)$/i;
+
+function stripStoredPrefix(name: string): string {
+  const match = STORED_PREFIX_RE.exec(name);
+  return match ? match[1] : name;
+}
 
 function normalizeFile(entry: RawKnowledgeFile): KnowledgeFile {
-  const filename =
-    entry.filename ||
-    entry.display_name ||
-    entry.name ||
+  const stored =
     entry.stored_name ||
+    entry.filename ||
+    entry.name ||
     "";
+  const display =
+    entry.display_name ||
+    (stored ? stripStoredPrefix(stored) : "") ||
+    stored;
   return {
-    filename,
+    filename: stored,
+    displayName: display,
     size: entry.size,
     uploaded_at: entry.modified ? new Date(entry.modified * 1000).toISOString() : undefined,
     indexed_chunks: entry.indexed_chunks,
   };
 }
+
+const POLL_INTERVAL_MS = 1000;
 
 function parseFileList(data: RawKnowledgeFile[] | { files?: RawKnowledgeFile[] }): KnowledgeFile[] {
   const raw = Array.isArray(data) ? data : data.files ?? [];
@@ -58,9 +72,26 @@ function parseKbStatus(data: Record<string, unknown>): KbPipelineStatus {
     percent: typeof data.percent === "number" ? data.percent : undefined,
     indexed_chunks: typeof data.indexed_chunks === "number" ? data.indexed_chunks : undefined,
     total_chunks: typeof data.total_chunks === "number" ? data.total_chunks : undefined,
+    collection_chunks: typeof data.collection_chunks === "number" ? data.collection_chunks : undefined,
     stage_timings: data.stage_timings as Record<string, number> | undefined,
     updated_at: typeof data.updated_at === "number" ? data.updated_at : undefined,
+    proxy_degraded: data.proxy_degraded === true,
   };
+}
+
+function logKbStatusReceived(status: KbPipelineStatus): void {
+  console.info("[KB_STATUS_RECEIVED]", {
+    updated_at: status.updated_at,
+    state: status.state,
+    stage: status.stage,
+  });
+}
+
+function logKbStatusIgnoredStale(existingUpdatedAt: number, incomingUpdatedAt: number | undefined): void {
+  console.info("[KB_STATUS_IGNORED_STALE]", {
+    existing_updated_at: existingUpdatedAt,
+    incoming_updated_at: incomingUpdatedAt,
+  });
 }
 
 export function useKnowledge() {
@@ -69,6 +100,55 @@ export function useKnowledge() {
   const [loading, setLoading] = useState(true);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const refreshRef = useRef<(() => Promise<void>) | null>(null);
+  /** Highest backend updated_at applied to the UI — stale polls cannot regress past this. */
+  const appliedUpdatedAtRef = useRef<number | undefined>(undefined);
+  /** True while a kb_status HTTP request started by the poll loop is in flight. */
+  const pollInFlightRef = useRef(false);
+  /** Set when READY is observed so late poll completions are ignored. */
+  const pollingStoppedRef = useRef(false);
+
+  const applyKbStatus = useCallback((status: KbPipelineStatus): boolean => {
+    logKbStatusReceived(status);
+
+    const incomingUpdatedAt = status.updated_at;
+    const existingUpdatedAt = appliedUpdatedAtRef.current;
+    const incomingReady = status.state === "ready";
+
+    // READY always wins — even if the proxy flagged the response as degraded.
+    // The backend is authoritative for completion; a proxy_degraded flag on a
+    // READY response must not prevent the UI from advancing to the ready state.
+    if (incomingReady) {
+      if (incomingUpdatedAt !== undefined) {
+        appliedUpdatedAtRef.current = incomingUpdatedAt;
+      }
+      setPipelineStatus(status);
+      return true;
+    }
+
+    // Non-READY proxy_degraded responses are non-authoritative — keep polling
+    // without regressing the UI to an earlier state.
+    if (status.proxy_degraded) {
+      console.info("[KB_STATUS_IGNORED_DEGRADED]", { message: status.message });
+      return false;
+    }
+
+    // Only apply monotonic guard when both sides have timestamps.
+    if (
+      existingUpdatedAt !== undefined
+      && incomingUpdatedAt !== undefined
+      && incomingUpdatedAt < existingUpdatedAt
+    ) {
+      logKbStatusIgnoredStale(existingUpdatedAt, incomingUpdatedAt);
+      return false;
+    }
+
+    if (incomingUpdatedAt !== undefined) {
+      appliedUpdatedAtRef.current = incomingUpdatedAt;
+    }
+
+    setPipelineStatus(status);
+    return true;
+  }, []);
 
   const stopKbPolling = useCallback(() => {
     if (pollRef.current) {
@@ -80,9 +160,9 @@ export function useKnowledge() {
   const fetchKbStatus = useCallback(async (): Promise<KbPipelineStatus> => {
     const data = await apiClient.get<Record<string, unknown>>("/api/knowledge/kb_status");
     const status = parseKbStatus(data);
-    setPipelineStatus(status);
+    applyKbStatus(status);
     return status;
-  }, []);
+  }, [applyKbStatus]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -92,32 +172,57 @@ export function useKnowledge() {
         apiClient.get<Record<string, unknown>>("/api/knowledge/kb_status"),
       ]);
       setFiles(parseFileList(list));
-      setPipelineStatus(parseKbStatus(kb));
+      applyKbStatus(parseKbStatus(kb));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyKbStatus]);
 
   refreshRef.current = refresh;
 
+  const handlePipelineReady = useCallback(async () => {
+    pollingStoppedRef.current = true;
+    stopKbPolling();
+    await refreshRef.current?.();
+  }, [stopKbPolling]);
+
   const startKbPolling = useCallback(() => {
     stopKbPolling();
+    pollingStoppedRef.current = false;
+
     const poll = async () => {
+      if (pollingStoppedRef.current || pollInFlightRef.current) {
+        return;
+      }
+
+      pollInFlightRef.current = true;
       try {
-        const status = await fetchKbStatus();
+        const data = await apiClient.get<Record<string, unknown>>("/api/knowledge/kb_status");
+        if (pollingStoppedRef.current) {
+          return;
+        }
+
+        const status = parseKbStatus(data);
+        const applied = applyKbStatus(status);
+        if (!applied) {
+          return;
+        }
+
         if (!isPipelineBusy(status.state)) {
-          stopKbPolling();
-          await refreshRef.current?.();
+          await handlePipelineReady();
         }
       } catch {
         // keep polling on transient errors
+      } finally {
+        pollInFlightRef.current = false;
       }
     };
+
     void poll();
     pollRef.current = setInterval(() => {
       void poll();
     }, POLL_INTERVAL_MS);
-  }, [fetchKbStatus, stopKbPolling]);
+  }, [applyKbStatus, handlePipelineReady, stopKbPolling]);
 
   const upload = useCallback(
     async (file: File) => {
@@ -127,6 +232,7 @@ export function useKnowledge() {
       const res = await secureFetch("/proxy/upload_rag", { method: "POST", body: form });
       if (!res.ok) {
         stopKbPolling();
+        pollingStoppedRef.current = false;
         throw new Error("Upload failed");
       }
       await fetchKbStatus();
@@ -140,8 +246,10 @@ export function useKnowledge() {
       await apiClient.post("/api/knowledge/reindex-all", {});
     } catch (err) {
       stopKbPolling();
+      pollingStoppedRef.current = false;
       throw err;
     }
+    pollingStoppedRef.current = true;
     stopKbPolling();
     await refresh();
   }, [startKbPolling, stopKbPolling, refresh]);
@@ -153,8 +261,10 @@ export function useKnowledge() {
         await apiClient.post(`/api/knowledge/reindex-file?filename=${encodeURIComponent(filename)}`, {});
       } catch (err) {
         stopKbPolling();
+        pollingStoppedRef.current = false;
         throw err;
       }
+      pollingStoppedRef.current = true;
       stopKbPolling();
       await refresh();
     },
@@ -162,7 +272,10 @@ export function useKnowledge() {
   );
 
   const clearCache = useCallback(async () => {
-    await apiClient.post("/api/knowledge/clear-cache", {});
+    const data = await apiClient.post<{ message?: string }>("/api/knowledge/clear-cache", {});
+    return (
+      data?.message ?? "Cache cleared — next chat will use fresh knowledge base data."
+    );
   }, []);
 
   const remove = useCallback(
@@ -182,9 +295,13 @@ export function useKnowledge() {
   }, []);
 
   const getPdfData = useCallback(async (filename: string) => {
-    return apiClient.get<{ data?: string; base64?: string }>(
+    return apiClient.get<{ bytes_b64?: string; data?: string; base64?: string }>(
       `/api/knowledge/files/${encodeURIComponent(filename)}/pdf-data`,
     );
+  }, []);
+
+  const previewUrl = useCallback((filename: string) => {
+    return `/api/knowledge/files/${encodeURIComponent(filename)}/preview`;
   }, []);
 
   const updateFileContent = useCallback(
@@ -200,13 +317,30 @@ export function useKnowledge() {
   }, []);
 
   useEffect(() => {
-    refresh()
-      .then(() => fetchKbStatus())
-      .then((status) => {
-        if (isPipelineBusy(status.state)) startKbPolling();
-      })
-      .catch(() => {});
-    return () => stopKbPolling();
+    let cancelled = false;
+
+    const bootstrap = async () => {
+      try {
+        await refresh();
+        if (cancelled) return;
+        const status = await fetchKbStatus();
+        if (cancelled) return;
+        if (isPipelineBusy(status.state)) {
+          startKbPolling();
+        }
+      } catch {
+        if (!cancelled) {
+          // Self-heal: start polling even when initial refresh fails.
+          startKbPolling();
+        }
+      }
+    };
+
+    void bootstrap();
+    return () => {
+      cancelled = true;
+      stopKbPolling();
+    };
   }, [refresh, fetchKbStatus, startKbPolling, stopKbPolling]);
 
   const isPipelineBusyState = isPipelineBusy(pipelineStatus?.state);
@@ -224,6 +358,7 @@ export function useKnowledge() {
     remove,
     getFileContent,
     getPdfData,
+    previewUrl,
     updateFileContent,
     downloadUrl,
   };

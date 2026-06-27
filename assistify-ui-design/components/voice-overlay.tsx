@@ -2,6 +2,7 @@
 
 import { Mic, MicOff, RotateCcw, Square, X } from "lucide-react";
 import type { VoiceState } from "@/src/hooks/useVoiceMode";
+import { MarkdownContent } from "./markdown-content";
 
 const STATE_COLORS: Record<VoiceState, string> = {
   idle: "from-[#6c63ff] to-[#10a37f]",
@@ -79,9 +80,13 @@ export function VoiceOverlay({
             </div>
           )}
           {assistantText && (
-            <div className="w-full rounded-lg bg-[#171717] px-4 py-2 text-sm text-[#f6c33c]">
-              <span className="text-xs text-[#9ca3af]">Assistify: </span>
-              {assistantText}
+            <div className="w-full rounded-lg border border-[#333] bg-[#171717] px-4 py-3 text-sm">
+              <span className="mb-1 block text-xs text-[#9ca3af]">Assistify</span>
+              <MarkdownContent
+                content={assistantText}
+                variant="assistant"
+                isStreaming={state === "transcribing"}
+              />
             </div>
           )}
 

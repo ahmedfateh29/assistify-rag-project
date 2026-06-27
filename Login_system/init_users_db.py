@@ -11,8 +11,32 @@ from Login_system.dev_users import dev_user_summary  # noqa: E402
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Recreate users.db with default dev accounts.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Required to delete an existing users.db (destructive).",
+    )
+    args = parser.parse_args()
+
     db_path = Path(DB_PATH)
     if db_path.exists():
+        if not args.force:
+            print(
+                f"[ERROR] {db_path} already exists. This script DELETES all users.",
+                file=sys.stderr,
+            )
+            print(
+                "  To recreate dev seed only: python Login_system/init_users_db.py --force",
+                file=sys.stderr,
+            )
+            print(
+                "  To restore a wiped account: python scripts/restore_ahmed_user.py",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         db_path.unlink()
         print(f"Deleted existing {db_path}")
 

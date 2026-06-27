@@ -18,8 +18,10 @@ export interface KbPipelineStatus {
   percent?: number;
   indexed_chunks?: number;
   total_chunks?: number;
+  collection_chunks?: number;
   stage_timings?: Record<string, number>;
   updated_at?: number;
+  proxy_degraded?: boolean;
 }
 
 export const KB_PIPELINE_STEPS: KbPipelineStage[] = [

@@ -125,6 +125,14 @@ export function useTenants() {
     [refresh],
   );
 
+  const deleteTenant = useCallback(
+    async (id: number, confirmSlug: string) => {
+      await apiClient.delete(`/api/tenants/${id}`, { confirm_slug: confirmSlug });
+      await refresh();
+    },
+    [refresh],
+  );
+
   useEffect(() => {
     refresh().catch(() => {});
   }, [refresh]);
@@ -140,5 +148,6 @@ export function useTenants() {
     updateManager,
     deleteManager,
     updateSettings,
+    deleteTenant,
   };
 }

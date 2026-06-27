@@ -27,6 +27,7 @@ from scripts.service_inventory import (  # noqa: E402
     LEGACY_PORTS,
     PORT_OLLAMA,
     PORT_PIPER,
+    close_assistify_service_windows,
     default_service_specs,
     find_pids_on_port_windows,
     kill_listeners_on_ports,
@@ -48,15 +49,18 @@ from scripts.project_start_server import (  # noqa: E402
 from scripts.ollama_bootstrap import (  # noqa: E402
     ensure_ollama_model,
     ensure_ollama_running,
+    ollama_http_ready,
     ollama_port_ready,
     print_ollama_failure_hints,
     resolve_ollama_exe,
 )
 from scripts.react_ui_build import ensure_react_ui_built  # noqa: E402
+from scripts.public_tunnel import PublicTunnel, print_access_urls  # noqa: E402
 from scripts.launch_windows.write_launch_scripts import (  # noqa: E402
     LAUNCH_DIR,
     write_service_bats,
 )
+from scripts.python_env import python_env_label, resolve_project_python  # noqa: E402
 
 assert REPO_ROOT == _REPO
 
@@ -83,15 +87,6 @@ def ensure_sqlite3_or_exit() -> None:
         print("  See: docs/WINDOWS_TROUBLESHOOTING.md")
         print()
         raise SystemExit(1)
-
-
-def _resolve_python_exe() -> str:
-    user_profile = Path(os.environ.get("USERPROFILE", str(Path.home())))
-    for base_name in ("miniconda3", "anaconda3", "Miniconda3", "Anaconda3"):
-        candidate = user_profile / base_name / "envs" / "assistify_main" / "python.exe"
-        if candidate.exists():
-            return str(candidate)
-    return sys.executable
 
 
 def spawn_bat_window(title: str, bat_path: Path) -> None:
@@ -125,6 +120,7 @@ def build_rag_env(args) -> dict:
 
 
 def generate_launch_bats(args, python_exe: str) -> dict[str, Path]:
+    capture_logs = args.service_logs or args.public
     return write_service_bats(
         REPO_ROOT,
         python_exe,
@@ -134,6 +130,7 @@ def generate_launch_bats(args, python_exe: str) -> dict[str, Path]:
         rag_env=build_rag_env(args),
         piper_env=_piper_voice_env() or {},
         reload_flag=args.reload,
+        capture_logs=capture_logs,
     )
 
 
@@ -192,12 +189,12 @@ async def _service_is_healthy(host: str, port: int, ready_path: str) -> bool:
     return await http_check(url)
 
 
-async def _free_port_listeners(port: int, *, label: str) -> None:
+async def _free_port_listeners(port: int, *, label: str, exclude_ollama: bool = False) -> None:
     pids = find_pids_on_port_windows(port)
     if not pids:
         return
     print(f"[COORDINATOR] Freed port {port} before {label} (PIDs: {pids})")
-    kill_listeners_on_ports([port])
+    kill_listeners_on_ports([port], exclude_ollama=exclude_ollama)
     await asyncio.sleep(PORT_KILL_SETTLE_SEC)
 
 
@@ -241,14 +238,22 @@ async def start_service_sequential(
         if await _service_is_healthy(host, port, ready_path):
             print(f"[{name}] Already healthy on port {port} — skipping new window")
             return True
-        if find_pids_on_port_windows(port):
-            print(f"[{name}] Stale listener on port {port} — freeing before spawn")
-            await _free_port_listeners(port, label=name)
+    elif name == "Ollama":
+        if ollama_http_ready():
+            print(f"[{name}] API healthy — opening status window")
+        elif find_pids_on_port_windows(port):
+            print(f"[{name}] Port {port} open but API unhealthy — freeing stale listener")
+            await _free_port_listeners(port, label=name, exclude_ollama=False)
     elif not pre_kill_port:
         row = status_by_name.get(name)
-        if row and row.listening:
+        if row and row.listening and await _service_is_healthy(host, port, ready_path):
             print(f"[{name}] Already running on port {row.port} — skipping new window")
             return True
+
+    if find_pids_on_port_windows(port):
+        print(f"[{name}] Stale listener on port {port} — freeing before spawn")
+        exclude_ollama = name != "Ollama"
+        await _free_port_listeners(port, label=name, exclude_ollama=exclude_ollama)
 
     print(f"[COORDINATOR] Starting {name} in a new window...")
     spawn_bat_window(window_title, bat_path)
@@ -268,8 +273,9 @@ async def run_split_launcher(args) -> int:
     if args.ui_build_only:
         return 0 if ensure_react_ui_built(skip=args.skip_ui_build) else 1
 
-    python_exe = _resolve_python_exe()
+    python_exe = str(resolve_project_python(REPO_ROOT))
     print(f"[COORDINATOR] Repo root : {REPO_ROOT}")
+    print(f"[COORDINATOR] Python env: {python_env_label(Path(python_exe))}")
     print(f"[COORDINATOR] Python    : {python_exe}")
     print(f"[COORDINATOR] Launchers : {LAUNCH_DIR}")
 
@@ -285,6 +291,10 @@ async def run_split_launcher(args) -> int:
     legacy_still_up = [p for p in LEGACY_PORTS if find_pids_on_port_windows(p)]
 
     if args.kill_ports:
+        closed_windows = close_assistify_service_windows()
+        if closed_windows:
+            print(f"[COORDINATOR] Closed prior Assistify windows: {', '.join(closed_windows)}")
+            await asyncio.sleep(1.0)
         ports = list(LEGACY_PORTS) + [SERVICES[0]["port"], SERVICES[1]["port"], SERVICES[2]["port"]]
         if not args.no_piper:
             ports.append(PORT_PIPER)
@@ -325,7 +335,7 @@ async def run_split_launcher(args) -> int:
     elif args.skip_ui_build:
         ensure_react_ui_built(skip=True)
 
-    ollama_ok = args.no_ollama or ollama_port_ready()
+    ollama_ok = args.no_ollama or ollama_http_ready()
 
     if not args.no_ollama:
         if args.restart_ollama:
@@ -357,11 +367,11 @@ async def run_split_launcher(args) -> int:
                 force_spawn=True,
                 failure_hint="Install Ollama or use --no-ollama if managed externally",
             )
-            ollama_ok = ok and ollama_port_ready()
+            ollama_ok = ok and ollama_http_ready()
             if not ollama_ok:
                 print("[COORDINATOR] Ollama window failed — trying Python bootstrap fallback...")
                 await ensure_ollama_running(skip=False)
-                ollama_ok = ollama_port_ready()
+                ollama_ok = ollama_http_ready()
         if not ollama_ok:
                 failures.append("Ollama")
                 print_ollama_failure_hints()
@@ -413,7 +423,7 @@ async def run_split_launcher(args) -> int:
     ]
 
     print()
-    print("[COORDINATOR] Starting services sequentially (spawn → wait → next)...")
+    print("[COORDINATOR] Starting services sequentially (spawn -> wait -> next)...")
     print("-" * 72)
 
     for key, display, host, port, ready_path, skipped, hint in startup_plan:
@@ -454,13 +464,36 @@ async def run_split_launcher(args) -> int:
         print(f"  Failed or timed out: {', '.join(failures)}")
         print("  Check the matching Assistify * windows for error output.")
     print("=" * 72)
-    print(f"  Open: http://127.0.0.1:{SERVICES[2]['port']}/login")
-    print(f"  Chat UI: http://127.0.0.1:{SERVICES[2]['port']}/frontend/  (after login)")
+    login_port = SERVICES[2]["port"]
+    public_url: str | None = None
+    tunnel: PublicTunnel | None = None
+    if args.public and all_ok and not args.no_login:
+        tunnel = PublicTunnel(port=login_port, provider=args.tunnel_provider)
+        public_url = await tunnel.start_async()
+
+    print_access_urls(
+        login_port=login_port,
+        rag_port=SERVICES[1]["port"],
+        llm_port=SERVICES[0]["port"],
+        public_base=public_url,
+        tunnel_provider=tunnel.resolved_provider if tunnel else None,
+        service_logs=args.service_logs or args.public,
+    )
     print("  Dev login: admin / admin  or  superadmin / superadmin")
     if all_ok:
         print()
         print("  Running stack verification...")
         print("  Login window may show HTTP 401 on /api/my-profile during verification — expected when logged out.")
+        if not args.no_ollama and not ollama_http_ready():
+            print("[COORDINATOR] Ollama not responding before verify — attempting recovery...")
+            await ensure_ollama_running(skip=False)
+            if ollama_http_ready():
+                await ensure_ollama_model(skip_pull=args.skip_model_pull)
+            else:
+                print("[COORDINATOR] Ollama still unreachable after recovery attempt.")
+                all_ok = False
+                if "Ollama" not in failures:
+                    failures.append("Ollama (verify)")
         try:
             from scripts.verify_stack import run_checks
 
@@ -490,6 +523,9 @@ async def run_split_launcher(args) -> int:
             await asyncio.sleep(3600)
     except KeyboardInterrupt:
         print("\n[COORDINATOR] Exiting. Service windows are still running — close them manually.")
+        if tunnel is not None:
+            print("[TUNNEL] Stopping tunnel...")
+            tunnel.stop()
         return 0
 
     return 0 if all_ok else 1

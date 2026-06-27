@@ -24,6 +24,11 @@ class VoiceWebSocketDeps:
     session_cookie: str = "session"
     serializer: Any = None
     set_request_tenant_id: Optional[Callable[[int], None]] = None
+    resolve_chat_tenant_id: Optional[Callable] = None
+    set_conversation_active_tenant: Optional[Callable] = None
+    assert_chat_tenant_allowed: Optional[Callable] = None
+    get_tenant_name: Optional[Callable] = None
+    default_tenant_id: int = 1
     get_memory_snapshot: Callable = lambda: {"gpu_reserved_mb": 0, "gpu_allocated_mb": 0, "cpu_rss_mb": 0}
     get_stable_memory_snapshot: Callable = None
     on_ws_connect: Optional[Callable] = None

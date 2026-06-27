@@ -470,3 +470,25 @@ def get_kb_stats(days: int = 30, tenant_id=None) -> dict:
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def purge_tenant_analytics(tenant_id: int) -> dict:
+    """Delete analytics rows scoped to a tenant."""
+    tid = _coerce_tenant_id(tenant_id)
+    counts: dict[str, int] = {}
+    tables = (
+        "satisfaction_ratings",
+        "usage_stats",
+        "session_analytics",
+        "kb_document_versions",
+    )
+    conn = sqlite3.connect(ANALYTICS_DB)
+    cursor = conn.cursor()
+    try:
+        for table in tables:
+            cursor.execute(f"DELETE FROM {table} WHERE tenant_id = ?", (tid,))
+            counts[table] = cursor.rowcount if cursor.rowcount >= 0 else 0
+        conn.commit()
+    finally:
+        conn.close()
+    return counts

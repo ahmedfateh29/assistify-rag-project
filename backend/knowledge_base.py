@@ -69,8 +69,30 @@ except Exception as e:
     logger.error(f"Fallback to CPU due to exception: {e}", exc_info=True)
     device = 'cpu'
 
-# Initialize embedding model with GPU support
+# Initialize embedding model with GPU support (shared by VectorStore retrieval)
 embedder = SentenceTransformer(EMBEDDING_MODEL, device=device)
+
+
+def get_shared_embedder():
+    """Return the singleton SentenceTransformer used for ingestion and retrieval."""
+    return embedder
+
+
+def _embedding_batch_sizes() -> tuple[int, int]:
+    """Return (embed_batch, upsert_batch) tuned for available GPU VRAM."""
+    if device != "cuda":
+        return 64, 100
+    upsert_batch = 64
+    try:
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        # 6–8 GB cards sharing VRAM with Ollama need small embed batches to avoid hangs/OOM.
+        if total_gb <= 8.0:
+            return 8, upsert_batch
+        if total_gb <= 12.0:
+            return 16, upsert_batch
+        return 32, 128
+    except Exception:
+        return 8, upsert_batch
 
 
 def _e5_passage(text: str) -> str:
@@ -665,6 +687,28 @@ def chunk_and_add_document(
     from datetime import datetime as _dt
     total_t0 = _time.perf_counter()
     chunking_t0 = _time.perf_counter()
+    _TABLE_DATA_MARKER = "[TABLE DATA]"
+
+    def _split_prose_and_table_blocks(text_block: str) -> list[str]:
+        """Never merge prose with [TABLE DATA] blocks in the same structured unit."""
+        block = str(text_block or "")
+        if _TABLE_DATA_MARKER not in block:
+            return [block] if block.strip() else []
+        parts: list[str] = []
+        remaining = block
+        while remaining:
+            idx = remaining.find(_TABLE_DATA_MARKER)
+            if idx < 0:
+                tail = remaining.strip()
+                if tail:
+                    parts.append(tail)
+                break
+            before = remaining[:idx].strip()
+            if before:
+                parts.append(before)
+            parts.append(remaining[idx:].strip())
+            break
+        return parts
 
     def _emit_progress(event: dict) -> None:
         if progress_callback is None:
@@ -781,6 +825,14 @@ def chunk_and_add_document(
         line = (text_block or "").strip()
         if not line:
             return False
+        # Pipe-delimited rows (table header rows AND single-column
+        # "Label | $value" fee rows) are tabular data, not section headings.
+        # Treating such a row as a heading caused it to be either prepended to
+        # every data row or promoted to a chunk title; keeping it inline
+        # preserves column semantics (e.g.
+        # "Account | Monthly fee | Min. balance | ..." and "Outgoing wire | $15").
+        if "|" in line:
+            return False
         words = line.split()
         if len(words) > 14:
             return False
@@ -792,6 +844,37 @@ def chunk_and_add_document(
             return False
         titleish = sum(1 for w in words if w[:1].isupper())
         return titleish >= max(1, len(words) // 2)
+
+    def _split_at_numbered_headings(raw_para: str) -> list[str]:
+        """Isolate numbered section heading lines from surrounding prose.
+
+        Headings like '1. About Meridian Financial Services' that appear on
+        their own line in the PDF but share a single-newline paragraph block
+        with adjacent prose survive _normalize_para unchanged — merging the
+        heading into the prose and contaminating chunk text.
+
+        This function splits raw_para at such lines before _normalize_para
+        is called, so each heading arrives as an isolated string that
+        _is_heading() can recognise and consume as a section boundary.
+        """
+        lines = raw_para.split('\n')
+        if len(lines) <= 1:
+            return [raw_para]
+        _num_heading_re = _re.compile(r'^\s*\d{1,2}\.\s+[A-Z]')
+        groups: list[str] = []
+        current: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and _num_heading_re.match(stripped) and _is_heading(stripped):
+                if current:
+                    groups.append('\n'.join(current))
+                    current = []
+                groups.append(stripped)
+            else:
+                current.append(line)
+        if current:
+            groups.append('\n'.join(current))
+        return [g for g in groups if g.strip()]
 
     def _infer_chunk_role(text_block: str, section_val: str, title_val: str, chapter_val: str, page_val: Optional[int]) -> str:
         """
@@ -872,98 +955,106 @@ def chunk_and_add_document(
         page_hint_chapter = page_chapter_hints.get(page_num) if page_num is not None else ""
         page_is_toc = bool(page_toc_flags.get(page_num, False)) if page_num is not None else False
         for raw_para in raw_paragraphs:
-            para = _normalize_para(raw_para)
-            if len(para) < 12 and total_doc_words <= 8000:
-                if _re.search(r'\d', para):
-                    pass
-                else:
-                    continue
-            elif len(para) < 20:
-                continue
-            if _is_noise_chunk(para):
-                continue
+            for raw_sub in _split_at_numbered_headings(raw_para):
+                para = _normalize_para(raw_sub)
+                for sub_para in _split_prose_and_table_blocks(para):
+                    sub_para = _normalize_para(sub_para)
+                    is_table_block = sub_para.strip().startswith(_TABLE_DATA_MARKER)
+                    # Section headings (incl. short numbered ones like
+                    # "2. Deposit Accounts" / "3. Loan Payments") must never be
+                    # dropped by the short-fragment length filters below. If a
+                    # heading is dropped it never sets current_heading, so the
+                    # next section's body inherits the PREVIOUS section's title
+                    # and merges into its chunk (cross-section contamination).
+                    is_heading_line = (not is_table_block) and _is_heading(sub_para)
+                    if not is_heading_line and not is_table_block and len(sub_para) < 12 and total_doc_words <= 8000:
+                        if _re.search(r'\d', sub_para):
+                            pass
+                        else:
+                            continue
+                    elif not is_heading_line and not is_table_block and len(sub_para) < 20:
+                        continue
+                    if not is_table_block and _is_noise_chunk(sub_para):
+                        continue
 
-            para_chapter_hits = len(_re.findall(r'(?i)\bchapter\s+\d+\b', para))
-            para_section_hits = len(_re.findall(r'\b\d{1,2}\.\d{1,2}\b', para))
-            para_is_toc = (
-                page_is_toc
-                or "table of contents" in para.lower()
-                or bool(toc_line_pattern.search(para))
-                or (para_chapter_hits >= 3 and para_section_hits >= 3)
-            )
+                    para_chapter_hits = len(_re.findall(r'(?i)\bchapter\s+\d+\b', sub_para))
+                    para_section_hits = len(_re.findall(r'\b\d{1,2}\.\d{1,2}\b', sub_para))
+                    para_is_toc = (
+                        page_is_toc
+                        or "table of contents" in sub_para.lower()
+                        or bool(toc_line_pattern.search(sub_para))
+                        or (para_chapter_hits >= 3 and para_section_hits >= 3)
+                    )
 
-            if para_is_toc:
-                structured_units.append({
-                    "text": para,
-                    "page": page_num,
-                    "unit": current_unit,
-                    "section": "Table of Contents",
-                    "heading": "Table of Contents",
-                    "title": "Table of Contents",
-                    "chapter": "",
-                })
-                continue
+                    if para_is_toc:
+                        structured_units.append({
+                            "text": sub_para,
+                            "page": page_num,
+                            "unit": current_unit,
+                            "section": "Table of Contents",
+                            "heading": "Table of Contents",
+                            "title": "Table of Contents",
+                            "chapter": "",
+                        })
+                        continue
 
-            if page_hint_chapter and (not current_chapter or str(current_section or "").lower().startswith("page ")):
-                current_chapter = page_hint_chapter
-                if not current_section or str(current_section).lower().startswith("page "):
-                    current_section = page_hint_chapter
+                    if page_hint_chapter and (not current_chapter or str(current_section or "").lower().startswith("page ")):
+                        current_chapter = page_hint_chapter
+                        if not current_section or str(current_section).lower().startswith("page "):
+                            current_section = page_hint_chapter
 
-            chapter_inline_match = chapter_inline_pattern.search(para)
-            if chapter_inline_match:
-                current_chapter = f"Chapter {chapter_inline_match.group(1)}"
+                    chapter_inline_match = chapter_inline_pattern.search(sub_para)
+                    if chapter_inline_match:
+                        current_chapter = f"Chapter {chapter_inline_match.group(1)}"
 
-            if _is_heading(para):
-                current_heading = para
-                section_match = section_pattern.search(para)
-                if section_match:
-                    current_section = section_match.group(1).strip()
-                    sec_to_ch = chapter_from_section_pattern.search(current_section)
-                    if sec_to_ch:
-                        current_chapter = f"Chapter {sec_to_ch.group(1)}"
-                chapter_match = chapter_heading_pattern.search(para)
-                if chapter_match:
-                    current_chapter = f"Chapter {chapter_match.group(1)}"
-                    current_section = current_chapter
-                unit_match = unit_pattern.search(para)
-                if unit_match:
-                    current_unit = unit_match.group(1)
-                continue
+                    if _is_heading(sub_para):
+                        current_heading = sub_para
+                        section_match = section_pattern.search(sub_para)
+                        if section_match:
+                            current_section = section_match.group(1).strip()
+                            sec_to_ch = chapter_from_section_pattern.search(current_section)
+                            if sec_to_ch:
+                                current_chapter = f"Chapter {sec_to_ch.group(1)}"
+                        chapter_match = chapter_heading_pattern.search(sub_para)
+                        if chapter_match:
+                            current_chapter = f"Chapter {chapter_match.group(1)}"
+                            current_section = current_chapter
+                        unit_match = unit_pattern.search(sub_para)
+                        if unit_match:
+                            current_unit = unit_match.group(1)
+                        continue
 
-            unit_match = unit_pattern.search(para)
-            if unit_match:
-                current_unit = unit_match.group(1)
+                    unit_match = unit_pattern.search(sub_para)
+                    if unit_match:
+                        current_unit = unit_match.group(1)
 
-            section_match = section_pattern.search(para)
-            if section_match:
-                current_section = section_match.group(1).strip()
-                sec_to_ch = chapter_from_section_pattern.search(current_section)
-                if sec_to_ch:
-                    current_chapter = f"Chapter {sec_to_ch.group(1)}"
-            else:
-                numeric_match = numeric_section_heading_pattern.search(para[:120])
-                if numeric_match:
-                    current_section = f"Section {numeric_match.group(1)}"
-                    current_chapter = f"Chapter {numeric_match.group(1).split('.')[0]}"
+                    section_match = section_pattern.search(sub_para)
+                    if section_match:
+                        current_section = section_match.group(1).strip()
+                        sec_to_ch = chapter_from_section_pattern.search(current_section)
+                        if sec_to_ch:
+                            current_chapter = f"Chapter {sec_to_ch.group(1)}"
+                    else:
+                        numeric_match = numeric_section_heading_pattern.search(sub_para[:120])
+                        if numeric_match:
+                            current_section = f"Section {numeric_match.group(1)}"
+                            current_chapter = f"Chapter {numeric_match.group(1).split('.')[0]}"
 
-            if not current_section and current_chapter:
-                current_section = current_chapter
+                    if not current_section and current_chapter:
+                        current_section = current_chapter
 
-            if not current_section and current_unit:
-                current_section = f"Unit {current_unit}"
+                    if not current_section and current_unit:
+                        current_section = f"Unit {current_unit}"
 
-            if current_heading and current_heading.lower() not in para.lower():
-                para = f"{current_heading}\n{para}"
-
-            structured_units.append({
-                "text": para,
-                "page": page_num,
-                "unit": current_unit,
-                "section": current_section or (f"Page {page_num}" if page_num is not None else "Document"),
-                "heading": current_heading,
-                "title": current_heading,
-                "chapter": current_chapter,
-            })
+                    structured_units.append({
+                        "text": sub_para,
+                        "page": page_num,
+                        "unit": current_unit,
+                        "section": current_section or (f"Page {page_num}" if page_num is not None else "Document"),
+                        "heading": current_heading,
+                        "title": current_heading,
+                        "chapter": current_chapter,
+                    })
 
     # Fallback for PDFs with weak paragraph structure (single newlines, OCR-ish text).
     if not structured_units:
@@ -1034,8 +1125,11 @@ def chunk_and_add_document(
         next_title = str(unit.get("title") or unit.get("heading") or "")
 
         # Metadata consistency guard:
-        # when structure boundary changes, flush current buffer so one chunk
-        # does not span multiple chapter/section/title labels.
+        # when structure boundary changes, always flush current buffer so one
+        # chunk never spans multiple chapter/section/title labels.
+        # NOTE: No minimum-word threshold — even short pre-boundary content
+        # must be emitted to prevent cross-section contamination (e.g. Meridian
+        # Invest content bleeding into Everyday Checking chunks).
         structure_changed = bool(
             curr_words
             and (
@@ -1044,8 +1138,9 @@ def chunk_and_add_document(
                 or (next_title and curr_title and next_title != curr_title)
             )
         )
-        if structure_changed and len(curr_words) >= max(60, TARGET_MIN_WORDS // 3):
+        if structure_changed:
             _emit_current_chunk()
+            # Never carry overlap across a section boundary.
             curr_words = []
             curr_page = unit.get("page")
             curr_unit = str(unit.get("unit") or "")
@@ -1053,6 +1148,17 @@ def chunk_and_add_document(
             curr_chapter = next_chapter
             curr_title = next_title
 
+        if unit_text.strip().startswith(_TABLE_DATA_MARKER) and curr_words:
+            _emit_current_chunk()
+            curr_words = []
+
+        # NOTE: Section headings are intentionally NOT prepended to the chunk
+        # text. The heading is preserved in chunk metadata ("section"/"title")
+        # only. Injecting it into the body text caused the heading to repeat
+        # once per merged unit/window inside a single chunk (e.g.
+        # "1. About Meridian Financial Services" appearing between every
+        # sentence, and table headers repeating before every row). Keeping it in
+        # metadata gives retrieval the section context without corrupting text.
         windows = _split_long_text_to_windows(unit_text, TARGET_WORDS, OVERLAP_WORDS)
         for window_text in windows:
             window_words = window_text.split()
@@ -1152,6 +1258,7 @@ def chunk_and_add_document(
         "indexed_chunks": 0,
         "batch_errors": [],
         "reason": "",
+        "chunk_texts": list(chunks),
     }
 
     if not chunks:
@@ -1189,14 +1296,8 @@ def chunk_and_add_document(
     now_iso = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     
     # GPU-OPTIMIZED BATCH PROCESSING:
-    # GPU can handle much larger batches than CPU (1000s of texts at once)
-    # CPU is more limited (128-256 texts per batch recommended)
-    if device == 'cuda':
-        EMBEDDING_BATCH_SIZE = 64  # GPU: reduced to prevent OOM
-        UPSERT_BATCH_SIZE = 128    # Chroma can take larger upserts
-    else:
-        EMBEDDING_BATCH_SIZE = 64  # CPU: smaller batches
-        UPSERT_BATCH_SIZE = 100
+    # Batch sizes are tuned to available VRAM (shared with Ollama on 6GB cards).
+    EMBEDDING_BATCH_SIZE, UPSERT_BATCH_SIZE = _embedding_batch_sizes()
     
     logger.info(f"Processing {len(chunks)} chunks using {device.upper()} (embed_batch={EMBEDDING_BATCH_SIZE}, upsert_batch={UPSERT_BATCH_SIZE})")
     total_batches = max(1, (len(chunks) + UPSERT_BATCH_SIZE - 1) // UPSERT_BATCH_SIZE)
@@ -1224,6 +1325,11 @@ def chunk_and_add_document(
                 import numpy as _np
                 batch_embeddings = _np.vstack(embeddings).tolist()
             embed_ms = int((_time.perf_counter() - embed_t0) * 1000)
+            if device == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
             batch_no = (batch_start // UPSERT_BATCH_SIZE) + 1
             logger.info(
                 "[INGEST PERF] stage=embedding batch=%s/%s chunks=%s ms=%s",
@@ -1273,6 +1379,8 @@ def chunk_and_add_document(
             for local_idx, idx in enumerate(batch_indices):
                 record = batch_records[local_idx]
                 chunk_meta = dict(metadata or {})
+                if tenant_id is not None:
+                    chunk_meta["tenant_id"] = _effective_tenant_id(tenant_id)
                 chunk_meta["chunk_index"] = idx
                 chunk_meta["chunk_total"] = len(chunks)
                 chunk_meta["document_id"] = str(doc_id)
@@ -1770,19 +1878,22 @@ def list_uploaded_files(tenant_id=None) -> list:
         return []
 
 def clear_knowledge_base():
-    """Clear all documents from knowledge base"""
+    """Clear all documents from the default tenant knowledge base collection."""
     try:
-        # Delete collection if exists
+        from config import tenant_collection_name
+
+        collection_name = tenant_collection_name(DEFAULT_TENANT_ID)
         try:
-            client.delete_collection(name="support_docs")
-            logger.info("✓ Deleted old collection")
+            client.delete_collection(name=collection_name)
+            logger.info("Deleted collection %s", collection_name)
         except Exception as e:
-            # Log the exception info instead of silently swallowing all exceptions
             logger.info("No existing collection to delete or deletion error: %s", e)
-        
-        # Create fresh collection
-        client.create_collection(name="support_docs")
-        logger.info("✓ Created new collection")
+
+        client.create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        logger.info("Created fresh collection %s", collection_name)
         return True
     except Exception as e:
         logger.error(f"Error clearing knowledge base: {e}")
@@ -1821,3 +1932,49 @@ if __name__ == "__main__":
     # Count
     count = count_documents()
     print(f"\nTotal documents: {count}")
+
+
+def purge_tenant_knowledge(tenant_id: int) -> dict:
+    """Delete Chroma collections and on-disk assets for a tenant."""
+    import shutil
+
+    tid = int(tenant_id)
+    deleted_collections: list[str] = []
+    errors: list[str] = []
+
+    try:
+        from config import tenant_collection_base, tenant_assets_dir
+    except Exception:
+        tenant_collection_base = lambda t: f"t{int(t)}_support_docs_v3"  # noqa: E731
+        tenant_assets_dir = lambda t: Path(__file__).resolve().parent / "assets" / f"tenant_{int(t)}"  # noqa: E731
+
+    prefix = tenant_collection_base(tid)
+    try:
+        for col in list(client.list_collections() or []):
+            name = str(getattr(col, "name", "") or "").strip()
+            if not name:
+                continue
+            if name == prefix or name.startswith(prefix + "_"):
+                try:
+                    client.delete_collection(name=name)
+                    deleted_collections.append(name)
+                    logger.info("purge_tenant_knowledge: deleted collection '%s'", name)
+                except Exception as col_err:
+                    errors.append(f"{name}: {col_err}")
+    except Exception as list_err:
+        errors.append(f"list_collections: {list_err}")
+
+    assets_removed = False
+    try:
+        assets_path = tenant_assets_dir(tid)
+        if assets_path.exists():
+            shutil.rmtree(assets_path, ignore_errors=True)
+            assets_removed = True
+    except Exception as assets_err:
+        errors.append(f"assets: {assets_err}")
+
+    return {
+        "deleted_collections": deleted_collections,
+        "assets_removed": assets_removed,
+        "errors": errors,
+    }

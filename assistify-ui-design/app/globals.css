@@ -44,10 +44,10 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply m-0 bg-[#232323] text-[#fafaff];
+    @apply m-0 min-h-full bg-[#232323] text-[#fafaff];
   }
   html {
-    @apply bg-[#232323];
+    @apply min-h-full bg-[#232323];
   }
 }
 
@@ -73,4 +73,44 @@
 .dot-3 {
   animation: dots-pulse 1.4s infinite;
   animation-delay: 0.4s;
+}
+
+@keyframes message-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message-enter {
+  animation: message-in 0.35s ease-out both;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.thinking-shimmer {
+  background: linear-gradient(
+    90deg,
+    #f6c33c 0%,
+    #fde68a 40%,
+    #f6c33c 80%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2.5s ease-in-out infinite;
+}
+
+/* Chat scroll area subtle gradient fade at top */
+.chat-scroll-fade {
+  mask-image: linear-gradient(to bottom, transparent 0%, black 24px, black 100%);
 }

@@ -5,10 +5,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useChatWebSocket } from "@/src/hooks/useChatWebSocket";
 import { useVoiceMode, type VoiceWsApi } from "@/src/hooks/useVoiceMode";
 import type { UiMessage } from "@/src/hooks/useConversations";
-import type { AppLanguage } from "@/src/lib/types";
+import type { AppLanguage, ChatTenant } from "@/src/lib/types";
 import { ChatMessage } from "./chat-message";
+import { AssistantIcon } from "./assistant-icon";
 import { Header } from "./header";
 import { KBBanner } from "./kb-banner";
+import { TenantSelector } from "./tenant-selector";
 import { ThinkingIndicator } from "./thinking-indicator";
 import { VoiceOverlay } from "./voice-overlay";
 
@@ -16,18 +18,34 @@ interface ChatAreaProps {
   onMenuClick: () => void;
   messages: UiMessage[];
   activeConversationId: string | null;
-  appendMessage: (role: "user" | "assistant", text: string, persist?: boolean) => Promise<void>;
+  activeTenantId: number;
+  appendMessage: (role: "user" | "assistant" | "system", text: string, persist?: boolean) => Promise<void>;
+  onTenantSwitched?: () => void;
+  onConversationCreated?: (conversationId: string) => void;
   exitUrl: string;
   wsEnabled?: boolean;
+  wsPath?: string;
+  guestMode?: boolean;
+  tenants?: ChatTenant[];
+  tenantsLoading?: boolean;
+  onTenantChange?: (tenantId: number) => void;
 }
 
 export function ChatArea({
   onMenuClick,
   messages,
   activeConversationId,
+  activeTenantId,
   appendMessage,
+  onTenantSwitched,
+  onConversationCreated,
   exitUrl,
   wsEnabled = true,
+  wsPath = "/ws",
+  guestMode = false,
+  tenants = [],
+  tenantsLoading = false,
+  onTenantChange,
 }: ChatAreaProps) {
   const [inputValue, setInputValue] = useState("");
   const [language, setLanguage] = useState<AppLanguage>("en");
@@ -39,18 +57,20 @@ export function ChatArea({
     sendControl: () => {},
   });
 
+  const persistToServer = !wsEnabled;
+
   const appendUser = useCallback(
     (text: string) => {
-      appendMessage("user", text, true).catch(() => {});
+      appendMessage("user", text, persistToServer).catch(() => {});
     },
-    [appendMessage],
+    [appendMessage, persistToServer],
   );
 
   const appendAssistant = useCallback(
     (text: string) => {
-      appendMessage("assistant", text, true).catch(() => {});
+      appendMessage("assistant", text, persistToServer).catch(() => {});
     },
-    [appendMessage],
+    [appendMessage, persistToServer],
   );
 
   const voiceMode = useVoiceMode({
@@ -78,9 +98,13 @@ export function ChatArea({
   const chatWs = useChatWebSocket({
     language,
     conversationId: activeConversationId,
+    tenantId: activeTenantId,
     ttsEnabled: true,
     enabled: wsEnabled,
+    wsPath,
     onAssistantComplete: appendAssistant,
+    onTenantSwitched: () => onTenantSwitched?.(),
+    onConversationCreated,
     onUserTranscript: (text) => {
       if (!voiceOpenRef.current) appendUser(text);
     },
@@ -104,61 +128,118 @@ export function ChatArea({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, chatWs.streamingText, voiceMode.assistantText]);
 
+  const isResponding = chatWs.thinking || Boolean(chatWs.streamingText);
+  const canSend = !isResponding && Boolean(inputValue.trim());
+
   const handleSend = async () => {
     const text = inputValue.trim();
-    if (!text) return;
+    if (!text || isResponding) return;
     setInputValue("");
-    await appendMessage("user", text, true);
+    await appendMessage("user", text, persistToServer);
     chatWs.sendText(text);
   };
 
   return (
-    <div className="relative flex flex-1 flex-col bg-[#232323]">
-      <Header exitUrl={exitUrl} language={language} onLanguageChange={setLanguage} onMenuClick={onMenuClick} />
+    <div className="relative flex min-h-0 flex-1 flex-col bg-[#232323]">
+      <Header
+        exitUrl={exitUrl}
+        language={language}
+        onLanguageChange={setLanguage}
+        onMenuClick={onMenuClick}
+        guestMode={guestMode}
+      />
       {chatWs.kbMessage && <KBBanner message={chatWs.kbMessage} onDismiss={chatWs.dismissKb} />}
-      <div className="flex-1 space-y-4 overflow-y-auto p-4 md:p-6">
-        {messages.map((m) => (
-          <ChatMessage key={m.id} message={m} />
-        ))}
+      {!chatWs.connected && chatWs.connectionError && (
+        <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-center text-sm text-amber-200">
+          {chatWs.connectionError}
+        </div>
+      )}
+      {chatWs.lastError && (
+        <div className="mx-4 mt-2 flex items-center justify-between gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+          <span>{chatWs.lastError}</span>
+          <button type="button" className="shrink-0 text-xs underline" onClick={chatWs.dismissError}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      <div className="chat-scroll-fade min-h-0 flex-1 space-y-2 overflow-y-auto p-4 md:p-6">
+        {messages.length === 0 && !chatWs.streamingText && !chatWs.thinking && (
+          <div className="message-enter flex min-h-[40vh] flex-col items-center justify-center px-4 text-center">
+            <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-[#404040] bg-gradient-to-br from-[#2f2f2f] to-[#1a1a1a] p-2 shadow-[0_8px_32px_rgba(16,163,127,0.15)]">
+              <AssistantIcon size={44} />
+            </div>
+            <h2 className="mb-2 text-xl font-semibold text-white">How can I help you today?</h2>
+            <p className="max-w-md text-sm leading-relaxed text-[#9ca3af]">
+              Ask questions about your knowledge base. Responses are formatted with headings, lists, and highlights for easy reading.
+            </p>
+          </div>
+        )}
+        {messages.map((m, idx) => {
+          const prev = idx > 0 ? messages[idx - 1] : null;
+          const showBadge =
+            m.type !== "system" &&
+            m.tenant_id != null &&
+            (prev == null || prev.tenant_id !== m.tenant_id || prev.type === "system");
+          return <ChatMessage key={m.id} message={m} showTenantBadge={showBadge} />;
+        })}
         {chatWs.streamingText && !voiceMode.isOpen && (
           <ChatMessage
             message={{ id: "stream", type: "assistant", content: chatWs.streamingText, language }}
+            isStreaming
           />
         )}
-        {chatWs.thinking && !voiceMode.isOpen && <ThinkingIndicator />}
+        {chatWs.thinking && !chatWs.streamingText && !voiceMode.isOpen && <ThinkingIndicator />}
         <div ref={messagesEndRef} />
       </div>
-      <div className="border-t border-[#333333] bg-[#232323] p-4 md:p-6">
-        <div className="mx-auto max-w-4xl">
-          <div className="flex items-end gap-3 rounded-lg border border-[#333333] bg-[#2b2b2b] p-3">
+      <div className="shrink-0 overflow-visible border-t border-[#333333] bg-[#232323] p-4 md:p-6">
+        <div className="mx-auto max-w-4xl overflow-visible">
+          <div className="overflow-visible rounded-2xl border border-[#404040] bg-[#2b2b2b] shadow-[0_2px_12px_rgba(0,0,0,0.25)]">
             <input
-              className="flex-1 bg-transparent text-sm text-[#fafaff] outline-none placeholder:text-[#9ca3af]"
+              className="w-full rounded-t-2xl bg-transparent px-4 py-3 text-sm text-[#fafaff] outline-none placeholder:text-[#9ca3af] disabled:cursor-not-allowed disabled:opacity-50"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSend()}
-              placeholder="Type your message..."
+              onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && !isResponding && handleSend()}
+              placeholder={isResponding ? "Waiting for response..." : "Ask anything..."}
+              aria-label="Message"
+              disabled={isResponding}
             />
-            <div className="flex gap-2">
+            <div className="flex items-center justify-between gap-2 overflow-visible border-t border-[#383838] px-2 py-1.5">
+              <div className="min-w-0 flex-1 overflow-visible">
+                {onTenantChange && tenants.length > 0 && (
+                  <TenantSelector
+                    tenants={tenants}
+                    activeTenantId={activeTenantId}
+                    onChange={onTenantChange}
+                    disabled={tenantsLoading}
+                  />
+                )}
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
               <button
                 type="button"
-                className={`rounded p-2 transition-colors ${
+                className={`rounded-lg p-2 transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                   voiceMode.isOpen
                     ? "bg-[#6c63ff]/20 text-[#6c63ff]"
-                    : "text-[#6c63ff] hover:bg-[#333333]"
+                    : "text-[#9ca3af] hover:bg-[#333333] hover:text-[#6c63ff]"
                 }`}
                 onClick={() => (voiceMode.isOpen ? voiceMode.closeVoiceMode() : voiceMode.openVoiceMode())}
+                disabled={isResponding && !voiceMode.isOpen}
+                title={isResponding && !voiceMode.isOpen ? "Wait for the response to finish" : undefined}
                 aria-label={voiceMode.isOpen ? "Close voice mode" : "Open voice mode"}
               >
-                <Mic size={20} />
+                <Mic size={18} />
               </button>
               <button
                 type="button"
-                className="rounded bg-[#10a37f] p-2 text-white transition-colors hover:bg-[#0d8a6b]"
+                className="rounded-lg bg-[#10a37f] p-2 text-white transition-colors hover:bg-[#0d8a6b] disabled:cursor-not-allowed disabled:opacity-40"
                 onClick={handleSend}
+                disabled={!canSend}
+                title={isResponding ? "Wait for the response to finish" : undefined}
                 aria-label="Send message"
               >
-                <Send size={20} />
+                <Send size={18} />
               </button>
+              </div>
             </div>
           </div>
         </div>

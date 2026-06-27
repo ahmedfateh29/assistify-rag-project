@@ -156,7 +156,12 @@ export function AnalyticsPageContent({ title = "Analytics" }: { title?: string }
                         cx="50%"
                         cy="50%"
                         outerRadius={80}
-                        label={({ role, count }) => `${role}: ${count}`}
+                        label={(props) => {
+                          const payload = props.payload as { role?: string; count?: number } | undefined;
+                          const role = String(payload?.role ?? props.name ?? "");
+                          const count = Number(payload?.count ?? props.value ?? 0);
+                          return `${role}: ${count}`;
+                        }}
                       >
                         {usageByRole.map((_, i) => (
                           <Cell key={i} fill={ROLE_COLORS[i % ROLE_COLORS.length]} />

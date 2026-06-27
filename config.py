@@ -73,6 +73,26 @@ SKIP_EMAIL_OTP = (
     and os.getenv("SKIP_EMAIL_OTP", "false").lower() in {"1", "true", "yes", "on"}
 )
 
+# Public customer chat without login (enabled by default in development).
+ALLOW_PUBLIC_GUEST_CHAT = os.getenv(
+    "ALLOW_PUBLIC_GUEST_CHAT",
+    "true" if not IS_PRODUCTION else "false",
+).lower() in {"1", "true", "yes", "on"}
+
+GUEST_ID_COOKIE = "guest_id"
+GUEST_OWNER_HEADER = "X-Guest-Owner"
+
+# When enabled, chat/RAG queries require tenant membership (customers) or staff
+# assignment (admin/employee). Off by default in development; on in production unless
+# explicitly disabled via ENFORCE_CHAT_TENANT_MEMBERSHIP=false.
+_ENFORCE_MEMBERSHIP_ENV = os.getenv("ENFORCE_CHAT_TENANT_MEMBERSHIP", "").strip().lower()
+if _ENFORCE_MEMBERSHIP_ENV in {"1", "true", "yes", "on"}:
+    ENFORCE_CHAT_TENANT_MEMBERSHIP = True
+elif _ENFORCE_MEMBERSHIP_ENV in {"0", "false", "no", "off"}:
+    ENFORCE_CHAT_TENANT_MEMBERSHIP = False
+else:
+    ENFORCE_CHAT_TENANT_MEMBERSHIP = IS_PRODUCTION
+
 # Development fallbacks (ONLY for local development)
 if not IS_PRODUCTION:
     if not SESSION_SECRET:
@@ -223,7 +243,7 @@ if _requested_whisper_device != "cpu":
     )
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 for CPU efficiency
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))  # beam=5 for accuracy
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))  # 1 for CPU speed; Arabic STT overrides to 5 in stt/transcribe.py
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"  # Voice Activity Detection
 
 # Legacy (deprecated - keeping for migration)
@@ -365,6 +385,10 @@ __all__ = [
     "OLLAMA_CLI",
     "ALLOW_DEV_LOGIN_FALLBACK",
     "SKIP_EMAIL_OTP",
+    "ALLOW_PUBLIC_GUEST_CHAT",
+    "GUEST_ID_COOKIE",
+    "GUEST_OWNER_HEADER",
+    "ENFORCE_CHAT_TENANT_MEMBERSHIP",
     "LLM_SERVER_PORT",
     "assert_production_config",
 ]

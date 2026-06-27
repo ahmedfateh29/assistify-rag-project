@@ -177,6 +177,18 @@ def touch_user_session(session_id: str, last_activity: float) -> None:
         )
 
 
+def get_session_last_activity(session_id: str) -> float | None:
+    """Return the DB-persisted last_activity for a session, or None if not found."""
+    if not session_id:
+        return None
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT last_activity FROM user_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    return float(row["last_activity"]) if row else None
+
+
 def check_rate_limit(identifier: str, limit: int, window_seconds: int = 60) -> bool:
     now = time.time()
     with _conn() as conn:

@@ -65,8 +65,9 @@ from config import (
     ENFORCE_HTTPS, ALLOWED_HOSTS, IS_PRODUCTION,
     RATE_LIMIT_LOGIN, RATE_LIMIT_REGISTER, RATE_LIMIT_OTP,
     BCRYPT_ROUNDS, DEFAULT_TENANT_ID, kb_asset_search_dirs,
-    ALLOW_DEV_LOGIN_FALLBACK, SKIP_EMAIL_OTP, assert_production_config,
+    ALLOW_DEV_LOGIN_FALLBACK, SKIP_EMAIL_OTP, ALLOW_PUBLIC_GUEST_CHAT, assert_production_config,
 )
+from Login_system import guest_session
 
 try:
     from Login_system.persistent_state import (
@@ -75,6 +76,7 @@ try:
         invalidate_session as persist_invalidate_session,
         track_user_session,
         touch_user_session,
+        get_session_last_activity,
         check_rate_limit as persist_check_rate_limit,
         check_account_lockout as persist_check_account_lockout,
         record_failed_login as persist_record_failed_login,
@@ -89,6 +91,7 @@ except ImportError:
         invalidate_session as persist_invalidate_session,
         track_user_session,
         touch_user_session,
+        get_session_last_activity,
         check_rate_limit as persist_check_rate_limit,
         check_account_lockout as persist_check_account_lockout,
         record_failed_login as persist_record_failed_login,
@@ -198,8 +201,10 @@ _PDF_TEXT_CACHE_MAX = 16
 
 
 def _display_filename(stored_name: str) -> str:
+    from urllib.parse import unquote
     match = _UUID_FILENAME_PREFIX.match(stored_name or "")
-    return match.group(1) if match else stored_name
+    name = match.group(1) if match else (stored_name or "")
+    return unquote(name)
 
 
 def _cache_pdf_text(cache_key: str, mtime: float, content: str) -> None:
@@ -334,6 +339,10 @@ async def security_headers_middleware(request: Request, call_next):
                 samesite="lax",
                 max_age=86400  # 24 hours
             )
+
+        # Anonymous guest identity for public chat (per-browser isolation).
+        if ALLOW_PUBLIC_GUEST_CHAT and not guest_session.get_guest_id(request):
+            guest_session.set_guest_cookie(response, guest_session.new_guest_id())
     
     return response
 
@@ -375,6 +384,18 @@ def _rag_proxy_headers(request: Request) -> dict:
     if csrf:
         headers["x-csrf-token"] = csrf
     return headers
+
+
+def _guest_rag_proxy_headers(request: Request) -> dict:
+    guest_id = guest_session.get_guest_id(request)
+    if not guest_id:
+        raise HTTPException(status_code=401, detail="Guest session required.")
+    return guest_session.guest_rag_headers(request, guest_id)
+
+
+def _require_public_guest_chat() -> None:
+    if not ALLOW_PUBLIC_GUEST_CHAT:
+        raise HTTPException(status_code=403, detail="Public guest chat is disabled.")
 
 
 async def _rag_json_or_error(resp: aiohttp.ClientResponse):
@@ -514,21 +535,25 @@ def validate_session(session_data: dict) -> tuple[bool, str]:
     session_id = session_data.get("session_id")
     if session_id and is_session_invalidated(session_id):
         return False, "Session invalidated"
-    
+
     created_at = session_data.get("created_at", 0)
-    last_activity = session_data.get("last_activity", created_at)
     now = time.time()
-    
+
     if now - created_at > SESSION_ABSOLUTE_TIMEOUT:
         return False, "Session expired (absolute timeout)"
-    
+
+    # Use the DB-persisted last_activity (updated on every request via touch_user_session)
+    # instead of the cookie value which is frozen at login time.
+    db_last_activity = get_session_last_activity(session_id) if session_id else None
+    last_activity = db_last_activity if db_last_activity is not None else session_data.get("last_activity", created_at)
+
     if now - last_activity > SESSION_IDLE_TIMEOUT:
         return False, "Session expired (idle timeout)"
-    
+
     session_data["last_activity"] = now
     if session_id:
         touch_user_session(session_id, now)
-    
+
     return True, ""
 
 def invalidate_session(session_id: str):
@@ -656,6 +681,7 @@ REACT_PUBLIC_PATH_PREFIXES = (
     "forgot-password",
     "reset-password",
     "change-username",
+    "guest",
 )
 
 
@@ -2777,28 +2803,9 @@ def _get_tenant_admin(user_id: int, tenant_id: int) -> dict:
 
 def _purge_user_dependencies(cursor, user_id: int, username: str | None = None) -> None:
     """Remove rows that block deleting a user (support data, memberships)."""
-    uid = int(user_id)
-    uname = (username or "").strip()
-    cursor.execute("SELECT id FROM support_tickets WHERE customer_id=?", (uid,))
-    ticket_ids = [row[0] for row in cursor.fetchall()]
-    if ticket_ids:
-        placeholders = ",".join("?" * len(ticket_ids))
-        cursor.execute(
-            f"DELETE FROM ticket_messages WHERE ticket_id IN ({placeholders})",
-            ticket_ids,
-        )
-        cursor.execute(
-            f"DELETE FROM notifications WHERE related_ticket_id IN ({placeholders})",
-            ticket_ids,
-        )
-        cursor.execute(
-            f"DELETE FROM support_tickets WHERE id IN ({placeholders})",
-            ticket_ids,
-        )
-    cursor.execute("DELETE FROM customer_notes WHERE customer_id=?", (uid,))
-    if uname:
-        cursor.execute("DELETE FROM tenant_memberships WHERE username=?", (uname,))
-        cursor.execute("DELETE FROM notifications WHERE user_username=?", (uname,))
+    from Login_system.tenant_lifecycle import purge_user_dependencies
+
+    purge_user_dependencies(cursor, user_id, username)
 
 
 @app.patch("/api/tenants/{tenant_id}/managers/{user_id}")
@@ -2960,6 +2967,73 @@ async def activate_tenant_api(request: Request, tenant_id: int, user=Depends(req
     return {"status": "activated", "tenant_id": tenant_id}
 
 
+@app.delete("/api/tenants/{tenant_id}")
+async def delete_tenant_api(
+    request: Request,
+    tenant_id: int,
+    user=Depends(require_api_role("superadmin")),
+):
+    """Superadmin: permanently delete an inactive tenant and all scoped data."""
+    verify_csrf(request)
+    if int(tenant_id) == int(DEFAULT_TENANT_ID):
+        raise HTTPException(status_code=403, detail="Cannot delete the default business")
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    confirm_slug = (data.get("confirm_slug") or "").strip().lower()
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, slug, active FROM tenants WHERE id=?", (int(tenant_id),))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if int(row[2] or 0) == 1:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Business must be deactivated before it can be deleted",
+        )
+    expected_slug = str(row[1] or "").strip().lower()
+    if not confirm_slug or confirm_slug != expected_slug:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Confirmation slug does not match")
+
+    from Login_system.tenant_lifecycle import delete_tenant_permanently
+
+    try:
+        result = delete_tenant_permanently(
+            conn,
+            int(tenant_id),
+            performed_by=user.get("username") or "superadmin",
+            ip_address=request.client.host if request.client else None,
+        )
+    except PermissionError:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Cannot delete the default business")
+    except ValueError:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    except RuntimeError:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Business must be deactivated before it can be deleted",
+        )
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete business: related records still reference this tenant",
+        ) from exc
+    conn.close()
+    return result
+
+
 # ========== TENANT MEMBERSHIPS & CUSTOMER ACCESS WORKFLOW ==========
 
 @app.get("/api/businesses")
@@ -2976,6 +3050,17 @@ def list_businesses(user=Depends(require_api_auth())):
         {"id": r[0], "name": r[1], "slug": r[2], "plan": r[3]}
         for r in rows
     ]
+
+
+@app.get("/api/chat-tenants")
+def list_chat_tenants(user=Depends(require_api_auth())):
+    """All active tenants available in the chat tenant selector (no membership filter)."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, name, slug FROM tenants WHERE active=1 ORDER BY name")
+    rows = c.fetchall()
+    conn.close()
+    return {"tenants": [{"id": r[0], "name": r[1], "slug": r[2]} for r in rows]}
 
 
 @app.get("/api/my-memberships")
@@ -3811,11 +3896,16 @@ async def conversation_detail_proxy(conversation_id: str, request: Request, user
 async def conversation_create_proxy(request: Request, user=Depends(require_login())):
     """Proxy conversation creation to the RAG server."""
     verify_csrf(request)
+    body = await request.body()
+    headers = _rag_proxy_headers(request)
+    if body:
+        headers["Content-Type"] = request.headers.get("content-type", "application/json")
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
             async with session.post(
                 f"{RAG_HTTP_BASE}/conversations",
-                headers=_rag_proxy_headers(request),
+                data=body if body else None,
+                headers=headers,
             ) as resp:
                 return await _rag_json_or_error(resp)
     except HTTPException:
@@ -3885,6 +3975,195 @@ async def conversation_message_proxy(conversation_id: str, request: Request, use
     verify_csrf(request)
     body = await request.body()
     headers = _rag_proxy_headers(request)
+    headers["Content-Type"] = request.headers.get("content-type", "application/json")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(
+                f"{RAG_HTTP_BASE}/conversations/{conversation_id}/message",
+                data=body,
+                headers=headers,
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.patch("/conversations/{conversation_id}/active-tenant")
+async def conversation_active_tenant_proxy(
+    conversation_id: str,
+    request: Request,
+    user=Depends(require_login()),
+):
+    """Proxy active tenant updates to the RAG server."""
+    verify_csrf(request)
+    body = await request.body()
+    headers = _rag_proxy_headers(request)
+    headers["Content-Type"] = request.headers.get("content-type", "application/json")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.patch(
+                f"{RAG_HTTP_BASE}/conversations/{conversation_id}/active-tenant",
+                data=body,
+                headers=headers,
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+# ========== PUBLIC GUEST CHAT (no login) ==========
+@app.get("/api/public/chat-tenants")
+def public_chat_tenants():
+    """Tenant directory for anonymous customer chat."""
+    _require_public_guest_chat()
+    from backend.tenant_access import list_active_chat_tenants
+
+    return {"tenants": list_active_chat_tenants()}
+
+
+@app.get("/api/guest/conversations")
+async def guest_conversations_proxy(request: Request):
+    _require_public_guest_chat()
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit(f"guest_chat:{client_ip}", 120, 60):
+        raise HTTPException(status_code=429, detail="Too many requests.")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(
+                f"{RAG_HTTP_BASE}/conversations",
+                headers=_guest_rag_proxy_headers(request),
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.get("/api/guest/conversations/{conversation_id}")
+async def guest_conversation_detail_proxy(conversation_id: str, request: Request):
+    _require_public_guest_chat()
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(
+                f"{RAG_HTTP_BASE}/conversations/{conversation_id}",
+                headers=_guest_rag_proxy_headers(request),
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.post("/api/guest/conversations")
+async def guest_conversation_create_proxy(request: Request):
+    _require_public_guest_chat()
+    verify_csrf(request)
+    body = await request.body()
+    headers = _guest_rag_proxy_headers(request)
+    if body:
+        headers["Content-Type"] = request.headers.get("content-type", "application/json")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(
+                f"{RAG_HTTP_BASE}/conversations",
+                data=body if body else None,
+                headers=headers,
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.patch("/api/guest/conversations/{conversation_id}")
+async def guest_conversation_rename_proxy(conversation_id: str, request: Request):
+    _require_public_guest_chat()
+    verify_csrf(request)
+    body = await request.body()
+    headers = _guest_rag_proxy_headers(request)
+    headers["Content-Type"] = request.headers.get("content-type", "application/json")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.patch(
+                f"{RAG_HTTP_BASE}/conversations/{conversation_id}",
+                data=body,
+                headers=headers,
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.patch("/api/guest/conversations/{conversation_id}/active-tenant")
+async def guest_conversation_active_tenant_proxy(conversation_id: str, request: Request):
+    _require_public_guest_chat()
+    verify_csrf(request)
+    body = await request.body()
+    headers = _guest_rag_proxy_headers(request)
+    headers["Content-Type"] = request.headers.get("content-type", "application/json")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.patch(
+                f"{RAG_HTTP_BASE}/conversations/{conversation_id}/active-tenant",
+                data=body,
+                headers=headers,
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.delete("/api/guest/conversations")
+async def guest_conversations_delete_all_proxy(request: Request):
+    _require_public_guest_chat()
+    verify_csrf(request)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.delete(
+                f"{RAG_HTTP_BASE}/conversations",
+                headers=_guest_rag_proxy_headers(request),
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.delete("/api/guest/conversations/{conversation_id}")
+async def guest_conversation_delete_proxy(conversation_id: str, request: Request):
+    _require_public_guest_chat()
+    verify_csrf(request)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.delete(
+                f"{RAG_HTTP_BASE}/conversations/{conversation_id}",
+                headers=_guest_rag_proxy_headers(request),
+            ) as resp:
+                return await _rag_json_or_error(resp)
+    except HTTPException:
+        raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
+
+
+@app.post("/api/guest/conversations/{conversation_id}/message")
+async def guest_conversation_message_proxy(conversation_id: str, request: Request):
+    _require_public_guest_chat()
+    verify_csrf(request)
+    body = await request.body()
+    headers = _guest_rag_proxy_headers(request)
     headers["Content-Type"] = request.headers.get("content-type", "application/json")
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -4107,18 +4386,69 @@ def _knowledge_search_dirs(user) -> list:
 def _resolve_tenant_asset_file(user, filename):
     """Locate a stored asset for this tenant. Checks the tenant subdir first,
     then (default tenant only) the legacy root. Returns a resolved Path or None.
-    Path-traversal safe: only the basename is used."""
-    name = Path(str(filename or "")).name
+    Path-traversal safe: only the basename is used.
+
+    Accepts either the on-disk stored name (with optional UUID prefix) or the
+    human display name shown in the admin UI.
+    """
+    from urllib.parse import unquote
+
+    try:
+        from backend.knowledge_base import normalize_uploaded_filename
+    except Exception:
+        normalize_uploaded_filename = lambda n: (n or "").strip().lower()  # noqa: E731
+
+    raw = str(filename or "").strip()
+    if not raw:
+        return None
+    name = Path(unquote(raw)).name
     if not name:
         return None
-    for base in _knowledge_search_dirs(user):
-        candidate = base / name
+
+    search_dirs = _knowledge_search_dirs(user)
+    requested_keys = {
+        name.lower(),
+        normalize_uploaded_filename(name),
+        _display_filename(name).lower(),
+        normalize_uploaded_filename(_display_filename(name)),
+    }
+    requested_keys.discard("")
+
+    def _safe_candidate(base: Path, candidate: Path) -> Path | None:
         try:
             rp = candidate.resolve()
             if not str(rp).startswith(str(base.resolve())):
-                continue
+                return None
             if rp.exists() and rp.is_file():
                 return rp
+        except Exception:
+            return None
+        return None
+
+    for base in search_dirs:
+        found = _safe_candidate(base, base / name)
+        if found is not None:
+            return found
+
+    for base in search_dirs:
+        if not base.exists():
+            continue
+        try:
+            for file_path in base.iterdir():
+                if not file_path.is_file():
+                    continue
+                stored = file_path.name
+                display = _display_filename(stored)
+                match_keys = {
+                    stored.lower(),
+                    display.lower(),
+                    normalize_uploaded_filename(stored),
+                    normalize_uploaded_filename(display),
+                }
+                if requested_keys & match_keys:
+                    found = _safe_candidate(base, file_path)
+                    if found is not None:
+                        return found
         except Exception:
             continue
     return None
@@ -4165,6 +4495,7 @@ def list_knowledge_files(request: Request, user=Depends(require_api_role("admin"
             except Exception:
                 indexed_chunks = 0
             files.append({
+                "filename": stored_name,
                 "name": stored_name,
                 "stored_name": stored_name,
                 "display_name": _display_filename(stored_name),
@@ -4189,12 +4520,19 @@ async def proxy_kb_status(request: Request, user=Depends(require_api_role("admin
                 return await _rag_json_or_error(resp)
     except HTTPException:
         raise
+    except (asyncio.TimeoutError, TimeoutError):
+        return {
+            "state": "processing",
+            "message": "Knowledge base is busy — status temporarily unavailable",
+            "proxy_degraded": True,
+            "updated_at": time.time(),
+        }
     except aiohttp.ClientError as e:
         raise HTTPException(status_code=502, detail=f"RAG server unreachable: {str(e)}")
 
 
 @app.post("/api/knowledge/reindex-file")
-async def proxy_reindex_file(request: Request, filename: str, user=Depends(require_api_role("admin", "master_admin", "employee"))):
+async def proxy_reindex_file(request: Request, filename: str, user=Depends(require_tenant_staff())):
     """Reindex one knowledge-base file via the RAG server."""
     verify_csrf(request)
     if not filename:
@@ -4214,7 +4552,7 @@ async def proxy_reindex_file(request: Request, filename: str, user=Depends(requi
 
 
 @app.post("/api/knowledge/reindex-all")
-async def proxy_reindex_all(request: Request, user=Depends(require_api_role("admin", "master_admin", "employee"))):
+async def proxy_reindex_all(request: Request, user=Depends(require_tenant_staff())):
     """Reindex all knowledge-base files via the RAG server."""
     verify_csrf(request)
     try:
@@ -4310,10 +4648,16 @@ def get_knowledge_pdf_data(request: Request, filename: str, user=Depends(require
         raise HTTPException(status_code=400, detail="PDF data endpoint only supports PDF files")
 
     pdf_bytes = file_path.read_bytes()
+    stored_name = file_path.name
+    b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    display_name = _display_filename(stored_name)
     return {
-        "filename": filename,
-        "display_name": _display_filename(filename),
-        "bytes_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "filename": stored_name,
+        "stored_name": stored_name,
+        "display_name": display_name,
+        "bytes_b64": b64,
+        "data": b64,
+        "base64": b64,
     }
 
 
@@ -4977,10 +5321,8 @@ async def websocket_proxy(websocket: WebSocket):
     login server to open a single-origin websocket while the actual voice/LLM
     processing runs on the RAG server.
     """
-    # Accept the incoming client websocket first
     await websocket.accept()
 
-    # Simple session check: ensure the client has a valid session cookie
     token = websocket.cookies.get(SESSION_COOKIE)
     user = None
     if token:
@@ -4990,40 +5332,58 @@ async def websocket_proxy(websocket: WebSocket):
             user = None
 
     if not user:
-        # Reject unauthorized websocket clients
         log_security_event("websocket_unauthorized", {
             "client_ip": websocket.client.host if websocket.client else "unknown"
         }, severity="WARNING")
         await websocket.close(code=1008)
         return
-    
-    # Create rate limiter for this connection
+
     rate_limiter = WebSocketRateLimiter(max_messages=20, window_seconds=60)
-    
     log_security_event("websocket_connected", {
         "username": user.get("username"),
         "role": user.get("role")
     })
 
-    # Forward the browser's session cookie to the RAG server so it can resolve
-    # the authenticated user + tenant_id for this socket (per-tenant routing).
-    # Without this the RAG /ws sees an anonymous connection.
     _ws_cookie = websocket.headers.get("cookie")
     _ws_fwd_headers = {"Cookie": _ws_cookie} if _ws_cookie else None
+    await _bridge_rag_websocket(websocket, user, _ws_fwd_headers, rate_limiter)
 
-    # Open a websocket client connection to the RAG server and bridge messages
+
+@app.websocket("/ws/guest")
+async def guest_websocket_proxy(websocket: WebSocket):
+    """Public customer chat websocket (no login; scoped by guest_id cookie)."""
+    await websocket.accept()
+    _require_public_guest_chat()
+
+    guest_id = guest_session.get_guest_id(websocket)
+    if not guest_id:
+        await websocket.close(code=1008)
+        return
+
+    user = {"username": guest_id, "role": "guest"}
+    rate_limiter = WebSocketRateLimiter(max_messages=20, window_seconds=60)
+    log_security_event("guest_websocket_connected", {
+        "guest_id": guest_id,
+        "client_ip": websocket.client.host if websocket.client else "unknown",
+    })
+
+    fwd_headers = guest_session.guest_rag_headers(websocket, guest_id)
+    await _bridge_rag_websocket(websocket, user, fwd_headers, rate_limiter)
+
+
+async def _bridge_rag_websocket(websocket: WebSocket, user, fwd_headers, rate_limiter):
+    """Bridge browser websocket to RAG /ws with optional forwarded headers."""
     try:
         async with aiohttp.ClientSession() as session:
-            # Try to connect to the RAG server with a few retries/backoff to tolerate
-            # the backend booting slightly slower than the proxy.
             backend_ws = None
             max_attempts = 5
             for attempt in range(1, max_attempts + 1):
                 try:
-                    backend_ws = await session.ws_connect(RAG_WS_URL, headers=_ws_fwd_headers, timeout=120)
+                    backend_ws = await session.ws_connect(
+                        RAG_WS_URL, headers=fwd_headers, timeout=120
+                    )
                     break
                 except Exception as e:
-                    # Log and retry with a small backoff
                     logger = globals().get('logger')
                     msg = f"Attempt {attempt}/{max_attempts} failed connecting to RAG ws: {e}"
                     if logger:
@@ -5034,28 +5394,18 @@ async def websocket_proxy(websocket: WebSocket):
                         await asyncio.sleep(0.6 * attempt)
                     else:
                         raise
-            # Ensure we have a websocket to the backend
             if backend_ws is None:
                 raise RuntimeError("Failed to establish backend websocket")
-            # Use the connected websocket as an async context manager
             async with backend_ws:
-
-
-                # Send an initial auth handshake to the backend (non-blocking)
                 try:
                     await backend_ws.send_json({"type": "auth", "user": user})
                 except Exception:
-                    # backend may not expect JSON auth; ignore failures
                     pass
 
-
-                # Proxy messages in both directions until one closes
                 async def forward_client_to_backend():
                     try:
                         while True:
                             data = await websocket.receive()
-                            
-                            # Rate limiting check - only for text messages, not binary audio
                             if "text" in data:
                                 if not rate_limiter.is_allowed():
                                     remaining = rate_limiter.get_remaining_time()
@@ -5069,7 +5419,6 @@ async def websocket_proxy(websocket: WebSocket):
                                     continue
                                 await backend_ws.send_str(data["text"])
                             elif "bytes" in data:
-                                # Binary audio data - no rate limiting to allow continuous voice recording
                                 await backend_ws.send_bytes(data["bytes"])
                             elif data.get("type") == "websocket.disconnect":
                                 await backend_ws.close()
@@ -5112,7 +5461,6 @@ async def websocket_proxy(websocket: WebSocket):
                         except Exception:
                             pass
 
-                # Run both forwarding tasks concurrently
                 await asyncio.gather(
                     forward_client_to_backend(),
                     forward_backend_to_client(),
@@ -5131,7 +5479,6 @@ async def websocket_proxy(websocket: WebSocket):
             await websocket.close(code=1011)
         except Exception:
             pass
-    return websocket
 
 
 # ========== FEEDBACK & SUPPORT TICKET SYSTEM ==========
@@ -5856,3 +6203,11 @@ async def internal_check_rag_ws():
         import traceback
         tb = traceback.format_exc()
         return {"ok": False, "error": str(e), "trace": tb}
+
+
+try:
+    from scripts.service_log_viewer import mount_service_logs
+
+    mount_service_logs(app, _REPO_ROOT / "logs", require_login())
+except Exception:
+    pass

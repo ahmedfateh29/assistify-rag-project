@@ -12,7 +12,7 @@ const nextConfig = {
     root: __dirname,
   },
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false,
   },
   images: {
     unoptimized: true,
@@ -27,6 +27,9 @@ const nextConfig = {
       { source: "/arabic/:path*", destination: `${backend}/arabic/:path*` },
       { source: "/tts", destination: `${backend}/tts` },
       { source: "/ws", destination: `${backend}/ws` },
+      { source: "/ws/guest", destination: `${backend}/ws/guest` },
+      { source: "/api/public/:path*", destination: `${backend}/api/public/:path*` },
+      { source: "/api/guest/:path*", destination: `${backend}/api/guest/:path*` },
     ];
   },
 };

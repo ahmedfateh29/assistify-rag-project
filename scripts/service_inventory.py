@@ -16,6 +16,14 @@ PORT_LOGIN = 7001
 # Legacy ports from older Assistify launchers (RAG/LLM/Login/Voice on 8000–8002)
 LEGACY_PORTS = (8000, 8001, 8002)
 
+ASSISTIFY_WINDOW_TITLES = (
+    "Assistify Ollama",
+    "Assistify Piper",
+    "Assistify LLM",
+    "Assistify RAG",
+    "Assistify Login",
+)
+
 
 @dataclass
 class ServiceStatus:
@@ -151,6 +159,33 @@ def print_inventory_table(rows: List[ServiceStatus], *, title: str = "Assistify 
         print(f"{row.name:<10} {row.port:<8} {status:<12} {pid_str:<14} {proc_str}")
     print("=" * 72)
     print()
+
+
+def close_assistify_service_windows() -> List[str]:
+    """Close visible cmd windows titled 'Assistify ...' from a prior launcher run."""
+    if os.name != "nt":
+        return []
+    titles_ps = ",".join(f"'{t}'" for t in ASSISTIFY_WINDOW_TITLES)
+    script = f"""
+$titles = @({titles_ps})
+$closed = @()
+Get-Process | Where-Object {{
+  $_.MainWindowTitle -and ($titles -contains $_.MainWindowTitle)
+}} | ForEach-Object {{
+  $closed += $_.MainWindowTitle
+  Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+}}
+$closed -join "`n"
+"""
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", script],
+            text=True,
+            errors="ignore",
+        )
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+    except Exception:
+        return []
 
 
 def kill_listeners_on_ports(
