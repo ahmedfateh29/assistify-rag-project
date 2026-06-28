@@ -153,18 +153,20 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
         _ws_msg_bucket = {"count": 0, "reset": time.monotonic() + 60}
         _WS_MSG_RATE_LIMIT = 30
 
+        def _rate_limit_text_message() -> bool:
+            """Return True when a text/control message should be dropped (over limit)."""
+            _now_mono = time.monotonic()
+            if _now_mono > _ws_msg_bucket["reset"]:
+                _ws_msg_bucket["count"] = 0
+                _ws_msg_bucket["reset"] = _now_mono + 60
+            _ws_msg_bucket["count"] += 1
+            if _ws_msg_bucket["count"] > _WS_MSG_RATE_LIMIT:
+                return True
+            return False
+
         try:
             while True:
                 msg = await websocket.receive()
-                # Rate-limit incoming messages per connection to prevent flooding.
-                _now_mono = time.monotonic()
-                if _now_mono > _ws_msg_bucket["reset"]:
-                    _ws_msg_bucket["count"] = 0
-                    _ws_msg_bucket["reset"] = _now_mono + 60
-                _ws_msg_bucket["count"] += 1
-                if _ws_msg_bucket["count"] > _WS_MSG_RATE_LIMIT:
-                    await websocket.send_json({"type": "error", "message": "Rate limit exceeded. Please wait before sending more messages."})
-                    continue
                 if msg["type"] == "websocket.receive":
                     if "bytes" in msg and msg["bytes"] is not None:
                         audio = msg["bytes"]
@@ -272,6 +274,13 @@ def create_rag_ws_handler(deps: VoiceWebSocketDeps) -> Callable:
                             silence_counter = 0
                             first_audio_arrival = None
                     elif "text" in msg and msg["text"] is not None:
+                        # Binary mic audio arrives ~20/s; only throttle text/control frames.
+                        if _rate_limit_text_message():
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": "Rate limit exceeded. Please wait before sending more messages.",
+                            })
+                            continue
                         try:
                             payload = json.loads(msg["text"])
                         except Exception:

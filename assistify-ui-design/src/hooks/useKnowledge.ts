@@ -164,6 +164,13 @@ export function useKnowledge() {
     return status;
   }, [applyKbStatus]);
 
+  const refreshFiles = useCallback(async () => {
+    const list = await apiClient.get<RawKnowledgeFile[] | { files?: RawKnowledgeFile[] }>(
+      "/api/knowledge/files",
+    );
+    setFiles(parseFileList(list));
+  }, []);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
@@ -235,9 +242,14 @@ export function useKnowledge() {
         pollingStoppedRef.current = false;
         throw new Error("Upload failed");
       }
-      await fetchKbStatus();
+      // File is saved on disk before background indexing finishes.
+      await refreshFiles();
+      const status = await fetchKbStatus();
+      if (!isPipelineBusy(status.state)) {
+        await handlePipelineReady();
+      }
     },
-    [startKbPolling, stopKbPolling, fetchKbStatus],
+    [startKbPolling, stopKbPolling, fetchKbStatus, refreshFiles, handlePipelineReady],
   );
 
   const reindexAll = useCallback(async () => {

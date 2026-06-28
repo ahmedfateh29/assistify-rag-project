@@ -105,6 +105,37 @@ def _e5_query(text: str) -> str:
     return f"query: {cleaned}" if cleaned else "query:"
 
 
+_PAGE_PLACEHOLDER_RE = re.compile(r"(?i)^page\s*\d+$")
+_TABLE_DATA_MARKER_TEXT = "[TABLE DATA]"
+
+
+def _compose_embedding_text(record: dict) -> str:
+    """Build the text that is EMBEDDED for a chunk (not the text that is stored).
+
+    Prepends the chunk's structural context (chapter/section/title) exactly once
+    so a small fact chunk carries its topic into the embedding space. The stored
+    `documents=` payload remains the clean body text, so downstream pipe-table
+    and fact parsing are unaffected. This is fully document-agnostic: it only
+    uses generic structure metadata, never document content or known values.
+    """
+    text = str((record or {}).get("text") or "").strip()
+    context_parts: list[str] = []
+    for key in ("chapter", "section", "title"):
+        val = str((record or {}).get(key) or "").strip()
+        if not val or _PAGE_PLACEHOLDER_RE.match(val):
+            continue
+        if val not in context_parts:
+            context_parts.append(val)
+    # A table chunk's own header row is its strongest column context; keep the
+    # body intact but surface the section heading so topical queries match.
+    if not context_parts:
+        return text
+    context = " - ".join(context_parts)
+    if not text:
+        return context
+    return f"{context}. {text}"
+
+
 _STORED_FILENAME_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{8}_")
 _SAFE_METADATA_SOURCE_FIELDS = (
     "source_doc_id",
@@ -927,20 +958,40 @@ def chunk_and_add_document(
         return "content"
 
     def _split_long_text_to_windows(text_block: str, target_words: int, overlap_words: int) -> list[str]:
+        # Never split a flattened table: the header row and all data rows must
+        # stay in one chunk so row/column extraction keeps its column meaning.
+        if _TABLE_DATA_MARKER in text_block:
+            return [text_block]
         tokens = text_block.split()
         if len(tokens) <= TARGET_MAX_WORDS:
             return [text_block]
+
+        def _snap_to_sentence_end(lo: int, hi: int) -> int:
+            # Prefer cutting at a sentence boundary inside [lo, hi); this avoids
+            # truncating a fact mid-sentence. Decimal points (e.g. "$0.50") are
+            # not treated as sentence ends.
+            for j in range(hi - 1, lo - 1, -1):
+                tok = tokens[j]
+                if tok and tok[-1] in ".!?" and not (len(tok) >= 2 and tok[-2].isdigit()):
+                    return j + 1
+            return hi
+
         windows: list[str] = []
         start = 0
-        step = max(1, target_words - overlap_words)
         while start < len(tokens):
             end = min(start + target_words, len(tokens))
+            if end < len(tokens):
+                lo = min(start + max(1, target_words - overlap_words), end)
+                end = _snap_to_sentence_end(lo, end)
             segment = " ".join(tokens[start:end]).strip()
             if segment:
                 windows.append(segment)
             if end >= len(tokens):
                 break
-            start += step
+            next_start = end - overlap_words
+            if next_start <= start:
+                next_start = end
+            start = next_start
         return windows
 
     structured_units: list[dict] = []
@@ -1311,7 +1362,10 @@ def chunk_and_add_document(
         try:
             # On GPU: encode entire batch in one go for maximum speed
             # On CPU: encode in sub-batches to avoid memory issues
-            embedding_inputs = [_e5_passage(chunk) for chunk in batch_chunks]
+            # NOTE: embed the context-enriched text (section/title prepended once
+            # per chunk) but STORE the clean body text (`batch_chunks`) so that
+            # pipe-table/fact extraction downstream sees unmodified content.
+            embedding_inputs = [_e5_passage(_compose_embedding_text(rec)) for rec in batch_records]
 
             embed_t0 = _time.perf_counter()
             if device == 'cuda':

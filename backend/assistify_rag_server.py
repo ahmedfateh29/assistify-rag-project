@@ -5409,6 +5409,15 @@ def _get_active_sources() -> Set[str]:
     return set(_active_doc_registry.get("active_sources") or set())
 
 
+def _uses_tenant_isolated_retrieval(tenant_id: int | None = None) -> bool:
+    """Non-default tenants use dedicated Chroma collections; skip the global active-source gate."""
+    try:
+        tid = int(tenant_id if tenant_id is not None else current_tenant_id())
+    except (TypeError, ValueError):
+        tid = DEFAULT_TENANT_ID
+    return tid != DEFAULT_TENANT_ID
+
+
 def _metadata_source_keys(metadata: Optional[Dict[Any, Any]]) -> Set[str]:
     md = metadata or {}
     candidates = {
@@ -5458,6 +5467,8 @@ def _dbg7d3bbb(location, message, data=None, hypothesis=None):
 
 
 def _filter_results_to_active_sources(results: List[Dict[Any, Any]]) -> List[Dict[Any, Any]]:
+    if _uses_tenant_isolated_retrieval():
+        return list(results or [])
     active_sources = _get_active_sources()
     if not active_sources:
         # Attempt to recover active sources from the collection before failing closed.
@@ -5580,6 +5591,8 @@ def _doc_router_display_source(doc: Dict[str, Any], source_key: str) -> str:
 
 
 def _filter_doc_dicts_to_active_sources(doc_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if _uses_tenant_isolated_retrieval():
+        return list(doc_dicts or [])
     active_sources = _get_active_sources()
     if not active_sources:
         # Attempt to recover active sources from the collection before failing closed.
@@ -8271,15 +8284,17 @@ async def _bootstrap_assets_index_if_needed() -> None:
         logger.exception("KB bootstrap failed: %s", e)
 
 
-def _rebuild_active_sources_from_collection() -> None:
+def _rebuild_active_sources_from_collection(tenant_id: int | None = None) -> None:
     """Restore in-memory active_sources from chunk metadata after a restart."""
     try:
         from backend.knowledge_base import get_or_create_collection, indexed_source_keys_for_collection
 
-        col = get_or_create_collection(allow_empty=True)
+        tid = int(tenant_id if tenant_id is not None else current_tenant_id())
+        scope_tid = None if tid == DEFAULT_TENANT_ID else tid
+        col = get_or_create_collection(allow_empty=True, tenant_id=scope_tid)
         if not col or col.count() == 0:
             return
-        sources = indexed_source_keys_for_collection(col)
+        sources = indexed_source_keys_for_collection(col, tenant_id=scope_tid)
         if not sources:
             return
         mode = _active_doc_registry.get("mode", RAG_DOC_MODE)
@@ -8288,7 +8303,8 @@ def _rebuild_active_sources_from_collection() -> None:
         else:
             _set_active_sources(sorted(sources), mode=mode)
         logger.info(
-            "Active sources rebuilt from collection | mode=%s count=%d",
+            "Active sources rebuilt from collection | tenant=%s mode=%s count=%d",
+            tid,
             mode,
             len(sources),
         )
@@ -11027,6 +11043,74 @@ def _cleanup_definition_comparison_answer_text(value: str) -> str:
     return " ".join(deduped_parts).strip('"\'“”‘’')
 
 
+def _split_comparison_entities(query_text: str) -> list[str]:
+    """Split a comparison query into its candidate entity phrases (generic).
+
+    Works off generic connectors ("between", "and", "vs", commas) — no document
+    or domain terms — so it generalises to any future comparison query.
+    """
+    q = re.sub(r"\s+", " ", str(query_text or "").strip())
+    if not q:
+        return []
+    m = re.search(r"\bbetween\b(.+)$", q, flags=re.IGNORECASE)
+    seg = m.group(1) if m else q
+    # Drop a leading comparison verb/phrase when there was no "between" anchor.
+    if not m:
+        seg = re.sub(
+            r"^\s*(?:what\s+is\s+the\s+difference|what(?:'s| is)\s+the\s+diff(?:erence)?|"
+            r"compare|contrast|differentiate|distinguish|how\s+do(?:es)?)\b",
+            "",
+            seg,
+            flags=re.IGNORECASE,
+        )
+    seg = re.sub(r"[?.!]+\s*$", "", seg)
+    parts = re.split(r"\b(?:and|versus|vs\.?|or)\b|[,/&]", seg, flags=re.IGNORECASE)
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        p = re.sub(r"^(?:the|a|an)\s+", "", p.strip(" \t\"'."), flags=re.IGNORECASE).strip()
+        if not p or not re.search(r"[A-Za-z]", p):
+            continue
+        if not (1 <= len(p.split()) <= 6):
+            continue
+        key = p.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out[:4]
+
+
+def _compose_partial_comparison_answer(query_text: str, docs: list[dict]) -> str | None:
+    """Per-entity grounded fallback for comparison queries.
+
+    When the full comparison extractor finds nothing, answer whichever side(s)
+    ARE grounded in the documents instead of a blanket not-found. Each side is
+    independently gated by grounding + definition validity, so absent entities
+    are still not fabricated. Reversible via RAG_SOFT_FALLBACK.
+    """
+    if not _RAG_SOFT_FALLBACK:
+        return None
+    entities = _split_comparison_entities(query_text)
+    if not entities:
+        return None
+    pieces: list[str] = []
+    for ent in entities:
+        sub_q = f"What is {ent}?"
+        sent = _extract_best_scored_concept_sentence_from_docs(sub_q, docs, max_docs=3)
+        if not sent:
+            sent = _extract_simple_definition_sentence(sub_q, docs)
+        sent = _cleanup_final_answer_text(re.sub(r"\s+", " ", str(sent or "")).strip())
+        if not sent:
+            continue
+        ent_l = ent.lower()
+        if _is_answer_grounded_in_docs(sent, docs, query_text=sub_q) and _is_valid_definition_sentence(sent, ent_l):
+            pieces.append(sent if re.search(r"[.!?]$", sent) else sent + ".")
+    if not pieces:
+        return None
+    return " ".join(pieces[:3])
+
+
 def _extract_definition_comparison_answer(query_text: str, docs: list[dict]) -> str | None:
     if not _is_definition_comparison_query(query_text):
         return None
@@ -12493,6 +12577,8 @@ def _dedup_docs_exact_text(docs: list[dict]) -> list[dict]:
 def _is_ws_definition_query_mode(query: str) -> bool:
     q = re.sub(r"\s+", " ", str(query or "").strip().lower())
     if not q:
+        return False
+    if _is_numeric_fact_lookup_query(q):
         return False
     return bool(
         re.match(r"^\s*what\s+is\s+.+", q)
@@ -14792,6 +14878,10 @@ def _ws_fix_explanation_answer(query: str, answer: str, docs: list[dict]) -> str
     if _doc_router_implies_comparison(query) and not is_definition_comparison_mode:
         return _cleanup_final_answer_text(str(answer or "").strip())
     raw_answer = re.sub(r"\s+", " ", str(answer or "").strip())
+    # Fee/limit/cost lookups are factual value questions — never rewrite them
+    # through the definition synthesizer ("X refers to ...").
+    if _is_numeric_fact_lookup_query(query):
+        return _cleanup_final_answer_text(raw_answer)
     if is_definition_comparison_mode:
         ans = _cleanup_definition_comparison_answer_text(raw_answer)
     else:
@@ -20247,6 +20337,8 @@ def _context_grounded_definition_override(query_text: str, retrieved_docs: list[
 
 def _force_clean_definition_sentence(query_text: str, answer_text: str, retrieved_docs: list[dict] | None = None) -> str:
     q = (query_text or "").strip().lower()
+    if _is_numeric_fact_lookup_query(query_text):
+        return str(answer_text or "")
     if not (q.startswith("what is") or q.startswith("define")):
         return str(answer_text or "")
 
@@ -20290,6 +20382,8 @@ def _is_definition_style_query(query_text: str) -> bool:
     if _is_definition_comparison_query(q):
         return False
     if _is_compare_query(q):
+        return False
+    if _is_numeric_fact_lookup_query(q):
         return False
     # [DOMAIN CLEANUP] removed=hardcoded domain term blocklist (machine
     # learning|AI|blockchain|bitcoin|ethereum|neural network|cyber
@@ -20853,6 +20947,10 @@ def _extract_evidence_value_sentence(
             best = unit
     if not best:
         return None
+    if "|" in best and best.count("|") >= 6:
+        row_answer = _extract_best_pipe_table_row_answer(query_text, best)
+        if row_answer:
+            best = row_answer
     answer = re.sub(r"\s+", " ", best).strip().strip("|").strip()
     if answer and not re.search(r"[.!?]$", answer):
         answer += "."
@@ -20890,6 +20988,302 @@ def _collection_pipe_table_chunks() -> list[str]:
         return []
 
 
+_FAQ_PAIR_RE = re.compile(r"Q\s*[:\-.]\s*(.+?)\s*A\s*[:\-.]\s*(.+?)(?=\s*Q\s*[:\-.]\s|\Z)", re.IGNORECASE | re.DOTALL)
+_FAQ_TOKEN_STOP = frozenset({
+    "what", "which", "who", "when", "where", "why", "how", "the", "this", "that",
+    "these", "those", "is", "are", "was", "were", "be", "been", "being", "to", "of",
+    "in", "on", "for", "and", "or", "with", "from", "a", "an", "do", "does", "did",
+    "can", "could", "should", "would", "may", "might", "will", "there", "about",
+    "my", "your", "our", "their", "his", "her", "its", "me", "you", "i", "we",
+    "through", "via", "by", "at", "as", "if", "it", "they", "them", "have", "has",
+    "had", "get", "got", "any", "some", "please", "tell", "explain",
+})
+
+
+def _faq_content_tokens(text: str) -> set[str]:
+    out: set[str] = set()
+    for raw in re.findall(r"[a-z0-9]{2,}", str(text or "").lower()):
+        if raw in _FAQ_TOKEN_STOP:
+            continue
+        norm = _light_normalize_query_token(raw) or raw
+        if norm and norm not in _FAQ_TOKEN_STOP:
+            out.add(norm)
+    return out
+
+
+def _faq_overlap_count(q_tokens: set[str], target_tokens: set[str]) -> int:
+    """Token overlap with light prefix tolerance (deposit/deposited, app/apps)."""
+    count = 0
+    for qt in q_tokens:
+        for tt in target_tokens:
+            if qt == tt or (len(qt) >= 4 and len(tt) >= 4 and (qt.startswith(tt) or tt.startswith(qt))):
+                count += 1
+                break
+    return count
+
+
+def _extract_faq_answer(query_text: str, docs: list[dict]) -> str | None:
+    """Return the answer of the best-matching 'Q: ... A: ...' pair in retrieved docs.
+
+    Many help docs flatten an entire FAQ (multiple Q&A pairs) into a single
+    chunk. Naive extraction returns the FIRST pair regardless of the question,
+    which produces wrong/not-found answers. This selects the pair whose QUESTION
+    best matches the user's query and returns its grounded answer verbatim.
+    Fully document-agnostic: keys on the generic Q:/A: structure, never content.
+    """
+    q_tokens = _faq_content_tokens(query_text)
+    if len(q_tokens) < 1:
+        return None
+    best_answer: str | None = None
+    best_qmatch = 0
+    best_score = 0.0
+    for d in list(docs or [])[:8]:
+        text = str((d or {}).get("page_content") or (d or {}).get("text") or "")
+        low = text.lower()
+        if "q:" not in low and "q :" not in low and "q-" not in low:
+            continue
+        for m in _FAQ_PAIR_RE.finditer(text):
+            question = re.sub(r"\s+", " ", str(m.group(1) or "")).strip()
+            answer = re.sub(r"\s+", " ", str(m.group(2) or "")).strip()
+            if not question or not answer:
+                continue
+            qt = _faq_content_tokens(question)
+            at = _faq_content_tokens(answer)
+            if not qt:
+                continue
+            qmatch = _faq_overlap_count(q_tokens, qt)
+            amatch = _faq_overlap_count(q_tokens, at)
+            if qmatch <= 0:
+                continue
+            score = qmatch * 2.0 + amatch
+            if score > best_score or (score == best_score and qmatch > best_qmatch):
+                best_score = score
+                best_qmatch = qmatch
+                best_answer = answer
+    # Precision guard: require either 2+ question-token matches, or full coverage
+    # of a short query, so a weakly-related pair is never surfaced.
+    min_q = 2 if len(q_tokens) >= 2 else 1
+    if best_answer and best_qmatch >= min_q:
+        return best_answer.strip()
+    return None
+
+
+def _parse_table_row_groups_from_doc(clean_text: str) -> list[tuple[list[str], list[list[str]]]]:
+    """Parse a chunk's multi-line pipe table(s) into (header, rows) groups.
+
+    Fully generic: a header is any pipe line that looks like column labels; the
+    following pipe lines (until a blank/non-pipe line) are its data rows.
+    """
+    groups: list[tuple[list[str], list[list[str]]]] = []
+    header: list[str] | None = None
+    rows: list[list[str]] = []
+    for raw in str(clean_text or "").splitlines():
+        line = raw.strip()
+        if "|" not in line:
+            if header and rows:
+                groups.append((header, rows))
+            header, rows = None, []
+            continue
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if len(cells) < 2:
+            continue
+        if _looks_like_pipe_table_header_row(cells):
+            if header and rows:
+                groups.append((header, rows))
+            header, rows = cells, []
+        elif header is not None:
+            rows.append(cells)
+    if header and rows:
+        groups.append((header, rows))
+    # Fallback: a table flattened onto ONE line (header glued to its rows, no
+    # newlines) is common in extracted PDFs. Line-splitting yields nothing, so
+    # reconstruct (header, rows) by inferring the column count. Fully generic.
+    if not groups:
+        for raw in str(clean_text or "").splitlines():
+            line = raw.strip()
+            if line.count("|") < 4:
+                continue
+            try:
+                flat = _parse_flat_pipe_table(line)
+            except Exception:
+                flat = None
+            if flat:
+                f_header, f_rows, _footnote = flat
+                if f_header and f_rows:
+                    groups.append((f_header, f_rows))
+    return groups
+
+
+# Generic attribute words that are too common to disambiguate a table column on
+# their own (e.g. "fee", "price"). Column selection requires a more specific
+# token match unless there is exactly one value column. No document content.
+_TABLE_ATTR_GENERIC = frozenset({
+    "fee", "fees", "price", "prices", "cost", "costs", "charge", "charges",
+    "amount", "amounts", "rate", "rates", "limit", "limits", "plan", "plans",
+    "account", "accounts", "option", "options", "value", "values", "much", "many",
+    "monthly",  # generic on its own but kept; specific match still preferred
+})
+
+# Question/function words that never disambiguate a table column.
+_SPECIFIC_TOKEN_STOP = frozenset({
+    "how", "and", "the", "for", "with", "per", "does", "did", "what", "which",
+    "when", "where", "why", "who", "you", "your", "its", "are", "was", "were",
+    "take", "long", "this", "that", "from", "have", "has", "about",
+})
+
+
+def _is_bare_table_header_line(text: str) -> bool:
+    """True if text is just a pipe table's header row (column labels, no value)."""
+    line = str(text or "").strip().rstrip(".")
+    if "|" not in line:
+        return False
+    cells = [c.strip() for c in line.split("|") if c.strip()]
+    if len(cells) < 2:
+        return False
+    if _TABLE_FACT_CURRENCY_RE.search(line):
+        return False
+    return _looks_like_pipe_table_header_row(cells)
+
+
+def _extract_single_entity_table_fact(
+    query_text: str,
+    cleaned_docs: list[str],
+    focus_tokens: list[str],
+) -> str | None:
+    """Column-aware single-row lookup: return the asked-for cell of one table row.
+
+    Prevents two failure modes seen in practice: (1) returning the header row as
+    an answer, and (2) answering a value for an attribute the table does not have
+    (false positive). A column is only chosen when a SPECIFIC (non-generic,
+    non-label) query token matches the header, or when the row has exactly one
+    value column. Otherwise it declines (returns None) so genuinely-absent
+    details stay "not found". Fully document-agnostic.
+    """
+    q_low = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    if not q_low:
+        return None
+    for clean in cleaned_docs:
+        for header, rows in _parse_table_row_groups_from_doc(clean):
+            label_to_row: dict[str, list[str]] = {}
+            for r in rows:
+                if len(r) == len(header) and r and r[0]:
+                    label_to_row.setdefault(r[0], r)
+            matched = [
+                lbl for lbl in label_to_row
+                if len(lbl) >= 2 and re.search(rf"\b{re.escape(lbl.lower())}\b", q_low)
+            ]
+            if len(matched) != 1:
+                continue
+            label = matched[0]
+            row = label_to_row[label]
+            label_toks = set(re.findall(r"[a-z0-9]{2,}", label.lower()))
+            # The entity row is already uniquely identified, so any header column
+            # whose own word appears in the query is a column the user named. This
+            # covers multi-attribute asks ("amount AND term") and lets otherwise
+            # "generic" attribute words (amount/limit/term) select a column when
+            # they literally match a header. Word tokens only; label words removed
+            # so the entity name never selects a column. Fully document-agnostic.
+            q_named = set(re.findall(r"[a-z0-9]{3,}", q_low)) - _SPECIFIC_TOKEN_STOP - label_toks
+            named_cols = [
+                i for i in range(1, len(header))
+                if i < len(row) and row[i].strip()
+                and (set(re.findall(r"[a-z0-9]{3,}", header[i].lower())) & q_named)
+            ]
+            if len(named_cols) >= 2:
+                parts = [f"{header[i].strip()}: {row[i].strip()}" for i in named_cols]
+                return f"{label} — " + "; ".join(parts) + "."
+            # Distinguishing tokens: drop generic attribute words, the entity
+            # label, very short tokens, and question/function words. Match by
+            # WORD BOUNDARY so e.g. "it" never matches inside "limit".
+            specific = [
+                t for t in focus_tokens
+                if len(t) >= 3
+                and t not in _TABLE_ATTR_GENERIC
+                and t not in label_toks
+                and t not in _SPECIFIC_TOKEN_STOP
+            ]
+            col_idx: int | None = None
+            best_hits = 0
+            for i in range(1, len(header)):
+                hl = header[i].lower()
+                hits = sum(1 for t in specific if re.search(rf"\b{re.escape(t)}\b", hl))
+                if hits > best_hits:
+                    best_hits, col_idx = hits, i
+            if col_idx is None and named_cols:
+                col_idx = named_cols[0]
+            if col_idx is None:
+                value_cols = [
+                    i for i in range(1, len(header))
+                    if i < len(row) and _TABLE_FACT_CURRENCY_RE.search(row[i])
+                ]
+                if len(value_cols) == 1:
+                    col_idx = value_cols[0]
+                else:
+                    # Ambiguous (multiple value columns, no specific match):
+                    # decline rather than risk a wrong-column answer.
+                    continue
+            if col_idx is not None and col_idx < len(row):
+                value = row[col_idx].strip()
+                if value:
+                    return _format_table_fact_answer(query_text, label, value)
+    return None
+
+
+def _extract_multi_entity_table_facts(
+    query_text: str,
+    cleaned_docs: list[str],
+    focus_tokens: list[str],
+) -> str | None:
+    """Answer a query that asks about TWO OR MORE table rows at once.
+
+    Detects which row labels (taken from the table itself) are mentioned in the
+    query, maps the asked-for attribute to a column via the header, and returns
+    one combined answer with each entity's value. No product/company name is
+    hardcoded: requested entities are the intersection of the table's own row
+    labels with the query text, so this works for any future document.
+    """
+    q_low = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    if not q_low:
+        return None
+    for clean in cleaned_docs:
+        for header, rows in _parse_table_row_groups_from_doc(clean):
+            label_to_row: dict[str, list[str]] = {}
+            for r in rows:
+                if len(r) == len(header) and r and r[0]:
+                    label_to_row.setdefault(r[0], r)
+            # Which table row labels does the query explicitly mention?
+            matched = [
+                lbl for lbl in label_to_row
+                if len(lbl) >= 2 and re.search(rf"\b{re.escape(lbl.lower())}\b", q_low)
+            ]
+            if len(matched) < 2:
+                continue
+            # Pick the value column whose header best matches the query focus.
+            col_idx: int | None = None
+            best_hits = 0
+            for i in range(1, len(header)):
+                hl = header[i].lower()
+                hits = sum(1 for tok in focus_tokens if tok in hl)
+                if hits > best_hits:
+                    best_hits, col_idx = hits, i
+            parts: list[str] = []
+            for lbl in matched:
+                row = label_to_row[lbl]
+                value = ""
+                if col_idx is not None and col_idx < len(row):
+                    value = row[col_idx].strip()
+                if not value:
+                    for cell in row[1:]:
+                        if _TABLE_FACT_CURRENCY_RE.search(cell):
+                            value = cell.strip()
+                            break
+                if value:
+                    parts.append(f"{lbl}: {value}")
+            if len(parts) >= 2:
+                return ". ".join(parts) + "."
+    return None
+
+
 def _extract_table_fact_answer(query_text: str, docs: list[dict]) -> str | None:
     docs = list(docs or [])
     if not docs:
@@ -20924,6 +21318,13 @@ def _extract_table_fact_answer(query_text: str, docs: list[dict]) -> str | None:
                 cleaned_docs.append(clean_extra)
                 seen_clean.add(clean_extra)
 
+    # --- Multi-entity table lookup: answer EACH requested row, not just the
+    #     first. Handles "X and Y" / "A, B and C" numeric/attribute queries. ---
+    if is_value_lookup:
+        multi = _extract_multi_entity_table_facts(query_text, cleaned_docs, focus_tokens)
+        if multi:
+            return multi
+
     # --- Generic min-balance-by-entity path (column-mapped, no hardcoded names) ---
     if is_minbal_query and product_phrases:
         for clean in cleaned_docs:
@@ -20933,12 +21334,21 @@ def _extract_table_fact_answer(query_text: str, docs: list[dict]) -> str | None:
                     label = product_phrases[0].title()
                     return _format_table_fact_answer(query_text, label, val)
 
+    # --- Column-aware single-entity table lookup (before the greedy evidence
+    #     path) so a specific attribute returns the right cell, not a header. ---
+    if is_value_lookup:
+        single = _extract_single_entity_table_fact(query_text, cleaned_docs, focus_tokens)
+        if single:
+            return single
+
     # --- Generic evidence-driven value path: read the value the query asks for
     #     straight from the matching sentence/row, for any concept or domain. ---
     if is_value_lookup:
         for clean in cleaned_docs:
             ev = _extract_evidence_value_sentence(query_text, clean, require_value=False)
-            if ev:
+            # Never answer with a bare table header row (column names, no value);
+            # let the value-bearing row/sentence paths below handle it instead.
+            if ev and not _is_bare_table_header_line(ev):
                 return ev
 
     best_answer: str | None = None
@@ -28608,6 +29018,394 @@ def _strip_doc_structure_artifacts(text: str) -> str:
     return text
 
 
+def _is_pipe_table_footnote_cell(cell: str) -> bool:
+    c = str(cell or "").strip()
+    if len(c) > 55:
+        return True
+    if re.search(r"\b(may be|can be|on request|established accounts|subject to|see below)\b", c, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _looks_like_table_row_label(tail: str) -> bool:
+    t = str(tail or "").strip()
+    if not t or not re.match(r"^[A-Z]", t):
+        return False
+    if _is_pipe_table_footnote_cell(t):
+        return False
+    words = t.split()
+    return 1 <= len(words) <= 8 and len(t) <= 60
+
+
+def _looks_like_pipe_table_data_cell(cell: str) -> bool:
+    c = str(cell or "").strip()
+    if re.search(r"[\$€£]", c):
+        return True
+    if re.search(r"\b\d+(?:\.\d+)?\s*%", c):
+        return True
+    if re.search(r"\b\d+\s*-\s*\d+\s+business\s+days?\b", c, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:minutes?|hours?|same business day|held\s+\d)\b", c, flags=re.IGNORECASE):
+        return True
+    if re.search(r"/\s*day\b", c, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _split_pipe_table_merged_cells(parts: list[str]) -> list[str]:
+    out: list[str] = []
+    for part in parts:
+        cell = str(part or "").strip()
+        if not cell:
+            continue
+        if _is_pipe_table_footnote_cell(cell):
+            out.append(cell)
+            continue
+        m_fee_row = re.match(
+            r"^(\$[\d,]+(?:\.\d+)?(?:\s+[a-z]{2,15}){0,2})\s+([A-Z][A-Za-z].*)$",
+            cell,
+        )
+        if m_fee_row and _looks_like_table_row_label(m_fee_row.group(2)):
+            out.append(m_fee_row.group(1).strip())
+            out.append(m_fee_row.group(2).strip())
+            continue
+        m_free = re.match(r"^(Free|\$[\d,]+(?:\.\d+)?(?:\s*/\s*day)?)\s+([A-Z][A-Za-z].*)$", cell)
+        if m_free and _looks_like_table_row_label(m_free.group(2)):
+            out.append(m_free.group(1).strip())
+            out.append(m_free.group(2).strip())
+            continue
+        m = re.match(r"^(.+?\))\s+([A-Z][A-Za-z].*)$", cell)
+        if m and _looks_like_table_row_label(m.group(2)):
+            out.append(m.group(1).strip())
+            out.append(m.group(2).strip())
+            continue
+        m2 = re.match(
+            r"^(.+?%\s*(?:\([^)]+\))?)\s+([A-Z][A-Za-z][A-Za-z0-9\s\-().'/]+)$",
+            cell,
+        )
+        if m2 and _looks_like_table_row_label(m2.group(2)):
+            out.append(m2.group(1).strip())
+            out.append(m2.group(2).strip())
+            continue
+        out.append(cell)
+    return out
+
+
+def _split_pipe_table_merged_header(parts: list[str], col_count: int) -> list[str]:
+    if col_count <= 0 or len(parts) <= col_count:
+        return parts
+    idx = col_count - 1
+    cell = str(parts[idx] or "").strip()
+    if not cell:
+        return parts
+    m = re.match(r"^(fee|limit|notes|term|amount)\s+(.+)$", cell, flags=re.IGNORECASE)
+    if not m or len(m.group(2).strip()) < 2:
+        return parts
+    head = m.group(1).strip()
+    tail = m.group(2).strip()
+    parts[idx] = head.title() if head.lower() == "fee" else head
+    parts.insert(col_count, tail)
+    return parts
+
+
+def _looks_like_pipe_table_header_row(cells: list[str]) -> bool:
+    if not cells:
+        return False
+    if any(_looks_like_pipe_table_data_cell(c) for c in cells):
+        return False
+    labelish = 0
+    for cell in cells:
+        if re.search(r"[\$€£]|\d", cell):
+            continue
+        if re.search(r"\b(type|timing|limit|fee|product|amount|term|notes|balance|rate)\b", cell.lower()):
+            labelish += 1
+        elif len(cell.split()) <= 4:
+            labelish += 1
+    return labelish >= max(2, len(cells) // 2)
+
+
+# Small connector words that may appear INSIDE a Title-Case row label
+# (e.g. "Line of Credit", "Health & Safety"). Used to detect a row-boundary
+# glue where a PDF dropped the line break between a row's trailing text cell
+# and the next row's label cell. No document content — purely structural.
+_ROW_LABEL_CONNECTORS = frozenset({"of", "and", "the", "for", "de", "la", "&", "-"})
+
+
+def _split_pipe_table_trailing_labels(parts: list[str]) -> list[str]:
+    """Split cells where a row's trailing TEXT cell is fused to the next row's
+    Title-Case label (a common PDF table-flattening artifact: the row break is
+    lost so "...prose Next Label" lands in one pipe cell).
+
+    Conservative + generic: only splits when a clear multi/title-case label sits
+    at the END of a longer cell whose head still contains lowercase prose. The
+    caller (`_parse_flat_pipe_table`) self-validates the result against the
+    inferred column grid, so an over-split simply fails the grid check.
+    """
+    out: list[str] = []
+    for part in parts:
+        c = str(part or "").strip()
+        if not c or _is_pipe_table_footnote_cell(c):
+            out.append(c)
+            continue
+        words = c.split()
+        if len(words) < 4:
+            out.append(c)
+            continue
+        j = len(words)
+        while j > 0:
+            w = words[j - 1]
+            is_titlecase = bool(re.match(r"^[A-Z][A-Za-z0-9'&./-]*$", w))
+            is_connector = (w.lower() in _ROW_LABEL_CONNECTORS) and (j < len(words))
+            if is_titlecase or is_connector:
+                j -= 1
+            else:
+                break
+        label_words = words[j:]
+        # require a substantial prose head (>=2 words, with lowercase) and a
+        # plausible 1-4 word label that begins with a capital letter.
+        if 1 <= len(label_words) <= 4 and j >= 2:
+            head = " ".join(words[:j]).strip()
+            label = " ".join(label_words).strip()
+            if head and re.search(r"[a-z]", head) and re.match(r"^[A-Z]", label):
+                out.append(head)
+                out.append(label)
+                continue
+        out.append(c)
+    return out
+
+
+def _parse_flat_pipe_table(line: str) -> tuple[list[str], list[list[str]], str] | None:
+    parts = [p.strip() for p in str(line or "").split("|") if str(p or "").strip()]
+    footnote = ""
+    if parts:
+        last = parts[-1]
+        m_fn = re.match(r"^(Free)\s+(Limits\b.+)$", last, flags=re.IGNORECASE)
+        if m_fn and _is_pipe_table_footnote_cell(m_fn.group(2)):
+            parts[-1] = m_fn.group(1).strip()
+            footnote = m_fn.group(2).strip()
+        elif _is_pipe_table_footnote_cell(last):
+            footnote = parts.pop()
+    parts = _split_pipe_table_merged_cells(parts)
+    parts = _split_pipe_table_trailing_labels(parts)
+    if len(parts) < 6:
+        return None
+    for col_count in (4, 3, 5, 6, 2):
+        trial = _split_pipe_table_merged_header(list(parts), col_count)
+        if len(trial) < col_count + col_count:
+            continue
+        header = trial[:col_count]
+        body = trial[col_count:]
+        if len(body) % col_count != 0:
+            continue
+        if not _looks_like_pipe_table_header_row(header):
+            continue
+        rows = [body[i : i + col_count] for i in range(0, len(body), col_count)]
+        if not rows:
+            continue
+        if rows[-1] and _is_pipe_table_footnote_cell(rows[-1][-1]):
+            footnote = footnote or rows[-1][-1]
+            rows[-1][-1] = ""
+            if all(not str(c or "").strip() for c in rows[-1]):
+                rows.pop()
+        return header, rows, footnote
+    return None
+
+
+def _pipe_column_semantic(header: str) -> str:
+    h = str(header or "").strip().lower()
+    if re.search(r"\b(fee|cost|charge|price)\b", h):
+        return "fee"
+    if re.search(r"\b(timing|time|duration|speed|when)\b", h):
+        return "timing"
+    if re.search(r"\b(limit|maximum|max|cap)\b", h):
+        return "limit"
+    if re.search(r"\b(type|product|transfer|service|account)\b", h):
+        return "label"
+    return "other"
+
+
+def _should_return_full_pipe_table(query_text: str) -> bool:
+    q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    if not q:
+        return True
+    if re.search(
+        r"\b(all|each|every|compare|comparison|versus|vs\.?|list|overview|summarize|summary|breakdown)\b",
+        q,
+    ):
+        return True
+    if re.search(r"\bwhat are (?:the )?(?:transfer )?(?:types|options|methods|limits and fees|fees and limits)\b", q):
+        return True
+    if re.search(r"\btransfer limits\b", q) and not re.search(r"\b(how much|how long|cost|fee|take)\b", q):
+        return True
+    return False
+
+
+def _focus_markdown_table_for_query(query_text: str, md: str) -> str | None:
+    lines = [ln.strip() for ln in str(md or "").splitlines() if ln.strip().startswith("|")]
+    if len(lines) < 3:
+        return None
+    header_cells = [c.strip() for c in lines[0].split("|") if c.strip()]
+    if not header_cells:
+        return None
+    data_rows: list[list[str]] = []
+    for ln in lines[2:]:
+        cells = [c.strip() for c in ln.split("|") if c.strip()]
+        if not cells:
+            continue
+        if len(cells) != len(header_cells):
+            continue
+        if _is_pipe_table_footnote_cell(cells[-1]):
+            cells = cells[:-1]
+            if len(cells) != len(header_cells):
+                continue
+        data_rows.append(cells)
+    if len(data_rows) <= 1:
+        return None
+    concept = _evidence_concept_tokens(query_text)
+    best_row: list[str] | None = None
+    best_score = -1
+    for row in data_rows:
+        hits = sum(1 for tok in concept if tok in " ".join(row).lower())
+        if hits > best_score:
+            best_score = hits
+            best_row = row
+    if not best_row or best_score <= 0:
+        return None
+    return _format_matched_pipe_row_answer(query_text, header_cells, best_row)
+
+
+def _format_matched_pipe_row_answer(query_text: str, header: list[str], row: list[str]) -> str:
+    q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+    wants_timing = bool(
+        re.search(r"\b(how long|take|timing|when|duration|business day|days?\b|minutes?\b|hours?\b)\b", q)
+    )
+    wants_fee = bool(re.search(r"\b(how much|fee|fees|cost|charge|price)\b", q))
+    wants_limit = bool(re.search(r"\b(limit|maximum|max|cap)\b", q))
+
+    by_sem: dict[str, str] = {}
+    for h, v in zip(header, row):
+        sem = _pipe_column_semantic(h)
+        if v.strip():
+            by_sem[sem] = v.strip()
+    label = by_sem.get("label") or (row[0].strip() if row else "")
+
+    timing = by_sem.get("timing")
+    if not timing:
+        for v in row:
+            if re.search(r"\b(day|minute|hour|instant|same business|business day|held)\b", v, flags=re.IGNORECASE):
+                timing = v.strip()
+                break
+    fee = by_sem.get("fee")
+    if not fee:
+        for h, v in zip(header, row):
+            if _pipe_column_semantic(h) in {"limit", "timing", "label"}:
+                continue
+            if re.search(r"[\$€£]|(?:\d+(?:\.\d+)?\s?%)|^(?:free|no charge)\b", v, flags=re.IGNORECASE):
+                fee = v.strip()
+                break
+    limit = by_sem.get("limit")
+
+    if wants_fee and wants_timing and label and fee and timing:
+        return f"{label}: {timing}, {fee}."
+    if wants_fee and wants_timing and fee and timing:
+        return f"{timing}, {fee}."
+
+    selected: list[str] = []
+    if wants_timing and timing:
+        selected.append(timing)
+    if wants_fee and fee:
+        selected.append(fee)
+    if wants_limit and limit:
+        selected.append(limit)
+
+    if selected:
+        if label:
+            return f"{label}: {', '.join(selected)}."
+        return f"{', '.join(selected)}."
+
+    pairs = [f"{h}: {v}" for h, v in zip(header, row) if str(v or "").strip()]
+    return "; ".join(pairs) + "." if pairs else " ".join(row)
+
+
+def _extract_best_pipe_table_row_answer(query_text: str, line: str) -> str | None:
+    parsed = _parse_flat_pipe_table(line)
+    if not parsed:
+        return None
+    header, rows, _footnote = parsed
+    if not rows:
+        return None
+    if len(rows) == 1:
+        return _format_matched_pipe_row_answer(query_text, header, rows[0])
+    concept = _evidence_concept_tokens(query_text)
+    best_row: list[str] | None = None
+    best_score = -1
+    for row in rows:
+        row_text = " ".join(row).lower()
+        hits = sum(1 for tok in concept if tok in row_text)
+        if hits > best_score:
+            best_score = hits
+            best_row = row
+    if not best_row or best_score <= 0:
+        return None
+    return _format_matched_pipe_row_answer(query_text, header, best_row)
+
+
+def _format_pipe_delimited_tables(text: str, query_text: str | None = None) -> str:
+    """Convert inline pipe-delimited table blobs into GitHub-flavored markdown tables."""
+    raw = str(text or "").strip()
+    if raw.count("|") < 3:
+        return raw
+    query = _effective_user_query(query_text)
+    narrow = bool(query) and not _should_return_full_pipe_table(query)
+    if narrow:
+        flat = re.sub(r"\s*\|\s*", " | ", raw)
+        flat = re.sub(r"\s+", " ", flat).strip()
+        row_answer = _extract_best_pipe_table_row_answer(query, flat)
+        if row_answer:
+            return row_answer
+    if re.search(r"(?m)^\|\s*.+\|\s*$", raw) and re.search(r"(?m)^\|\s*[-:| ]+\|\s*$", raw):
+        if narrow:
+            focused = _focus_markdown_table_for_query(query, raw)
+            if focused:
+                return focused
+        return raw
+
+    def _line_to_markdown_table(line: str) -> str | None:
+        parsed = _parse_flat_pipe_table(line)
+        if not parsed:
+            return None
+        header, rows, footnote = parsed
+        col_count = len(header)
+        md_lines = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(["---"] * col_count) + " |",
+        ]
+        for row in rows:
+            md_lines.append("| " + " | ".join(row) + " |")
+        md = "\n".join(md_lines)
+        if footnote:
+            md += "\n\n" + footnote
+        return md
+
+    out_lines: list[str] = []
+    for line in raw.splitlines():
+        converted = _line_to_markdown_table(line.strip())
+        out_lines.append(converted if converted else line)
+    merged = "\n".join(out_lines).strip()
+    if merged.count("|") >= 6 and "\n" not in merged:
+        converted = _line_to_markdown_table(merged)
+        if converted:
+            merged = converted
+    if narrow and merged.count("|") >= 6:
+        focused = _focus_markdown_table_for_query(query, merged)
+        if focused:
+            return focused
+        row_answer = _extract_best_pipe_table_row_answer(query, merged)
+        if row_answer:
+            return row_answer
+    return merged
+
+
 def _cleanup_final_answer_text(answer_text: str) -> str:
     raw = _strip_doc_structure_artifacts(str(answer_text or "").strip())
     txt = clean_ocr_noise(_repair_split_words(re.sub(r"[ \t]+", " ", raw).strip()))
@@ -28739,7 +29537,7 @@ def _cleanup_final_answer_text(answer_text: str) -> str:
 
     txt = re.sub(r"\s{2,}", " ", txt).strip()
     txt = txt.strip('"\'“”‘’')
-    return txt
+    return _format_pipe_delimited_tables(txt)
 
 
 _AR_FINAL_POLISH_STOPWORDS: set[str] = {
@@ -28981,6 +29779,50 @@ def _retrieval_evidence_metrics(query_text: str, retrieved_docs: list[dict]) -> 
         "max_similarity": float(_max_doc_similarity(retrieved_docs)),
         "query_tokens": float(len(set(tokens))),
     }
+
+
+_RAG_NOTFOUND_TELEMETRY = os.environ.get("RAG_NOTFOUND_TELEMETRY", "1") not in ("0", "false", "False")
+
+
+def _emit_not_found_telemetry(
+    query_text: str,
+    *,
+    reason: str = "",
+    answer_type: str = "",
+    source_mode: str = "",
+    retrieved_docs: list[dict] | None = None,
+) -> None:
+    """Single structured line attributing a not-found to its firing guard.
+
+    Helps diagnose false negatives (good answers dropped by a guard) by pairing
+    the rejection reason with retrieval evidence strength. Env-gated (default on)
+    via RAG_NOTFOUND_TELEMETRY. Purely observational; changes no behaviour.
+    """
+    if not _RAG_NOTFOUND_TELEMETRY:
+        return
+    try:
+        docs = retrieved_docs or []
+        route = ""
+        try:
+            route = _resolve_grounded_answer_route(query_text)
+        except Exception:
+            route = ""
+        metrics = _retrieval_evidence_metrics(query_text, docs) if docs else {}
+        logger.info(
+            "[NOT FOUND TELEMETRY] reason=%s answer_type=%s source_mode=%s route=%s docs=%d "
+            "coverage=%.2f focus_ratio=%.2f max_similarity=%.2f query=%r",
+            reason or "",
+            answer_type or "",
+            source_mode or "",
+            route or "",
+            len(docs),
+            float(metrics.get("coverage", 0.0) or 0.0),
+            float(metrics.get("focus_ratio", 0.0) or 0.0),
+            float(metrics.get("max_similarity", 0.0) or 0.0),
+            str(query_text or "")[:160],
+        )
+    except Exception:
+        pass
 
 
 def _is_weak_retrieval_evidence(query_text: str, family: str, retrieved_docs: list[dict]) -> bool:
@@ -29837,6 +30679,86 @@ def _customer_service_no_match_response(query: str, language: str | None = None)
     return CS_NO_MATCH_RESPONSE_AR if lang == "ar" else CS_NO_MATCH_RESPONSE_EN
 
 
+_RAG_SOFT_FALLBACK = os.environ.get("RAG_SOFT_FALLBACK", "1") not in ("0", "false", "False")
+
+
+def _evidence_backed_soft_answer(query: str, doc_dicts: List[Dict[str, Any]]) -> str | None:
+    """Last-resort grounded snippet when a guard rejected an otherwise-answerable query.
+
+    Only returns text that already exists in retrieved chunks and passes the
+    standard grounding check, so no fabricated values are ever surfaced. This
+    converts false 'not found' into the actual evidence the user asked for.
+    Env-gated (RAG_SOFT_FALLBACK, default on) so the behaviour is reversible.
+    Fully document-agnostic: it reuses the generic deterministic extractors.
+    """
+    if not _RAG_SOFT_FALLBACK:
+        return None
+    docs = list(doc_dicts or [])
+    if not docs:
+        return None
+    # Skip conversational / out-of-scope queries: those should stay "not found".
+    try:
+        if _skip_deterministic_rag_shortcuts(query):
+            return None
+    except Exception:
+        pass
+
+    # FAQ Q&A pairs are the strongest grounded signal when present.
+    faq = _extract_faq_answer(query, docs)
+    if faq and not _is_low_quality_soft_snippet(faq):
+        logger.info("[SOFT FALLBACK] recovered faq answer=%s", faq[:200])
+        return faq
+
+    candidates: list[str] = []
+    try:
+        route = _resolve_grounded_answer_route(query)
+    except Exception:
+        route = "generic"
+
+    # Prefer the extractor matching the query's intent, then fall back to others.
+    extractors = []
+    if route == "fact" or _is_numeric_fact_lookup_query(query):
+        extractors = [_extract_table_fact_answer, _extract_fact_route_answer,
+                      _extract_best_scored_concept_sentence_from_docs]
+    elif route == "definition":
+        extractors = [_extract_simple_definition_sentence,
+                      _extract_best_scored_concept_sentence_from_docs]
+    else:
+        extractors = [_extract_best_scored_concept_sentence_from_docs,
+                      _extract_table_fact_answer]
+
+    for fn in extractors:
+        try:
+            out = fn(query, docs)
+        except Exception:
+            out = None
+        if out and str(out).strip() and str(out).strip().lower() != RAG_NO_MATCH_RESPONSE.lower():
+            candidates.append(str(out).strip())
+
+    for cand in candidates:
+        if _is_low_quality_soft_snippet(cand):
+            continue
+        try:
+            if _is_answer_grounded_in_docs(cand, docs, query_text=query):
+                logger.info("[SOFT FALLBACK] recovered grounded answer=%s", cand[:200])
+                return cand
+        except Exception:
+            continue
+    return None
+
+
+def _is_low_quality_soft_snippet(text: str) -> bool:
+    """Reject fragmentary soft-fallback snippets (e.g. a stray 'Q: 1.' fragment)."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(t) < 12:
+        return True
+    # A bare "Q:" / "A:" lead-in with almost no content is not an answer.
+    if re.match(r"^[QA]\s*[:\-.]", t, flags=re.IGNORECASE) and len(t) < 40:
+        return True
+    words = re.findall(r"[A-Za-z]{2,}", t)
+    return len(words) < 3
+
+
 def _apply_not_found_ux(
     query: str,
     answer: str,
@@ -29890,6 +30812,16 @@ def _apply_not_found_ux(
     if ans.lower() != RAG_NO_MATCH_RESPONSE.lower():
         logger.info("[POSTPROCESS FINAL ANSWER] %s", ans[:280])
         return ans
+
+    # Evidence-backed soft fallback: a guard rejected the answer, but the
+    # retrieved chunks may still contain the grounded fact/definition the user
+    # asked for. Surface it instead of a false "not found".
+    soft = _evidence_backed_soft_answer(query, doc_dicts or [])
+    if soft:
+        recovered = _finalize(soft)
+        if recovered.lower() != RAG_NO_MATCH_RESPONSE.lower():
+            logger.info("[POSTPROCESS FINAL ANSWER] soft_fallback=%s", recovered[:280])
+            return recovered
 
     final = _finalize_user_visible_answer(query, RAG_NO_MATCH_RESPONSE, language, doc_dicts or None)
     logger.info("[POSTPROCESS FINAL ANSWER] %s", final[:280])
@@ -31133,6 +32065,14 @@ def _enforce_runtime_answer_acceptance(query: str, decision: Dict[str, Any], ret
             rejected,
             rejection_reason,
         )
+        if rejected:
+            _emit_not_found_telemetry(
+                query,
+                reason=rejection_reason,
+                answer_type=str(dec.get("answer_type") or ""),
+                source_mode=str(dec.get("source_mode") or ""),
+                retrieved_docs=retrieved_docs,
+            )
 
     ans = dec.get("answer")
     if ans is None:
@@ -31310,7 +32250,13 @@ def _enforce_runtime_answer_acceptance(query: str, decision: Dict[str, Any], ret
         align = _list_query_alignment_metrics(query, shaped)
         mismatch_penalty = float(align.get("mismatch_penalty", 0.0) or 0.0)
         _effective_mismatch_threshold = 1.5
-        if mismatch_penalty > _effective_mismatch_threshold:
+        # Deterministic route-list answers are extracted directly from a matching
+        # document region and are grounded by construction; exempt them from the
+        # lexical token-mismatch rejection (mirrors the inner fast-guard at
+        # _assess_list_coherence). This de-falses synonym/morphology cases where
+        # the list is correct but shares no exact focus token with the query.
+        _route_list_answer = str(dec.get("answer_type") or "").startswith("list_route")
+        if mismatch_penalty > _effective_mismatch_threshold and not _route_list_answer:
             logger.info("[LIST TOKEN MISMATCH] rejected=true penalty=%.3f threshold=%.1f focus_hits=%s context_hits=%s items=%s", mismatch_penalty, _effective_mismatch_threshold, int(align.get("focus_hit_items", 0.0)), int(align.get("context_hit_items", 0.0)), int(align.get("item_count", 0.0)))
             dec["answer"] = RAG_NO_MATCH_RESPONSE
             dec["used_llm"] = False
@@ -32692,6 +33638,14 @@ def _shared_rag_final_answer_decision( # type: ignore
             rejected,
             rejection_reason,
         )
+        if rejected:
+            _emit_not_found_telemetry(
+                query,
+                reason=rejection_reason or "not_found",
+                answer_type=str(answer_type or ""),
+                source_mode=str(answer_source_mode or ""),
+                retrieved_docs=routed_docs or doc_dicts or [],
+            )
         return {
             "intent": intent,
             "query_family": family_v2,
@@ -32711,6 +33665,19 @@ def _shared_rag_final_answer_decision( # type: ignore
         len(routed_docs or doc_dicts or []),
     )
     route_docs = list(routed_docs or doc_dicts or [])
+
+    # FAQ-aware deterministic answer: when retrieved chunks contain flattened
+    # "Q: ... A: ..." pairs, answer from the pair whose question matches the
+    # user's query (verbatim, grounded). This runs across all routes because a
+    # FAQ can answer fact/definition/explanatory questions alike, and it fixes
+    # the case where the whole FAQ is one chunk and naive extraction grabs the
+    # wrong (first) pair. Document-agnostic; high-precision guard inside.
+    faq_answer = _extract_faq_answer(query, route_docs)
+    if faq_answer:
+        answer_source_mode = "support_kb"
+        logger.info("[ANSWER ROUTE] mode=faq_pair deterministic=true answer=%s", faq_answer[:220])
+        return _result(faq_answer, used_llm=False, answer_type="faq_pair_extractor", items_count=1)
+
     cmp_left_early, cmp_right_early = _compare_terms_from_query(query)
     if family_v2 != "definition_comparison" and cmp_left_early and cmp_right_early:
         answer_source_mode = "compare"
@@ -32729,6 +33696,13 @@ def _shared_rag_final_answer_decision( # type: ignore
                 answer_source_mode = "definition"
                 logger.info("[ANSWER ROUTE] mode=definition_comparison deterministic=true answer=%s", comparison_route_answer[:220])
                 return _result(comparison_route_answer, used_llm=False, answer_type="definition_comparison_extractor", items_count=1)
+            # Per-entity grounded fallback: answer whichever side(s) ARE defined
+            # in the docs rather than a blanket not-found (gated + grounded).
+            partial_comparison = _compose_partial_comparison_answer(query, route_docs)
+            if partial_comparison:
+                answer_source_mode = "definition"
+                logger.info("[ANSWER ROUTE] mode=definition_comparison partial=true answer=%s", partial_comparison[:220])
+                return _result(partial_comparison, used_llm=False, answer_type="definition_comparison_partial", items_count=1)
             answer_source_mode = "not_found_guard"
             logger.info("[DEFINITION COMPARISON] rejected reason=no_supported_structured_answer")
             return _result(RAG_NO_MATCH_RESPONSE, used_llm=False, answer_type="definition_comparison_not_found", items_count=0)
@@ -35602,7 +36576,10 @@ async def call_llm_with_rag(text: str, connection_id: str, user):  # pyright: ig
         elif query_family == "overview_chapter_compare":
             top_k_req = 2
         else:
-            top_k_req = 3
+            # Default generic family: widened from 3 -> 5 so hybrid (BM25+vector)
+            # fusion and the cross-encoder have more candidates to choose from.
+            # The final per-query cap (5/8) in VectorStore is unchanged.
+            top_k_req = 5
         logger.info("[TOPK TRACE] requested=%s actual=%s function=call_llm_with_rag", top_k_req, top_k_req)
         if is_definition_fast:
             relevant_docs = await _search_fast_definition_minimal_async(text)
@@ -42882,6 +43859,46 @@ async def statistics():
     }
 
 
+KB_STATUS_ENRICH_TIMEOUT_S = 8.0
+
+
+def _enrich_kb_status_snapshot(
+    snapshot: dict,
+    *,
+    scope_tid,
+    assets_dir,
+    tenant_id: int,
+) -> None:
+    """Best-effort collection stats for /kb_status (runs off the event loop)."""
+    from backend.knowledge_base import find_orphan_asset_files, get_or_create_collection
+
+    kb_col = get_or_create_collection(allow_empty=True, tenant_id=scope_tid)
+    snapshot["active_collection"] = getattr(kb_col, "name", None) if kb_col else None
+    collection_count = kb_col.count() if kb_col else 0
+    snapshot["collection_chunks"] = collection_count
+    snapshot["indexed_chunks"] = collection_count
+    prev_total = snapshot.get("total_chunks")
+    if isinstance(prev_total, int) and prev_total > 0:
+        snapshot["total_chunks"] = max(prev_total, collection_count)
+    else:
+        snapshot["total_chunks"] = collection_count
+    if (
+        isinstance(snapshot.get("indexed_chunks"), int)
+        and isinstance(snapshot.get("total_chunks"), int)
+        and snapshot["total_chunks"] > 0
+        and snapshot["indexed_chunks"] > snapshot["total_chunks"]
+    ):
+        snapshot["total_chunks"] = snapshot["indexed_chunks"]
+    if int(tenant_id) == int(DEFAULT_TENANT_ID):
+        retrieval_col = getattr(getattr(live_rag, "vs", None), "collection", None)
+        snapshot["retrieval_collection"] = getattr(retrieval_col, "name", None) if retrieval_col else None
+    else:
+        tenant_mgr = get_tenant_rag(tenant_id)
+        retrieval_col = getattr(getattr(tenant_mgr, "vs", None), "collection", None)
+        snapshot["retrieval_collection"] = getattr(retrieval_col, "name", None) if retrieval_col else None
+    snapshot["orphan_files"] = find_orphan_asset_files(assets_dir)
+
+
 @app.get("/kb_status")
 async def kb_status(user=Depends(require_login())):
     """KB pipeline state for admin upload polling (tenant-scoped).
@@ -42907,33 +43924,18 @@ async def kb_status(user=Depends(require_login())):
         snapshot["stage"] = "ready"
         snapshot["percent"] = 100
     try:
-        from backend.knowledge_base import find_orphan_asset_files, get_or_create_collection
-
-        kb_col = get_or_create_collection(allow_empty=True, tenant_id=scope_tid)
-        snapshot["active_collection"] = getattr(kb_col, "name", None) if kb_col else None
-        collection_count = kb_col.count() if kb_col else 0
-        snapshot["collection_chunks"] = collection_count
-        snapshot["indexed_chunks"] = collection_count
-        prev_total = snapshot.get("total_chunks")
-        if isinstance(prev_total, int) and prev_total > 0:
-            snapshot["total_chunks"] = max(prev_total, collection_count)
-        else:
-            snapshot["total_chunks"] = collection_count
-        if (
-            isinstance(snapshot.get("indexed_chunks"), int)
-            and isinstance(snapshot.get("total_chunks"), int)
-            and snapshot["total_chunks"] > 0
-            and snapshot["indexed_chunks"] > snapshot["total_chunks"]
-        ):
-            snapshot["total_chunks"] = snapshot["indexed_chunks"]
-        if int(tenant_id) == int(DEFAULT_TENANT_ID):
-            retrieval_col = getattr(getattr(live_rag, "vs", None), "collection", None)
-            snapshot["retrieval_collection"] = getattr(retrieval_col, "name", None) if retrieval_col else None
-        else:
-            tenant_mgr = get_tenant_rag(tenant_id)
-            retrieval_col = getattr(getattr(tenant_mgr, "vs", None), "collection", None)
-            snapshot["retrieval_collection"] = getattr(retrieval_col, "name", None) if retrieval_col else None
-        snapshot["orphan_files"] = find_orphan_asset_files(assets_dir)
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                _enrich_kb_status_snapshot,
+                snapshot,
+                scope_tid=scope_tid,
+                assets_dir=assets_dir,
+                tenant_id=int(tenant_id),
+            ),
+            timeout=KB_STATUS_ENRICH_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        snapshot["status_error"] = "collection stats temporarily unavailable"
     except Exception as status_err:
         snapshot["status_error"] = str(status_err)
     return snapshot
@@ -43041,6 +44043,7 @@ async def _finalize_tenant_pdf_upload_background(
     base helpers, so a business's documents are physically stored in a separate
     ChromaDB collection and can never be retrieved by another tenant.
     """
+    global _current_active_doc_id
     try:
         _set_kb_pipeline_stage("extracting", message="Extracting text", filename=filename)
         text = await asyncio.to_thread(_extract_text_from_asset, save_path)
@@ -43119,6 +44122,9 @@ async def _finalize_tenant_pdf_upload_background(
             mgr.vs = None
         except Exception as _rebind_err:
             logger.warning("[TENANT UPLOAD] retrieval rebind skipped: %s", _rebind_err)
+
+        _register_active_source(normalized_filename or original_filename or filename)
+        _current_active_doc_id = _normalize_source_label(normalized_filename or original_filename or filename)
 
         _set_kb_pipeline_state(
             "ready",

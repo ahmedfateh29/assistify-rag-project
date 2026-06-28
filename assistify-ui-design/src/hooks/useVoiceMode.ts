@@ -400,6 +400,11 @@ export function useVoiceMode({
           wsAudioStateRef.current = "playing";
           scheduleAllPending();
         }
+        // Progressive TTS sends ttsAudioEnd per chunk; only ttsComplete marks the full reply done.
+        const chunkTotal = Number(msg.chunk_total ?? 0);
+        if (chunkTotal > 0) return;
+        completeVoiceTurn();
+      } else if (type === "ttsComplete" || type === "arabic_tts_complete") {
         completeVoiceTurn();
       } else if (type === "ttsFallback") {
         const fb = String(msg.text ?? assistantBufferRef.current ?? "").trim();

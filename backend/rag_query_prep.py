@@ -46,14 +46,41 @@ _MID_CONVERSATIONAL = re.compile(
     re.IGNORECASE,
 )
 
+# Leading question / request framing to remove before KB search. Document-agnostic:
+# strips interrogative wrappers while preserving entity names and attributes.
+_QUESTION_OPENER_EN = re.compile(
+    r"^\s*(?:"
+    r"(?:what|which|who|when|where)(?:'s|\s+is|\s+are)(?:\s+the|\s+a|\s+an)?\s+|"
+    r"(?:how)(?:'s|\s+is|\s+are|\s+much|\s+many|\s+long|\s+often|\s+does|\s+do|\s+did|\s+can)?(?:\s+the|\s+a|\s+an)?\s+|"
+    r"why(?:'s|\s+is|\s+are|\s+did|\s+does|\s+do|\s+might(?:\s+there\s+be|\s+it\s+be)?|\s+would|\s+could)?\s+|"
+    r"(?:can|could)\s+you(?:\s+please)?\s+(?:tell\s+me\s+)?(?:what|how|why|when|where|which|who|about)?\s*|"
+    r"(?:please\s+)?(?:tell\s+me|explain)(?:\s+what|\s+how|\s+why|\s+when|\s+where|\s+which|\s+who|\s+about)?\s*|"
+    r"i(?:'d|\s+would)\s+like\s+to\s+know(?:\s+what|\s+how|\s+why|\s+when|\s+where|\s+which|\s+who|\s+about)?\s*|"
+    r"i\s+want\s+to\s+know(?:\s+what|\s+how|\s+why|\s+when|\s+where|\s+which|\s+who|\s+about)?\s*"
+    r")",
+    re.IGNORECASE,
+)
+
+_LEADING_ARTICLE_EN = re.compile(r"^\s*(?:the|a|an)\s+", re.IGNORECASE)
+
 _LLM_PREP_SYSTEM = (
-    "You normalize user messages for a knowledge-base search system.\n"
+    "You extract a compact knowledge-base SEARCH PHRASE from user messages.\n"
     "Return ONLY valid JSON with keys action and query.\n"
     "action must be rag or smalltalk.\n"
-    "If the message is only a greeting/thanks/ack with no real question, use smalltalk and query=\"\".\n"
-    "Otherwise use rag and put ONE concise question in query (no greetings, no sidetalk).\n"
-    "Preserve entity names and technical terms exactly.\n"
-    "Example: {\"action\":\"rag\",\"query\":\"what is gasoline?\"}"
+    "Use smalltalk only when the message is ONLY a greeting/thanks/ack with no real "
+    "information need; then query=\"\".\n"
+    "Otherwise use rag and put a SHORT search phrase in query — keywords the KB can "
+    "match, NOT a full question.\n"
+    "Rules for query:\n"
+    "- NO greetings, thanks, filler, or sidetalk.\n"
+    "- NO question words (what/how/why/when/where/who/which) and NO question mark.\n"
+    "- KEEP every entity name, product name, and technical term EXACTLY as written.\n"
+    "- KEEP ALL items when the user lists multiple (and/or); do not drop any.\n"
+    "- KEEP the attribute or topic asked about (fees, limits, balance, term, hold, etc.).\n"
+    'Example: user "What are the minimum balance requirements for Everyday Checking '
+    'and Money Market?" -> {"action":"rag","query":"minimum balance requirements '
+    'Everyday Checking Money Market accounts"}\n'
+    'Example: user "hello" -> {"action":"smalltalk","query":""}'
 )
 
 
@@ -76,6 +103,31 @@ def strip_conversational_prefix(text: str) -> str:
         t = _CONV_PREFIX_EN.sub("", t).strip()
         t = _CONV_PREFIX_AR.sub("", t).strip()
     return t
+
+
+def strip_question_framing(text: str) -> str:
+    """Remove interrogative wrappers; keep entities, attributes, and conjunctions."""
+    if not text:
+        return ""
+    t = str(text).strip()
+    prev = None
+    while prev != t:
+        prev = t
+        t = _QUESTION_OPENER_EN.sub("", t).strip()
+    t = _LEADING_ARTICLE_EN.sub("", t, count=1).strip()
+    return t.rstrip("?.!").strip()
+
+
+def extract_search_intent(text: str) -> str:
+    """Rule-based KB search phrase: strip greetings then question framing."""
+    t = strip_question_framing(strip_conversational_prefix(text))
+    return t if _is_substantive(t) else str(text or "").strip()
+
+
+def _finalize_search_phrase(text: str) -> str:
+    """Last-pass cleanup so RAG always receives a phrase, never a question."""
+    t = strip_question_framing(str(text or "").strip())
+    return t if _is_substantive(t) else str(text or "").strip()
 
 
 def _is_substantive(text: str) -> bool:
@@ -104,18 +156,25 @@ def is_pure_conversational_only(original: str, stripped: str) -> bool:
 def needs_llm_query_prep(original: str, stripped: str) -> bool:
     if not RAG_QUERY_LLM_PREP:
         return False
-    if not stripped or stripped.strip().lower() == original.strip().lower():
-        # Still mixed if conversational tokens remain mid-message
-        if _MID_CONVERSATIONAL.search(stripped) and _looks_like_document_question(stripped):
+    orig = str(original or "").strip()
+    work = str(stripped or "").strip()
+    if not work:
+        return False
+    # Always polish real KB/document questions through the LLM layer so RAG receives
+    # a compact search phrase instead of conversational interrogatives.
+    if _looks_like_document_question(orig) or _looks_like_document_question(work):
+        return True
+    if orig.lower() == work.lower():
+        if _MID_CONVERSATIONAL.search(work) and _looks_like_document_question(work):
             return True
         return False
-    if "," in original and _looks_like_document_question(stripped):
+    if "," in orig and _looks_like_document_question(work):
         return True
-    if len(original.split()) > 12 and _MID_CONVERSATIONAL.search(original):
+    if len(orig.split()) > 12 and _MID_CONVERSATIONAL.search(orig):
         return True
-    if _MID_CONVERSATIONAL.search(stripped) and _looks_like_document_question(stripped):
+    if _MID_CONVERSATIONAL.search(work) and _looks_like_document_question(work):
         return True
-    return stripped.strip().lower() != original.strip().lower()
+    return work.lower() != orig.lower()
 
 
 def _looks_like_document_question(text: str) -> bool:
@@ -204,24 +263,12 @@ async def llm_normalize_rag_query(text: str) -> Optional[PreparedQuery]:
         except Exception:
             return PreparedQuery(original=text, rag_query="", direct_response=None, prep_source="llm")
     if query:
-        return PreparedQuery(original=text, rag_query=query, prep_source="llm")
+        return PreparedQuery(
+            original=text,
+            rag_query=_finalize_search_phrase(query),
+            prep_source="llm",
+        )
     return None
-
-
-def _apply_spelling_correction(text: str) -> str:
-    try:
-        from backend.assistify_rag_server import _spelling_correction_preserving_exact_terms
-
-        corrected = _spelling_correction_preserving_exact_terms(text)
-        return corrected if corrected else text
-    except Exception:
-        return text
-
-
-def _smalltalk_direct_response(text: str) -> str:
-    from backend.assistify_rag_server import _smalltalk_response
-
-    return _smalltalk_response(text)
 
 
 async def prepare_query_for_rag(text: str) -> PreparedQuery:
@@ -239,7 +286,9 @@ async def prepare_query_for_rag(text: str) -> PreparedQuery:
             prep_source="rules",
         )
 
-    working = stripped if _is_substantive(stripped) else original
+    # Rule-based search intent is always applied first so RAG never sees raw
+    # interrogatives like "What are the ...?" even when the LLM is unavailable.
+    working = extract_search_intent(original)
     prep_source: PrepSource = "rules"
 
     if needs_llm_query_prep(original, working):
@@ -251,7 +300,7 @@ async def prepare_query_for_rag(text: str) -> PreparedQuery:
                 working = llm_result.rag_query
                 prep_source = "llm"
 
-    rag_query = _apply_spelling_correction(working)
+    rag_query = _apply_spelling_correction(_finalize_search_phrase(working))
     logger.info(
         "[QUERY PREP] original='%s' rag_query='%s' source=%s",
         original[:160],
@@ -259,3 +308,19 @@ async def prepare_query_for_rag(text: str) -> PreparedQuery:
         prep_source,
     )
     return PreparedQuery(original=original, rag_query=rag_query, prep_source=prep_source)
+
+
+def _apply_spelling_correction(text: str) -> str:
+    try:
+        from backend.assistify_rag_server import _spelling_correction_preserving_exact_terms
+
+        corrected = _spelling_correction_preserving_exact_terms(text)
+        return corrected if corrected else text
+    except Exception:
+        return text
+
+
+def _smalltalk_direct_response(text: str) -> str:
+    from backend.assistify_rag_server import _smalltalk_response
+
+    return _smalltalk_response(text)

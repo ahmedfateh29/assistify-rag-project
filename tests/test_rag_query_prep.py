@@ -12,10 +12,12 @@ if str(ROOT) not in sys.path:
 
 from backend.rag_query_prep import (
     PreparedQuery,
+    extract_search_intent,
     is_pure_conversational_only,
     needs_llm_query_prep,
     prepare_query_for_rag,
     strip_conversational_prefix,
+    strip_question_framing,
 )
 
 
@@ -128,3 +130,46 @@ def test_gasoline_unchanged() -> None:
 def test_needs_llm_on_comma_mix() -> None:
     stripped = strip_conversational_prefix("hello, also what is gasoline")
     assert needs_llm_query_prep("hello, also what is gasoline", stripped)
+
+
+def test_strip_question_framing_what_are() -> None:
+    q = "What are the minimum balance requirements for the Everyday Checking and Money Market accounts?"
+    out = strip_question_framing(q)
+    assert out.lower().startswith("minimum balance")
+    assert "what are" not in out.lower()
+    assert "everyday checking" in out.lower()
+    assert "money market" in out.lower()
+
+
+def test_extract_search_intent_normalizes_both_phrasings() -> None:
+    formal = "What are the minimum balance requirements for the Everyday Checking and Money Market accounts?"
+    informal = "the minimum balance requirements for the Everyday Checking and Money Market accounts?"
+    a = extract_search_intent(formal).lower()
+    b = extract_search_intent(informal).lower()
+    assert a == b
+    assert "what are" not in a
+    assert "everyday checking" in a
+    assert "money market" in a
+
+
+def test_prepare_strips_what_are_without_llm() -> None:
+    q = "What are the minimum balance requirements for the Everyday Checking and Money Market accounts?"
+    with patch(
+        "backend.rag_query_prep.needs_llm_query_prep",
+        return_value=False,
+    ), patch(
+        "backend.rag_query_prep._apply_spelling_correction",
+        side_effect=lambda t: t,
+    ):
+        prepared = asyncio.run(prepare_query_for_rag(q))
+    assert prepared.direct_response is None
+    assert "what are" not in prepared.rag_query.lower()
+    assert "minimum balance" in prepared.rag_query.lower()
+    assert "everyday checking" in prepared.rag_query.lower()
+    assert "money market" in prepared.rag_query.lower()
+
+
+def test_needs_llm_on_document_question_even_without_prefix_strip() -> None:
+    q = "What are the minimum balance requirements for Everyday Checking?"
+    stripped = extract_search_intent(q)
+    assert needs_llm_query_prep(q, stripped)

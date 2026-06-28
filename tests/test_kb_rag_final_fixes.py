@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from pathlib import Path
 
@@ -116,6 +117,100 @@ def test_kb_pipeline_stage_clamps_indexed_to_total() -> None:
     _set_kb_pipeline_stage("writing", indexed=120, total=100, percent=100)
     assert srv._kb_pipeline_state["indexed_chunks"] == 100
     assert srv._kb_pipeline_state["total_chunks"] == 100
+
+
+def test_active_source_filter_bypassed_for_tenant_isolated_retrieval() -> None:
+    from backend import assistify_rag_server as srv
+
+    sample = [{"metadata": {"normalized_filename": "handbook.pdf"}, "text": "fee schedule"}]
+    token = srv._request_tenant_id.set(6)
+    try:
+        assert srv._uses_tenant_isolated_retrieval() is True
+        assert len(srv._filter_results_to_active_sources(sample)) == 1
+        assert len(srv._filter_doc_dicts_to_active_sources(sample)) == 1
+    finally:
+        srv._request_tenant_id.reset(token)
+
+    default_token = srv._request_tenant_id.set(srv.DEFAULT_TENANT_ID)
+    try:
+        srv._active_doc_registry["active_sources"] = set()
+        assert srv._filter_results_to_active_sources(sample) == []
+    finally:
+        srv._request_tenant_id.reset(default_token)
+
+
+def test_numeric_fee_query_skips_definition_rewrite() -> None:
+    from backend import assistify_rag_server as srv
+
+    query = "What is the standard fee for an expedited card replacement?"
+    grounded = (
+        "To replace a lost or damaged card, choose 'Replace card' - "
+        "standard replacement is free; expedited is $25."
+    )
+    assert srv._is_ws_definition_query_mode(query) is False
+    fixed = srv._ws_fix_explanation_answer(query, grounded, [])
+    assert "refers to" not in fixed.lower()
+    assert "expedited is $25" in fixed or "expedited is $25." in fixed
+
+
+def test_pipe_delimited_tables_convert_to_markdown() -> None:
+    from backend import assistify_rag_server as srv
+
+    raw = (
+        "Transfer type | Typical timing | Limit (standard) | Fee ACH (bank-to-bank) | "
+        "1-3 business days | $25,000 / day | Free Instant debit-card transfer | Minutes | "
+        "$5,000 / day | 1.5% (min $0.50) Domestic wire | Same business day | $100,000 / day | $15 outgoing Mobile check deposit | "
+        "Held 1-5 business days | $10,000 / day | Free Peer-to-peer (Meridian Pay) | Minutes | "
+        "$2,500 / day | Free Limits may be higher for established accounts and can be reviewed on request."
+    )
+    md = srv._format_pipe_delimited_tables(raw)
+    assert md.startswith("| Transfer type | Typical timing | Limit (standard) | Fee |")
+    assert re.search(r"\|\s*---\s*\|\s*---\s*\|\s*---\s*\|\s*---\s*\|", md)
+    assert "ACH (bank-to-bank) | 1-3 business days | $25,000 / day | Free |" in md
+    assert "Domestic wire | Same business day | $100,000 / day | $15 outgoing |" in md
+    assert "Peer-to-peer (Meridian Pay) | Minutes | $2,500 / day | Free |" in md
+    assert "Limits may be higher" in md
+    assert "Free Limits may be higher" not in md
+
+
+def test_wire_transfer_query_returns_matching_row_not_full_table() -> None:
+    raw = (
+        "Transfer type | Typical timing | Limit (standard) | Fee ACH (bank-to-bank) | "
+        "1-3 business days | $25,000 / day | Free Instant debit-card transfer | Minutes | "
+        "$5,000 / day | 1.5% (min $0.50) Domestic wire | Same business day | $100,000 / day | $15 outgoing Mobile check deposit | "
+        "Held 1-5 business days | $10,000 / day | Free Peer-to-peer (Meridian Pay) | Minutes | "
+        "$2,500 / day | Free Limits may be higher for established accounts and can be reviewed on request."
+    )
+    docs = [{"page_content": raw, "metadata": {"filename": "handbook.pdf"}}]
+    q = "How much does an outgoing domestic wire transfer cost, and how long does it take?"
+    answer = _extract_table_fact_answer(q, docs)
+    assert answer is not None
+    assert "$15" in answer
+    assert "business day" in answer.lower()
+    assert "ACH" not in answer
+    assert "Instant debit-card transfer" not in answer
+
+    from backend import assistify_rag_server as srv
+
+    full_md = srv._format_pipe_delimited_tables(raw)
+    focused = srv._format_pipe_delimited_tables(raw, query_text=q)
+    assert "ACH (bank-to-bank)" in full_md
+    assert "ACH" not in focused
+    assert "$15" in focused
+
+
+def test_cleanup_preserves_markdown_table_separator() -> None:
+    from backend import assistify_rag_server as srv
+
+    raw = (
+        "Transfer type | Typical timing | Limit (standard) | Fee ACH (bank-to-bank) | "
+        "1-3 business days | $25,000 / day | Free Instant debit-card transfer | Minutes | "
+        "$5,000 / day | 1.5% (min $0.50) Domestic wire | Same business day | $100,000 / day | $15 outgoing"
+    )
+    md = srv._format_pipe_delimited_tables(raw)
+    cleaned = srv._cleanup_final_answer_text(md)
+    assert re.search(r"\|\s*---\s*\|", cleaned)
+    assert "ACH (bank-to-bank)" in cleaned
 
 
 if __name__ == "__main__":

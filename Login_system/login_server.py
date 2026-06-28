@@ -4512,7 +4512,7 @@ def list_knowledge_files(request: Request, user=Depends(require_api_role("admin"
 async def proxy_kb_status(request: Request, user=Depends(require_api_role("admin", "master_admin", "employee"))):
     """Proxy the RAG ingestion status for the admin knowledge page."""
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.get(
                 f"{RAG_HTTP_BASE}/kb_status",
                 headers=_rag_proxy_headers(request),

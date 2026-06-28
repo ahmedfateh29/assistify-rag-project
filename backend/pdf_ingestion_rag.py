@@ -126,10 +126,137 @@ def _query_embed_cache_put(key: str, embedding: list[float]) -> None:
         _QUERY_EMBED_CACHE.popitem(last=False)
 
 
+# --- Lexical BM25 index for hybrid retrieval -----------------------------------
+# Self-contained Okapi BM25 (no external dependency). Built lazily per active
+# collection and cached, so exact terms / numbers / IDs that dense cosine search
+# misses can still enter the candidate pool. Fully document-agnostic: tokenises
+# generically and uses no document-specific content.
+import math as _bm_math
+
+_BM25_ENABLED = os.environ.get("RAG_HYBRID_BM25", "1") not in ("0", "false", "False")
+_BM25_TOKEN_RE = re.compile(r"[a-z0-9$%][a-z0-9$%./,-]*", re.IGNORECASE)
+_BM25_MAX_CORPUS = int(os.environ.get("RAG_HYBRID_BM25_MAX_CORPUS", "20000"))
+_BM25_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "to", "in", "on", "for", "with", "by", "from", "and",
+    "or", "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
+    "this", "that", "these", "those", "it", "its", "as", "at", "what", "which",
+    "who", "how", "when", "where", "why", "into", "about",
+})
+
+
+def _bm25_tokenize(text: str) -> list[str]:
+    toks = _BM25_TOKEN_RE.findall(str(text or "").lower())
+    out: list[str] = []
+    for t in toks:
+        t = t.strip(".,/-")
+        if len(t) < 2 or t in _BM25_STOPWORDS:
+            continue
+        out.append(t)
+    return out
+
+
+class _BM25Index:
+    """Minimal Okapi BM25 over a fixed corpus snapshot."""
+
+    __slots__ = ("ids", "docs", "metas", "doc_freqs", "idf", "doc_len", "avgdl", "k1", "b", "n")
+
+    def __init__(self, ids: list[str], docs: list[str], metas: list[dict], k1: float = 1.5, b: float = 0.75):
+        self.ids = ids
+        self.docs = docs
+        self.metas = metas
+        self.k1 = k1
+        self.b = b
+        self.n = len(docs)
+        self.doc_freqs: list[dict[str, int]] = []
+        self.doc_len: list[int] = []
+        df: dict[str, int] = {}
+        for d in docs:
+            tokens = _bm25_tokenize(d)
+            self.doc_len.append(len(tokens))
+            freqs: dict[str, int] = {}
+            for tok in tokens:
+                freqs[tok] = freqs.get(tok, 0) + 1
+            self.doc_freqs.append(freqs)
+            for tok in freqs:
+                df[tok] = df.get(tok, 0) + 1
+        self.avgdl = (sum(self.doc_len) / self.n) if self.n else 0.0
+        self.idf: dict[str, float] = {}
+        for tok, freq in df.items():
+            self.idf[tok] = _bm_math.log(1.0 + (self.n - freq + 0.5) / (freq + 0.5))
+
+    def search(self, query: str, top_n: int) -> list[tuple[int, float]]:
+        q_tokens = [t for t in _bm25_tokenize(query) if t in self.idf]
+        if not q_tokens or self.n == 0:
+            return []
+        scored: list[tuple[int, float]] = []
+        for i in range(self.n):
+            freqs = self.doc_freqs[i]
+            if not freqs:
+                continue
+            dl = self.doc_len[i] or 1
+            score = 0.0
+            for tok in q_tokens:
+                f = freqs.get(tok, 0)
+                if not f:
+                    continue
+                idf = self.idf.get(tok, 0.0)
+                denom = f + self.k1 * (1.0 - self.b + self.b * dl / (self.avgdl or 1.0))
+                score += idf * (f * (self.k1 + 1.0)) / (denom or 1.0)
+            if score > 0.0:
+                scored.append((i, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[: max(1, top_n)]
+
+
+_BM25_CACHE: "_RC_OrderedDict[str, _BM25Index]" = _RC_OrderedDict()
+_BM25_CACHE_MAX = int(os.environ.get("RAG_HYBRID_BM25_CACHE_MAX", "4"))
+
+
+def _get_bm25_index(collection) -> Optional[_BM25Index]:
+    """Return a cached BM25 index for the given Chroma collection (lazy build)."""
+    if not _BM25_ENABLED or collection is None:
+        return None
+    try:
+        coll_name = str(getattr(collection, "name", "") or "default")
+        count = int(collection.count())
+    except Exception:
+        return None
+    if count <= 0 or count > _BM25_MAX_CORPUS:
+        return None
+    cache_key = f"{coll_name}::{count}"
+    cached = _BM25_CACHE.get(cache_key)
+    if cached is not None:
+        _BM25_CACHE.move_to_end(cache_key)
+        return cached
+    try:
+        data = collection.get(include=["documents", "metadatas"]) or {}
+    except Exception as exc:
+        logger.debug("[HYBRID BM25] corpus fetch failed: %s", exc)
+        return None
+    docs = [str(d or "") for d in (data.get("documents") or [])]
+    ids = [str(i or "") for i in (data.get("ids") or [])]
+    metas = [m if isinstance(m, dict) else {} for m in (data.get("metadatas") or [])]
+    if not docs:
+        return None
+    # Align lengths defensively.
+    if len(ids) < len(docs):
+        ids = ids + [f"bm25_{i}" for i in range(len(ids), len(docs))]
+    if len(metas) < len(docs):
+        metas = metas + [{} for _ in range(len(metas), len(docs))]
+    index = _BM25Index(ids, docs, metas)
+    _BM25_CACHE[cache_key] = index
+    _BM25_CACHE.move_to_end(cache_key)
+    while len(_BM25_CACHE) > _BM25_CACHE_MAX:
+        _BM25_CACHE.popitem(last=False)
+    logger.info("[HYBRID BM25] built index collection=%s docs=%d", coll_name, len(docs))
+    return index
+
+
 def _rerank_cache_clear(reason: str = "") -> None:
     n = len(_RERANK_CACHE)
     _RERANK_CACHE.clear()
     _QUERY_EMBED_CACHE.clear()
+    _BM25_CACHE.clear()
     logger.info("[RERANK CACHE] cleared entries=%d reason=%s", n, reason or "unspecified")
 
 
@@ -766,7 +893,10 @@ class VectorStore:
             key = VectorStore._dedup_key(text)
             if not key or key in seen:
                 continue
-            if not VectorStore._has_real_sentence_structure(text, meta):
+            # A dominant exact-term (BM25) anchor is always eligible: table and
+            # keyword-dense chunks lack prose "sentence structure" yet are exactly
+            # the evidence the query targets. Document-agnostic.
+            if not bool(cand.get("bm25_protected")) and not VectorStore._has_real_sentence_structure(text, meta):
                 if wants_list and VectorStore._is_structured_short_chunk(text, meta):
                     pass
                 else:
@@ -944,7 +1074,9 @@ class VectorStore:
         _t_emb_ms = (_time_vs.perf_counter() - _t_emb0) * 1000
         logger.info("[RETRIEVAL TIMING] query_embedding=%.0f ms", _t_emb_ms)
         
-        candidate_pool = max(24, min(120, top_k * 4))
+        # Wider candidate floor (40) gives hybrid fusion + cross-encoder a richer
+        # pool to rerank; the final selection cap downstream is unchanged.
+        candidate_pool = max(40, min(120, top_k * 4))
 
         results = None
         last_query_exception = None
@@ -1086,6 +1218,98 @@ class VectorStore:
                     "trace_preview": (chunk_text[:120] if chunk_text else ""),
                 })
         logger.info("[DOC COUNT TRACE] stage=VectorStore.search.candidates_raw count=%s", len(candidates))
+
+        # ── HYBRID FUSION: merge BM25 lexical hits via Reciprocal Rank Fusion ──
+        # Dense cosine search can miss exact terms, numbers and IDs. We compute a
+        # lexical ranking with BM25 and fuse it with the vector ranking (RRF),
+        # then ensure strong lexical-only chunks also enter the candidate pool so
+        # the cross-encoder can judge them. Document-agnostic; gated by env flag.
+        # `_bm25_protected_rank` maps a chunk id -> its BM25 rank for the few
+        # DOMINANT lexical matches that must survive the cross-encoder/semantic
+        # filter (those score table/keyword chunks too low). Used downstream.
+        _bm25_protected_rank: Dict[str, int] = {}
+        if _BM25_ENABLED:
+            try:
+                _bm_t0 = _time_vs.perf_counter()
+                _bm25 = _get_bm25_index(self.collection)
+                if _bm25 is not None:
+                    _RRF_K = 60.0
+                    # Vector ranking (candidates are already best-first from Chroma).
+                    _vec_rank: Dict[str, int] = {}
+                    for _rank, _c in enumerate(candidates):
+                        _cid = str(_c.get("id") or "")
+                        if _cid and _cid not in _vec_rank:
+                            _vec_rank[_cid] = _rank
+                    _lex_hits = _bm25.search(normalized_query, top_n=candidate_pool)
+                    _lex_rank: Dict[str, int] = {}
+                    for _rank, (_idx, _score) in enumerate(_lex_hits):
+                        _cid = str(_bm25.ids[_idx])
+                        if _cid and _cid not in _lex_rank:
+                            _lex_rank[_cid] = _rank
+                    # Protect the few DOMINANT lexical matches (exact term/number
+                    # hits) so they are not discarded by the cross-encoder. A hit
+                    # qualifies when its BM25 score is a large fraction of the top
+                    # score; capped at 2 to preserve precision. Relative + bounded
+                    # so it stays document-agnostic.
+                    if _lex_hits:
+                        _top_bm = float(_lex_hits[0][1] or 0.0)
+                        _bm_floor = max(_top_bm * 0.5, 3.0)
+                        for _rank, (_idx, _score) in enumerate(_lex_hits):
+                            if _rank >= 2 or float(_score or 0.0) < _bm_floor:
+                                break
+                            _bm25_protected_rank[str(_bm25.ids[_idx])] = _rank
+                    # Fused RRF score across both rankings.
+                    _by_id = {str(_c.get("id") or ""): _c for _c in candidates}
+                    _all_ids = set(_vec_rank) | set(_lex_rank)
+                    for _cid in _all_ids:
+                        _rrf = 0.0
+                        if _cid in _vec_rank:
+                            _rrf += 1.0 / (_RRF_K + _vec_rank[_cid])
+                        if _cid in _lex_rank:
+                            _rrf += 1.0 / (_RRF_K + _lex_rank[_cid])
+                        _c = _by_id.get(_cid)
+                        if _c is not None:
+                            _c["rrf_score"] = _rrf
+                            _c["bm25_rank"] = _lex_rank.get(_cid)
+                    # Add strong lexical-only chunks (missed by dense search) so the
+                    # reranker can consider them. Bounded to keep precision.
+                    _lex_only_budget = max(5, top_k)
+                    _added = 0
+                    for _idx, _score in _lex_hits:
+                        if _added >= _lex_only_budget:
+                            break
+                        _cid = str(_bm25.ids[_idx])
+                        if _cid in _by_id:
+                            continue
+                        _txt = _bm25.docs[_idx]
+                        if not _txt or not _txt.strip():
+                            continue
+                        _meta = _bm25.metas[_idx] if _idx < len(_bm25.metas) else {}
+                        _new = {
+                            "text": _txt,
+                            "page_content": _txt,
+                            "content": _txt,
+                            "metadata": _meta or {},
+                            "id": _cid,
+                            "distance": 1.0,
+                            "similarity": 0.0,
+                            "score": 0.0,
+                            "rrf_score": 1.0 / (_RRF_K + _lex_rank.get(_cid, candidate_pool)),
+                            "bm25_rank": _lex_rank.get(_cid),
+                            "lexical_only": True,
+                            "trace_id": _cid,
+                            "trace_preview": _txt[:120],
+                        }
+                        candidates.append(_new)
+                        _by_id[_cid] = _new
+                        _added += 1
+                    _bm_ms = (_time_vs.perf_counter() - _bm_t0) * 1000
+                    logger.info(
+                        "[HYBRID BM25] lexical_hits=%d lexical_only_added=%d candidates=%d ms=%.0f",
+                        len(_lex_hits), _added, len(candidates), _bm_ms,
+                    )
+            except Exception as _bm_err:
+                logger.debug("[HYBRID BM25] fusion skipped: %s", _bm_err)
 
         # Skip expensive rerank when the top hit is already a strong semantic match.
         _top_sim = float(candidates[0].get("similarity", 0.0) or 0.0) if candidates else 0.0
@@ -1230,7 +1454,11 @@ class VectorStore:
                 if c.get("reranker_score") is not None:
                     return float(c.get("reranker_score") or 0.0)
                 return float(c.get("similarity", 0.0) or 0.0)
-            _semantic_kept = [c for c in candidates if _semantic_signal(c) > _semantic_threshold]
+            _semantic_kept = [
+                c for c in candidates
+                if _semantic_signal(c) > _semantic_threshold
+                or str(c.get("id") or "") in _bm25_protected_rank
+            ]
             if _comparison_query:
                 _min_compare_survivors = min(8, len(candidates))
                 if len(_semantic_kept) < _min_compare_survivors:
@@ -1272,6 +1500,12 @@ class VectorStore:
         for cand in candidates:
             text = str(cand.get("text") or cand.get("page_content") or "")
             metadata = dict(cand.get("metadata") or {})
+            # A dominant exact-term (BM25) anchor is never dropped as low quality:
+            # keyword/number-dense or table chunks can trip the heuristic, yet they
+            # are exactly the evidence the user asked for. Document-agnostic.
+            if str(cand.get("id") or "") in _bm25_protected_rank:
+                quality_filtered.append(cand)
+                continue
             reason = self._low_quality_reason(text, metadata)
             if reason:
                 if reason in {"toc_index_like"}:
@@ -1315,6 +1549,18 @@ class VectorStore:
                     final_score -= 0.08
                 else:
                     final_score -= 0.28
+
+            # Lexical-anchor floor: a DOMINANT exact-term match (BM25) must land
+            # in the final set even when the cross-encoder under-scores it (common
+            # for tables and keyword/number-dense chunks). The floor ranks it among
+            # the top candidates without forcing it to outrank a strong semantic
+            # hit. Document-agnostic; only the few protected anchors are affected.
+            _prot_rank = _bm25_protected_rank.get(str(cand.get("id") or ""))
+            if _prot_rank is not None:
+                cand["bm25_protected"] = True
+                _anchor_floor = 4.0 - (0.4 * float(_prot_rank))
+                if final_score < _anchor_floor:
+                    final_score = _anchor_floor
 
             cand["semantic_score_used"] = float(semantic_score)
             cand["content_density"] = float(content_density)
